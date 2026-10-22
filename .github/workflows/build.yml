@@ -53,10 +53,7 @@ jobs:
       - name: Verify APK signature
         run: |
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then
-            echo "ERROR: no release APK produced"
-            exit 1
-          fi
+          if [ -z "$APK" ]; then echo "ERROR: no release APK produced"; exit 1; fi
           echo "APK: $APK"
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
           "$BT/apksigner" verify --verbose --print-certs "$APK"

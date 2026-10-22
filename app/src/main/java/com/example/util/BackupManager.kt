@@ -21,8 +21,10 @@ object BackupManager {
     private const val KEY_MAX_BACKUP_FILES = "max_backup_files"
     private const val KEY_LAST_BACKUP_TIME = "last_backup_time"
     const val DEFAULT_MAX_BACKUP_FILES = 5
+    /** Value 0 means unlimited: never prune old backup files. */
+    const val UNLIMITED_MAX_BACKUP_FILES = 0
 
-    val MAX_FILES_OPTIONS: List<Int> = listOf(1, 2, 3, 5, 10, 15, 20, 30, 50)
+    val MAX_FILES_OPTIONS: List<Int> = listOf(0, 1, 2, 3, 5, 10, 15, 20, 30, 50)  // 0 = Unlimited
 
     val INTERVAL_OPTIONS: List<Pair<String, Long>> = listOf(
         "1 hour" to 60L,
@@ -63,13 +65,15 @@ object BackupManager {
     }
 
     fun setMaxBackupFiles(context: Context, maxFiles: Int) {
-        val clamped = maxFiles.coerceAtLeast(1)
+        val clamped = maxFiles.coerceAtLeast(0)  // 0 = Unlimited
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         prefs.edit().putInt(KEY_MAX_BACKUP_FILES, clamped).apply()
-        try {
-            val dir = getBackupDirectory(context)
-            pruneOldBackups(dir, clamped)
-        } catch (_: Exception) {}
+        if (clamped > 0) {
+            try {
+                val dir = getBackupDirectory(context)
+                pruneOldBackups(dir, clamped)
+            } catch (_: Exception) {}
+        }
     }
 
     fun getBackupDirectory(context: Context): File {
@@ -267,7 +271,9 @@ object BackupManager {
             val targetFile = File(chosenBackupDir, backupFileName)
 
             // Always write latest backup to target and latest.json
-            val jsonString = rootJson.toString()
+            // Pretty-printed (indent = 2) for human readability; compact JSON
+            // files can still be restored because JSONObject() accepts both.
+            val jsonString = rootJson.toString(2)
             targetFile.writeText(jsonString)
 
             val latestFile = File(chosenBackupDir, "latest_backup.json")
@@ -287,6 +293,7 @@ object BackupManager {
     }
 
     private fun pruneOldBackups(backupDir: File, maxCount: Int) {
+        if (maxCount <= 0) return  // Unlimited: never delete old backups
         try {
             val backupFiles = backupDir.listFiles { file ->
                 file.isFile && file.name.startsWith("pinboard_backup_") && file.name.endsWith(".json")
@@ -310,20 +317,22 @@ object BackupManager {
     }
 
     fun getAvailableBackups(context: Context): List<File> {
+        // Return ALL .json files in the backup folder (and its parent
+        // PinterestViewerDownloads folder, if any), so user-created or
+        // manually-copied backups are listed. Compact and pretty JSON are
+        // both supported by the restore path.
         val primaryDir = getBackupDirectory(context)
         val files = mutableListOf<File>()
 
         fun collectFrom(dir: File) {
             if (dir.exists() && dir.isDirectory) {
                 dir.listFiles { f ->
-                    f.isFile && f.extension.equals("json", ignoreCase = true) &&
-                            (f.name.startsWith("pinboard_backup_") || f.name == "latest_backup.json")
+                    f.isFile && f.extension.equals("json", ignoreCase = true)
                 }?.let { files.addAll(it) }
             }
         }
 
         collectFrom(primaryDir)
-        // Also check parent folder in case previous backups were placed there
         primaryDir.parentFile?.let { parent ->
             if (parent.name == "PinterestViewerDownloads") {
                 collectFrom(parent)

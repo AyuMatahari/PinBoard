@@ -50,6 +50,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
 import androidx.compose.material.icons.filled.Share
@@ -67,6 +68,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -139,6 +141,8 @@ fun FullscreenGalleryViewer(
     var showControls by remember { mutableStateOf(false) }
     var isCurrentPageZoomed by remember { mutableStateOf(false) }
     var pinForImageHoldDialog by remember { mutableStateOf<PinItem?>(null) }
+    // Per-pin refresh counter; increment forces a fresh network fetch
+    val imageRefreshKeys = remember { mutableStateMapOf<String, Int>() }
 
     BackHandler {
         onClose()
@@ -260,9 +264,16 @@ fun FullscreenGalleryViewer(
                     },
                 contentAlignment = Alignment.Center
             ) {
+                val pageRefreshKey = imageRefreshKeys[pin.id] ?: 0
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(pin.imageUrl)
+                        .apply {
+                            if (pageRefreshKey > 0) {
+                                memoryCacheKey("${pin.imageUrl}#refresh=$pageRefreshKey")
+                                diskCacheKey("${pin.imageUrl}#refresh=$pageRefreshKey")
+                            }
+                        }
                         .crossfade(true)
                         .build(),
                     contentDescription = pin.title,
@@ -351,6 +362,24 @@ fun FullscreenGalleryViewer(
                                 imageVector = if (pinIsFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                                 contentDescription = "Toggle favorite",
                                 tint = if (pinIsFavorite) PinterestRed else Color.White
+                            )
+                        }
+
+                        // Refresh image button (reloads from source URL, bypasses cache)
+                        IconButton(
+                            onClick = {
+                                val key = currentPin.id
+                                imageRefreshKeys[key] = (imageRefreshKeys[key] ?: 0) + 1
+                                Toast.makeText(context, "Refreshing image...", Toast.LENGTH_SHORT).show()
+                            },
+                            modifier = Modifier
+                                .size(38.dp)
+                                .testTag("fullscreen_refresh_image_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Refresh image",
+                                tint = Color.White
                             )
                         }
 

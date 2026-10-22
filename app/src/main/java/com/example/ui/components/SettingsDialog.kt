@@ -424,7 +424,7 @@ fun SettingsDialog(
                                         .testTag("max_backup_files_selector")
                                 ) {
                                     Text(
-                                        text = "$maxBackupFiles files ▾",
+                                        text = if (maxBackupFiles == 0) "Unlimited ▾" else "$maxBackupFiles files ▾",
                                         fontSize = 12.sp,
                                         fontWeight = FontWeight.Bold,
                                         color = PinterestRed,
@@ -456,7 +456,7 @@ fun SettingsDialog(
                                             horizontalArrangement = Arrangement.SpaceBetween
                                         ) {
                                             Text(
-                                                text = "$count file${if (count > 1) "s" else ""}",
+                                                text = if (count == 0) "Unlimited" else "$count file${if (count > 1) "s" else ""}",
                                                 fontSize = 12.sp,
                                                 fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
                                                 color = if (isSelected) PinterestRed else PinterestBlack
