@@ -99,6 +99,7 @@ import com.example.ui.dialogs.CreateCustomBoardDialog
 import com.example.ui.dialogs.EditCustomBoardDialog
 import com.example.ui.dialogs.AddManualImagesDialog
 import com.example.ui.dialogs.DeleteFromAllConfirmationDialog
+import com.example.ui.dialogs.DeleteSelectionDialog
 import com.example.ui.dialogs.CopyOrMoveImagesDialog
 import com.example.ui.dialogs.BoardTransferMode
 import androidx.activity.compose.BackHandler
@@ -181,6 +182,7 @@ fun PinBoardGalleryScreen(
     var isAddManualImagesDialogOpen by remember { mutableStateOf(false) }
     var showCopyDialog by remember { mutableStateOf(false) }
     var showMoveDialog by remember { mutableStateOf(false) }
+    var showDeleteSelectionDialog by remember { mutableStateOf(false) }
     var isReorderBoardsDialogOpen by remember { mutableStateOf(false) }
     val forceBoardTypeOrder by viewModel.forceBoardTypeOrder.collectAsStateWithLifecycle()
 
@@ -237,7 +239,7 @@ fun PinBoardGalleryScreen(
     val customDateAlbums = remember(customAlbums, allPinsForAlbums, favoriteAlbumIds, favoritePinKeys) {
         customAlbums.map { entity ->
             val albumPins = allPinsForAlbums.filter { it.albumId == entity.id }
-                .sortedBy { it.boardPosition }
+                .sortedByDescending { it.dateAddedMillis }
             DateAlbum(
                 id = entity.id,
                 title = entity.title,
@@ -510,8 +512,11 @@ fun PinBoardGalleryScreen(
                     onDownloadSelected = { viewModel.downloadSelected(context) },
                     onMoveToTop = { viewModel.moveSelectedPinsToTop() },
                     onDeleteSelected = {
-                        if (selectedPinIds.isNotEmpty()) viewModel.deletePinsFromCurrentBoard(selectedPinIds)
-                        if (selectedAlbumIds.isNotEmpty()) viewModel.deleteSelectedAlbums()
+                        if (selectedAlbumIds.isNotEmpty()) {
+                            showDeleteSelectionDialog = true
+                        } else if (selectedPinIds.isNotEmpty()) {
+                            viewModel.deletePinsFromCurrentBoard(selectedPinIds)
+                        }
                     },
                     onCopySelected = { showCopyDialog = true },
                     onMoveSelected = { showMoveDialog = true },
@@ -866,7 +871,7 @@ fun PinBoardGalleryScreen(
                         }
                     }
 
-                    val albumPins = activeAlbum!!.pins
+                    val albumPins = activeAlbum!!.pins.sortedByDescending { it.dateAddedMillis }
                     itemsIndexed(
                         items = albumPins,
                         key = { index, pin -> "album_${activeAlbum!!.id}_${pin.id}_$index" }
@@ -1323,7 +1328,20 @@ fun PinBoardGalleryScreen(
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "Deleted ${undoState.pins.size} image${if (undoState.pins.size > 1) "s" else ""}",
+                            text = run {
+                                val pinCount = undoState.pins.size
+                                val albumCount = undoState.albums.size
+                                when {
+                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DISSOLVE && albumCount > 0 && pinCount > 0 ->
+                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""}, dissolved $albumCount album${if (albumCount > 1) "s" else ""}"
+                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DISSOLVE && albumCount > 0 ->
+                                        "Dissolved $albumCount album${if (albumCount > 1) "s" else ""}"
+                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DELETE_WITH_CONTENTS && albumCount > 0 ->
+                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""} + $albumCount album${if (albumCount > 1) "s" else ""}"
+                                    else ->
+                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""}"
+                                }
+                            },
                             color = Color.White,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.Medium,
@@ -1440,6 +1458,17 @@ fun PinBoardGalleryScreen(
                     fontWeight = FontWeight.Medium,
                     modifier = Modifier.weight(1f)
                 )
+                androidx.compose.material3.TextButton(
+                    onClick = { viewModel.executeAlbumTransferToCurrentBoard() },
+                    modifier = Modifier.testTag("album_transfer_here_btn")
+                ) {
+                    Text(
+                        text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",
+                        color = Color(0xFF64B5F6),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
         }
@@ -1630,6 +1659,22 @@ fun PinBoardGalleryScreen(
         },
         onConfirm = { targetBoardIds ->
             viewModel.moveSelectedPinsToBoards(targetBoardIds, selectedPinIds)
+        }
+    )
+
+    // Delete selection (albums involved) — ask how
+    DeleteSelectionDialog(
+        isOpen = showDeleteSelectionDialog,
+        pinCount = selectedPinIds.size,
+        albumCount = selectedAlbumIds.size,
+        onDismiss = { showDeleteSelectionDialog = false },
+        onDissolve = {
+            viewModel.deleteSelectionAndAlbums(selectedPinIds, selectedAlbumIds, com.example.viewmodel.DeleteSelectionMode.DISSOLVE)
+            showDeleteSelectionDialog = false
+        },
+        onDeleteAll = {
+            viewModel.deleteSelectionAndAlbums(selectedPinIds, selectedAlbumIds, com.example.viewmodel.DeleteSelectionMode.DELETE_WITH_CONTENTS)
+            showDeleteSelectionDialog = false
         }
     )
 }

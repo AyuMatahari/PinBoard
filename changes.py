@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — FIX compile errors from previous album patch
+PinBoard Gallery — Select-mode fixes (round 2)
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -58,7 +58,6 @@ def run(cmd, cwd=None, check=True, capture=False):
         return subprocess.run(cmd, cwd=str(cwd or PROJECT_ROOT), check=check,
                               capture_output=capture, text=True, shell=isinstance(cmd, str))
     except subprocess.CalledProcessError as e:
-        log(f"  rc={e.returncode}")
         if e.stdout: log(f"  out: {e.stdout}")
         if e.stderr: log(f"  err: {e.stderr}")
         if check: raise
@@ -72,875 +71,885 @@ def tool_available(name):
 
 
 # ============================================================
-# New file contents
+# PATCH 1 — MultiSelectBottomBar
 # ============================================================
-NEW_SHARE_TARGET = r'''package com.example.ui
+def patch_multiselect_bar():
+    log("\n=== PATCH: MultiSelectBottomBar (label + save icon) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/MultiSelectBottomBar.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
 
-import android.content.Intent
-import android.net.Uri
-import android.os.Bundle
-import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
+    # (a) Label format
+    if 'if (selectedPinCount > 0 && selectedAlbumCount > 0)' not in t:
+        old_label = (
+            '                    Text(\n'
+            '                        text = buildString {\n'
+            '                            append(selectedPinCount)\n'
+            '                            append(" img")\n'
+            '                            if (selectedAlbumCount > 0) {\n'
+            '                                append(" · ")\n'
+            '                                append(selectedAlbumCount)\n'
+            '                                append(" alb")\n'
+            '                            }\n'
+            '                        },\n'
+        )
+        new_label = (
+            '                    Text(\n'
+            '                        text = if (selectedPinCount > 0 && selectedAlbumCount > 0)\n'
+            '                            "${selectedPinCount + selectedAlbumCount} itm"\n'
+            '                        else if (selectedPinCount > 0) "$selectedPinCount img"\n'
+            '                        else if (selectedAlbumCount > 0) "$selectedAlbumCount alb"\n'
+            '                        else "0",\n'
+        )
+        if old_label in t:
+            t = t.replace(old_label, new_label, 1); changed = True
+            log("  ✓ combined-count label")
+        else:
+            log("  ⚠ label anchor missing")
+
+    # (b) Save button → IconButton
+    if 'testTag("download_selected_button")' in t and 'Button(\n                        onClick = onDownloadSelected,' in t:
+        old_btn = (
+            'Button(\n'
+            '                        onClick = onDownloadSelected,\n'
+            '                        enabled = selectedPinCount > 0,\n'
+            '                        colors = ButtonDefaults.buttonColors(\n'
+            '                            containerColor = PinterestRed,\n'
+            '                            disabledContainerColor = PinterestPillGray\n'
+            '                        ),\n'
+            '                        shape = RoundedCornerShape(16.dp),\n'
+            '                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),\n'
+            '                        modifier = Modifier\n'
+            '                            .height(34.dp)\n'
+            '                            .testTag("download_selected_button")\n'
+            '                    ) {\n'
+            '                        Icon(\n'
+            '                            imageVector = Icons.Default.Download,\n'
+            '                            contentDescription = null,\n'
+            '                            tint = if (selectedPinCount > 0) Color.White else Color.Gray,\n'
+            '                            modifier = Modifier.size(14.dp)\n'
+            '                        )\n'
+            '                        Spacer(modifier = Modifier.width(4.dp))\n'
+            '                        Text(\n'
+            '                            text = "Save",\n'
+            '                            fontSize = 12.sp,\n'
+            '                            fontWeight = FontWeight.Bold,\n'
+            '                            color = if (selectedPinCount > 0) Color.White else Color.Gray\n'
+            '                        )\n'
+            '                    }'
+        )
+        new_btn = (
+            'IconButton(\n'
+            '                        onClick = onDownloadSelected,\n'
+            '                        enabled = selectedPinCount > 0,\n'
+            '                        modifier = Modifier\n'
+            '                            .size(32.dp)\n'
+            '                            .testTag("download_selected_button")\n'
+            '                    ) {\n'
+            '                        Icon(\n'
+            '                            imageVector = Icons.Default.Download,\n'
+            '                            contentDescription = "Save selected",\n'
+            '                            tint = if (selectedPinCount > 0) PinterestRed else Color.Gray,\n'
+            '                            modifier = Modifier.size(18.dp)\n'
+            '                        )\n'
+            '                    }'
+        )
+        if old_btn in t:
+            t = t.replace(old_btn, new_btn, 1); changed = True
+            log("  ✓ save button → icon only")
+        else:
+            log("  ⚠ save button anchor missing (may already be icon-only)")
+
+    if changed: f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 2 — CopyOrMoveImagesDialog: include current board
+# ============================================================
+def patch_copy_move_dialog():
+    log("\n=== PATCH: CopyOrMoveImagesDialog (include current) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    old_filter = (
+        '    val selectableBoards = remember(availableBoards, currentBoardId, mode) {\n'
+        '        if (mode == BoardTransferMode.MOVE && !currentBoardId.isNullOrBlank()) {\n'
+        '            availableBoards.filter { it.id != currentBoardId }\n'
+        '        } else {\n'
+        '            availableBoards\n'
+        '        }\n'
+        '    }\n'
+    )
+    new_filter = (
+        '    // MOVE now includes the current board (moving to current board = reorder to top)\n'
+        '    val selectableBoards = remember(availableBoards) { availableBoards }\n'
+    )
+    if old_filter in t:
+        t = t.replace(old_filter, new_filter, 1); changed = True
+        log("  ✓ include current board in MOVE list")
+
+    # Add "(Current)" tag next to the board title when it matches currentBoardId
+    if '(Current)' not in t:
+        old_row = (
+            '                                    Text(\n'
+            '                                        text = board.title,\n'
+            '                                        fontWeight = if (isChecked) FontWeight.Bold else FontWeight.Medium,\n'
+            '                                        fontSize = 13.sp,\n'
+            '                                        color = if (isChecked) PinterestRed else PinterestBlack\n'
+            '                                    )\n'
+        )
+        new_row = (
+            '                                    Text(\n'
+            '                                        text = board.title,\n'
+            '                                        fontWeight = if (isChecked) FontWeight.Bold else FontWeight.Medium,\n'
+            '                                        fontSize = 13.sp,\n'
+            '                                        color = if (isChecked) PinterestRed else PinterestBlack\n'
+            '                                    )\n'
+            '                                    if (board.id == currentBoardId) {\n'
+            '                                        Spacer(modifier = Modifier.width(6.dp))\n'
+            '                                        Text("(Current)", fontSize = 10.sp, color = PinterestTextSecondary)\n'
+            '                                    }\n'
+        )
+        if old_row in t:
+            t = t.replace(old_row, new_row, 1); changed = True
+            log("  ✓ (Current) tag")
+
+    if changed: f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 3 — AlbumCard: staleness + tap/hold inversion
+# ============================================================
+def patch_album_card():
+    log("\n=== PATCH: AlbumCard gestures ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/AlbumCard.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # Import rememberUpdatedState
+    if "import androidx.compose.runtime.rememberUpdatedState" not in t:
+        t = t.replace(
+            'import androidx.compose.runtime.remember\n',
+            'import androidx.compose.runtime.remember\nimport androidx.compose.runtime.rememberUpdatedState\n',
+            1,
+        )
+        changed = True
+
+    # Wrap callbacks in rememberUpdatedState — insert just before the Box with pointerInput
+    if "val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)" not in t:
+        anchor = (
+            '    val context = LocalContext.current\n'
+            '    val pins = album.pins\n'
+        )
+        add = (
+            '    val context = LocalContext.current\n'
+            '    val currentOnClick by rememberUpdatedState(onClick)\n'
+            '    val currentOnLongClick by rememberUpdatedState(onLongClick)\n'
+            '    val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)\n'
+            '    val currentOnSwipePreview by rememberUpdatedState(onSwipePreview)\n'
+            '    val pins = album.pins\n'
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ rememberUpdatedState wrappers")
+
+    # Change pointerInput key
+    if "pointerInput(album.id, isSelectionMode)" not in t:
+        t = t.replace(
+            '.pointerInput(album.id) {',
+            '.pointerInput(album.id, isSelectionMode) {',
+            1,
+        )
+        changed = True
+        log("  ✓ pointerInput key includes isSelectionMode")
+
+    # Invert long-press branch: select mode → open album (onClick)
+    old_long = (
+        '                        down.consume()\n'
+        '                        if (isSelectionMode) onSelectToggle() else onLongClick()\n'
+    )
+    new_long = (
+        '                        down.consume()\n'
+        '                        if (isSelectionMode) currentOnClick() else currentOnLongClick()\n'
+    )
+    if old_long in t:
+        t = t.replace(old_long, new_long, 1); changed = True
+        log("  ✓ long-press: select mode → open album")
+
+    # Tap branch: select mode → toggle selection
+    old_tap = (
+        '                        if (isSelectionMode) onSelectToggle() else onClick()\n'
+    )
+    new_tap = (
+        '                        if (isSelectionMode) currentOnSelectToggle() else currentOnClick()\n'
+    )
+    if old_tap in t:
+        t = t.replace(old_tap, new_tap, 1); changed = True
+        log("  ✓ tap: select mode → toggle selection")
+
+    # Also update swipe → rememberUpdatedState lambda
+    old_swipe = '                            onSwipePreview()\n'
+    new_swipe = '                            currentOnSwipePreview()\n'
+    if old_swipe in t and new_swipe not in t:
+        t = t.replace(old_swipe, new_swipe, 1); changed = True
+
+    if changed: f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 4 — ViewModel: delete-selection, move-to-top, banner
+# ============================================================
+def patch_viewmodel():
+    log("\n=== PATCH: ViewModel (select-mode) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # (a) Extend enum + data class
+    if "DeleteSelectionMode" not in t:
+        anchor = "enum class AlbumTransferMode { COPY, MOVE }\n"
+        add = (
+            "enum class AlbumTransferMode { COPY, MOVE }\n"
+            "\n"
+            "enum class DeleteSelectionMode { DISSOLVE, DELETE_WITH_CONTENTS, PINS_ONLY }\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ DeleteSelectionMode enum")
+
+    if "dissolvedLinks" not in t and "data class DeletedPinsUndoState" in t:
+        old_dc = (
+            'data class DeletedPinsUndoState(\n'
+            '    val boardId: String,\n'
+            '    val pins: List<PinItem>,\n'
+            '    val imageUrls: List<String> = pins.map { it.imageUrl }\n'
+            ')\n'
+        )
+        new_dc = (
+            'data class DeletedPinsUndoState(\n'
+            '    val boardId: String,\n'
+            '    val pins: List<PinItem>,\n'
+            '    val imageUrls: List<String> = pins.map { it.imageUrl },\n'
+            '    val albums: List<com.example.data.local.CustomAlbumEntity> = emptyList(),\n'
+            '    val dissolvedLinks: Map<String, String> = emptyMap(),\n'
+            '    val mode: DeleteSelectionMode = DeleteSelectionMode.PINS_ONLY\n'
+            ')\n'
+        )
+        if old_dc in t:
+            t = t.replace(old_dc, new_dc, 1); changed = True
+            log("  ✓ DeletedPinsUndoState extended")
+
+    # (b) New deleteSelectionAndAlbums method — insert before onCleared
+    if "fun deleteSelectionAndAlbums(" not in t:
+        anchor = '    override fun onCleared() {\n'
+        new_methods = (
+            '    fun deleteSelectionAndAlbums(pinIds: Set<String>, albumIds: Set<String>, mode: DeleteSelectionMode) {\n'
+            '        val board = _currentBoard.value ?: return\n'
+            '        if (pinIds.isEmpty() && albumIds.isEmpty()) return\n'
+            '        viewModelScope.launch {\n'
+            '            val ctx = appContext ?: return@launch\n'
+            '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
+            '            val allPins = _rawPins.value\n'
+            '            val albums = _customAlbums.value.filter { albumIds.contains(it.id) }\n'
+            '            val albumPins = allPins.filter { it.albumId != null && albumIds.contains(it.albumId!!) }\n'
+            '            val explicitPins = allPins.filter { pinIds.contains(it.id) }\n'
+            '\n'
+            '            val pinsToDelete: List<PinItem>\n'
+            '            val dissolvedLinks = mutableMapOf<String, String>()\n'
+            '\n'
+            '            when (mode) {\n'
+            '                DeleteSelectionMode.DELETE_WITH_CONTENTS -> {\n'
+            '                    pinsToDelete = (explicitPins + albumPins).distinctBy { it.id }\n'
+            '                }\n'
+            '                DeleteSelectionMode.DISSOLVE -> {\n'
+            '                    pinsToDelete = explicitPins\n'
+            '                    albumPins.forEach { p -> p.albumId?.let { dissolvedLinks[p.id] = it } }\n'
+            '                }\n'
+            '                DeleteSelectionMode.PINS_ONLY -> {\n'
+            '                    pinsToDelete = explicitPins\n'
+            '                }\n'
+            '            }\n'
+            '\n'
+            '            withContext(Dispatchers.IO) {\n'
+            '                if (pinsToDelete.isNotEmpty()) {\n'
+            '                    dao.deletePinsFromBoard(board.id, pinsToDelete.map { it.id })\n'
+            '                }\n'
+            '                albums.forEach { dao.deleteAlbum(it.id) }\n'
+            '            }\n'
+            '\n'
+            '            val remaining = allPins\n'
+            '                .filterNot { p -> pinsToDelete.any { pd -> pd.id == p.id } }\n'
+            '                .map { p ->\n'
+            '                    if (mode == DeleteSelectionMode.DISSOLVE &&\n'
+            '                        p.albumId != null && albumIds.contains(p.albumId!!)) {\n'
+            '                        p.copy(albumId = null)\n'
+            '                    } else p\n'
+            '                }\n'
+            '            val remainingAlbums = _customAlbums.value.filterNot { albumIds.contains(it.id) }\n'
+            '\n'
+            '            _deletedPinsUndo.value = DeletedPinsUndoState(\n'
+            '                boardId = board.id,\n'
+            '                pins = pinsToDelete,\n'
+            '                imageUrls = pinsToDelete.map { it.imageUrl },\n'
+            '                albums = albums,\n'
+            '                dissolvedLinks = dissolvedLinks,\n'
+            '                mode = mode\n'
+            '            )\n'
+            '\n'
+            '            withContext(Dispatchers.Main) {\n'
+            '                _rawPins.value = remaining\n'
+            '                _customAlbums.value = remainingAlbums\n'
+            '                _currentBoard.value = board.copy(pins = remaining, pinCount = remaining.size)\n'
+            '                updateDisplayedPins()\n'
+            '                clearSelection()\n'
+            '            }\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    // Move pins/albums to top of the board (also dissolves empty albums)\n'
+            '    private suspend fun moveToTopInternal(pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {\n'
+            '        val board = _currentBoard.value ?: return\n'
+            '        val allPins = _rawPins.value\n'
+            '        val maxPinDate = allPins.maxOfOrNull { it.dateAddedMillis } ?: 0L\n'
+            '        val maxAlbumDate = _customAlbums.value.maxOfOrNull { it.dateAddedMillis } ?: 0L\n'
+            '        var nextDate = maxOf(maxPinDate, maxAlbumDate) + 60_000L\n'
+            '\n'
+            '        val affectedAlbumIds = mutableSetOf<String>()\n'
+            '        val updatedPins = allPins.map { p ->\n'
+            '            if (pinIds.contains(p.id)) {\n'
+            '                p.albumId?.let { affectedAlbumIds.add(it) }\n'
+            '                p.copy(albumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }\n'
+            '            } else p\n'
+            '        }\n'
+            '\n'
+            '        val updatedAlbums = _customAlbums.value.map { a ->\n'
+            '            if (albumIds.contains(a.id)) {\n'
+            '                a.copy(dateAddedMillis = nextDate).also { nextDate += 1000L }\n'
+            '            } else a\n'
+            '        }\n'
+            '\n'
+            '        val nonEmptyAlbumIds = updatedPins.mapNotNull { it.albumId }.toSet()\n'
+            '        val dissolvedAlbumIds = affectedAlbumIds - nonEmptyAlbumIds\n'
+            '        val finalAlbums = updatedAlbums.filterNot { it.id in dissolvedAlbumIds }\n'
+            '\n'
+            '        withContext(Dispatchers.IO) {\n'
+            '            dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, board.id, i) })\n'
+            '            updatedAlbums.filter { it.id in albumIds }.forEach { dao.insertAlbum(it) }\n'
+            '            dissolvedAlbumIds.forEach { dao.deleteAlbum(it) }\n'
+            '        }\n'
+            '\n'
+            '        withContext(Dispatchers.Main) {\n'
+            '            _rawPins.value = updatedPins\n'
+            '            _customAlbums.value = finalAlbums\n'
+            '            _currentBoard.value = board.copy(pins = updatedPins, pinCount = updatedPins.size)\n'
+            '            updateDisplayedPins(resetLimit = true)\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+            '    fun executeAlbumTransferToCurrentBoard() {\n'
+            '        val transfer = _pendingAlbumTransfer.value ?: return\n'
+            '        val currentBoard = _currentBoard.value ?: return\n'
+            '        val sourceBoardId = transfer.sourceBoardId\n'
+            '        viewModelScope.launch {\n'
+            '            val ctx = appContext ?: return@launch\n'
+            '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
+            '            if (currentBoard.id == sourceBoardId) {\n'
+            '                if (transfer.mode == AlbumTransferMode.MOVE) {\n'
+            '                    moveToTopInternal(transfer.pinIds, emptySet(), dao)\n'
+            '                    _snackbarMessage.value = "Moved ${transfer.pinIds.size} to top of board"\n'
+            '                } else {\n'
+            '                    _snackbarMessage.value = "Already on this board"\n'
+            '                }\n'
+            '            } else {\n'
+            '                val pins = _rawPins.value.filter { transfer.pinIds.contains(it.id) }\n'
+            '                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(currentBoard.id).toSet() }\n'
+            '                val baseDate = System.currentTimeMillis()\n'
+            '                val toAdd = pins.filter { !existingUrls.contains(it.imageUrl) }\n'
+            '                    .mapIndexed { i, p -> p.copy(albumId = null, dateAddedMillis = baseDate + i * 1000L) }\n'
+            '                withContext(Dispatchers.IO) {\n'
+            '                    dao.insertPins(toAdd.mapIndexed { i, p -> PinEntity.fromPinItem(p, currentBoard.id, i) })\n'
+            '                    if (transfer.mode == AlbumTransferMode.MOVE) {\n'
+            '                        dao.deletePinsFromBoard(sourceBoardId, transfer.pinIds.toList())\n'
+            '                    }\n'
+            '                }\n'
+            '                if (transfer.mode == AlbumTransferMode.MOVE) {\n'
+            '                    val remaining = _rawPins.value.filterNot { transfer.pinIds.contains(it.id) }\n'
+            '                    withContext(Dispatchers.Main) {\n'
+            '                        _rawPins.value = remaining\n'
+            '                        _currentBoard.value = currentBoard.copy(pins = remaining, pinCount = remaining.size)\n'
+            '                        updateDisplayedPins()\n'
+            '                    }\n'
+            '                }\n'
+            '                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${toAdd.size} to ${currentBoard.title}"\n'
+            '            }\n'
+            '            _pendingAlbumTransfer.value = null\n'
+            '            withContext(Dispatchers.Main) { clearSelection() }\n'
+            '        }\n'
+            '    }\n'
+            '\n'
+        )
+        if anchor in t:
+            t = t.replace(anchor, new_methods + anchor, 1); changed = True
+            log("  ✓ deleteSelectionAndAlbums + moveToTopInternal + executeAlbumTransferToCurrentBoard")
+
+    # (c) beginAlbumTransfer exits select mode
+    old_begin = (
+        '        _pendingAlbumTransfer.value = PendingAlbumTransfer(\n'
+        '            pinIds = pinIds, mode = mode, sourceBoardId = board.id,\n'
+        '            savedSelectionPinIds = _selectedPinIds.value,\n'
+        '            savedSelectionAlbumIds = _selectedAlbumIds.value\n'
+        '        )\n'
+        '    }\n'
+    )
+    new_begin = (
+        '        _pendingAlbumTransfer.value = PendingAlbumTransfer(\n'
+        '            pinIds = pinIds, mode = mode, sourceBoardId = board.id,\n'
+        '            savedSelectionPinIds = _selectedPinIds.value,\n'
+        '            savedSelectionAlbumIds = _selectedAlbumIds.value\n'
+        '        )\n'
+        '        _isSelectionMode.value = false\n'
+        '    }\n'
+    )
+    if old_begin in t:
+        t = t.replace(old_begin, new_begin, 1); changed = True
+        log("  ✓ beginAlbumTransfer exits select mode")
+
+    # (d) Update undoDeletePins to restore albums + dissolved links
+    old_undo = (
+        '    fun undoDeletePins() {\n'
+        '        val undo = _deletedPinsUndo.value ?: return\n'
+        '        val board = _currentBoard.value ?: return\n'
+        '        _deletedPinsUndo.value = null\n'
+        '\n'
+        '        val restored = (undo.pins + _rawPins.value).distinctBy { it.id }\n'
+        '        _rawPins.value = restored\n'
+        '        _currentBoard.value = board.copy(pins = restored, pinCount = restored.size)\n'
+        '        updateDisplayedPins()\n'
+        '\n'
+        '        viewModelScope.launch(Dispatchers.IO) {\n'
+        '            val ctx = appContext ?: return@launch\n'
+        '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
+        '            val entities = undo.pins.mapIndexed { idx, p -> PinEntity.fromPinItem(p, undo.boardId, idx) }\n'
+        '            dao.insertPins(entities)\n'
+        '            refreshAvailableBoardsFromDatabaseInternal(dao)\n'
+        '        }\n'
+        '\n'
+        '        _snackbarMessage.value = "Restored ${undo.pins.size} image${if (undo.pins.size > 1) "s" else ""}"\n'
+        '    }\n'
+    )
+    new_undo = (
+        '    fun undoDeletePins() {\n'
+        '        val undo = _deletedPinsUndo.value ?: return\n'
+        '        val board = _currentBoard.value ?: return\n'
+        '        _deletedPinsUndo.value = null\n'
+        '\n'
+        '        val restored = (undo.pins + _rawPins.value).distinctBy { it.id }\n'
+        '        _rawPins.value = restored\n'
+        '        _currentBoard.value = board.copy(pins = restored, pinCount = restored.size)\n'
+        '        updateDisplayedPins()\n'
+        '\n'
+        '        viewModelScope.launch(Dispatchers.IO) {\n'
+        '            val ctx = appContext ?: return@launch\n'
+        '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
+        '            if (undo.albums.isNotEmpty()) {\n'
+        '                dao.insertAlbums(undo.albums)\n'
+        '            }\n'
+        '            val entities = undo.pins.mapIndexed { idx, p -> PinEntity.fromPinItem(p, undo.boardId, idx) }\n'
+        '            if (entities.isNotEmpty()) dao.insertPins(entities)\n'
+        '            undo.dissolvedLinks.forEach { (pinId, albumId) ->\n'
+        '                try { dao.movePinsToAlbum(listOf(pinId), albumId) } catch (_: Throwable) {}\n'
+        '            }\n'
+        '            refreshAvailableBoardsFromDatabaseInternal(dao)\n'
+        '        }\n'
+        '\n'
+        '        val albumMsg = if (undo.albums.isNotEmpty()) " + ${undo.albums.size} album${if (undo.albums.size > 1) "s" else ""}" else ""\n'
+        '        _snackbarMessage.value = "Restored ${undo.pins.size} image${if (undo.pins.size > 1) "s" else ""}$albumMsg"\n'
+        '    }\n'
+    )
+    if old_undo in t:
+        t = t.replace(old_undo, new_undo, 1); changed = True
+        log("  ✓ undoDeletePins restores albums + dissolved links")
+
+    if changed: f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 5 — New DeleteSelectionDialog.kt
+# ============================================================
+def patch_new_delete_dialog():
+    log("\n=== PATCH: DeleteSelectionDialog.kt (new file) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/DeleteSelectionDialog.kt"
+    if f.exists(): log("  ✓ already exists"); return
+
+    content = r'''package com.example.ui.dialogs
+
 import androidx.compose.foundation.background
-import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.wrapContentHeight
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Checklist
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material.icons.filled.DeleteOutline
+import androidx.compose.material.icons.filled.FolderOff
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.lifecycle.lifecycleScope
-import com.example.data.local.AppDatabase
-import com.example.data.local.BoardEntity
-import com.example.data.local.PinEntity
-import com.example.model.PinItem
-import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.PinterestBlack
 import com.example.ui.theme.PinterestPillGray
 import com.example.ui.theme.PinterestRed
 import com.example.ui.theme.PinterestTextSecondary
-import com.example.util.ImageLinkResolver
-import com.example.util.LinkExtractor
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 
-class ShareTargetActivity : ComponentActivity() {
-
-    @Volatile
-    private var autoSaveJob: Job? = null
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val sharedLinks = mutableListOf<String>()
-        val sharedImageUris = mutableListOf<Uri>()
-
-        when (intent?.action) {
-            Intent.ACTION_SEND -> {
-                if ("text/plain" == intent.type) {
-                    val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
-                    sharedLinks.addAll(LinkExtractor.extractLinks(sharedText))
-                    if (sharedLinks.isEmpty() && sharedText.isNotBlank() &&
-                        (sharedText.startsWith("http://") || sharedText.startsWith("https://"))) {
-                        sharedLinks.add(sharedText.trim())
-                    }
-                } else if (intent.type?.startsWith("image/") == true) {
-                    androidx.core.content.IntentCompat
-                        .getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-                        ?.let { sharedImageUris.add(it) }
-                }
-            }
-            Intent.ACTION_SEND_MULTIPLE -> {
-                if (intent.type?.startsWith("image/") == true) {
-                    androidx.core.content.IntentCompat
-                        .getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-                        ?.let { sharedImageUris.addAll(it) }
-                }
-            }
-        }
-
-        // Auto-save to default board immediately (async).
-        autoSaveJob = lifecycleScope.launch(Dispatchers.IO) {
-            autoSaveToDefaultBoardSync(sharedLinks, sharedImageUris)
-        }
-
-        setContent {
-            MyApplicationTheme {
-                FloatingShareDialog(
-                    sharedLinks = sharedLinks,
-                    sharedImageUris = sharedImageUris,
-                    onClose = { finish() },
-                    onSaveToBoards = { targetBoardIds, extractMultiple ->
-                        saveToBoards(
-                            targetBoardIds = targetBoardIds,
-                            links = sharedLinks,
-                            imageUris = sharedImageUris,
-                            extractMultipleImages = extractMultiple
-                        )
-                    }
-                )
-            }
-        }
-    }
-
-    private suspend fun autoSaveToDefaultBoardSync(links: List<String>, imageUris: List<Uri>) {
-        try {
-            val dao = AppDatabase.getDatabase(applicationContext).boardDao()
-            ensureDefaultBoardsExist(dao)
-            val allBoards = dao.getAllBoards()
-            val defaultBoard = allBoards.firstOrNull { it.isDefault }
-                ?: allBoards.firstOrNull { it.id == "board_dump" }
-                ?: allBoards.firstOrNull() ?: return
-
-            val resolvedPins = mutableListOf<PinItem>()
-            for (link in links) resolvedPins.add(ImageLinkResolver.resolveLink(link, defaultBoard.title))
-            for (uri in imageUris) {
-                val s = uri.toString()
-                resolvedPins.add(PinItem(
-                    id = ImageLinkResolver.generateDeterministicPinId(s),
-                    title = "Shared Photo", imageUrl = s, thumbnailUrl = s,
-                    author = "Shared from device", sourceUrl = s,
-                    dateAddedMillis = System.currentTimeMillis()
-                ))
-            }
-            val existingIds = dao.getPinIdsForBoard(defaultBoard.id).toSet()
-            val existingUrls = dao.getImageUrlsForBoard(defaultBoard.id).toSet()
-            val toInsert = resolvedPins.filter {
-                !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
-            }
-            if (toInsert.isNotEmpty()) {
-                dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })
-            }
-            withContext(Dispatchers.Main) {
-                Toast.makeText(
-                    this@ShareTargetActivity,
-                    "Saved to ${defaultBoard.title}",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        } catch (t: Throwable) {
-            t.printStackTrace()
-        }
-    }
-
-    private fun saveToBoards(
-        targetBoardIds: List<String>,
-        links: List<String>,
-        imageUris: List<Uri>,
-        extractMultipleImages: Boolean
-    ) {
-        lifecycleScope.launch {
-            try {
-                autoSaveJob?.join()
-                withContext(Dispatchers.IO) {
-                    val appCtx = applicationContext
-                    val dao = AppDatabase.getDatabase(appCtx).boardDao()
-                    ensureDefaultBoardsExist(dao)
-                    val allBoards = dao.getAllBoards()
-                    val defaultBoard = allBoards.firstOrNull { it.isDefault }
-                        ?: allBoards.firstOrNull { it.id == "board_dump" }
-                        ?: allBoards.firstOrNull()
-
-                    val chosenBoards = if (targetBoardIds.isEmpty()) {
-                        listOfNotNull(defaultBoard)
-                    } else {
-                        allBoards.filter { targetBoardIds.contains(it.id) }
-                    }
-
-                    val resolvedPins = mutableListOf<PinItem>()
-                    for (link in links) {
-                        if (extractMultipleImages) {
-                            resolvedPins.addAll(ImageLinkResolver.resolveMultipleLinks(link))
-                        } else {
-                            resolvedPins.add(ImageLinkResolver.resolveLink(link))
-                        }
-                    }
-                    for (uri in imageUris) {
-                        val s = uri.toString()
-                        resolvedPins.add(PinItem(
-                            id = ImageLinkResolver.generateDeterministicPinId(s),
-                            title = "Shared Photo", imageUrl = s, thumbnailUrl = s,
-                            author = "Shared from device", sourceUrl = s,
-                            dateAddedMillis = System.currentTimeMillis()
-                        ))
-                    }
-
-                    val matchedDomainBoards = allBoards.filter { b ->
-                        b.isCustom && resolvedPins.any { pin ->
-                            LinkExtractor.matchesAnyDomain(
-                                pin.sourceUrl.ifBlank { pin.imageUrl },
-                                b.customDomains.split(",")
-                            )
-                        }
-                    }
-                    val allTargets = (chosenBoards + matchedDomainBoards).distinctBy { it.id }
-                    val defaultId = defaultBoard?.id
-
-                    // If user explicitly picked boards that don't include default, remove from default
-                    if (defaultId != null && targetBoardIds.isNotEmpty() && !targetBoardIds.contains(defaultId)) {
-                        dao.deletePinsFromBoard(defaultId, resolvedPins.map { it.id })
-                    }
-
-                    for (target in allTargets) {
-                        val existingIds = dao.getPinIdsForBoard(target.id).toSet()
-                        val existingUrls = dao.getImageUrlsForBoard(target.id).toSet()
-                        val toInsert = mutableListOf<PinEntity>()
-                        resolvedPins.forEachIndexed { i, p ->
-                            if (!existingIds.contains(p.id) && !existingUrls.contains(p.imageUrl)) {
-                                toInsert.add(PinEntity.fromPinItem(p, target.id, i))
-                            }
-                        }
-                        if (toInsert.isNotEmpty()) dao.insertPins(toInsert)
-                    }
-                }
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(applicationContext, "Saved", Toast.LENGTH_SHORT).show()
-                    finish()
-                }
-            } catch (t: Throwable) {
-                t.printStackTrace()
-                withContext(Dispatchers.Main) { finish() }
-            }
-        }
-    }
-
-    private suspend fun ensureDefaultBoardsExist(dao: com.example.data.local.BoardDao) {
-        withContext(Dispatchers.IO) {
-            if (dao.getBoardById("board_dump") == null) {
-                dao.insertBoard(BoardEntity(
-                    id = "board_dump", title = "Dump board", slug = "dump",
-                    ownerUsername = "you", ownerDisplayName = "Dump board", ownerAvatarUrl = "",
-                    pinCount = 0, followerCount = 0, boardUrl = "custom://dump",
-                    description = "Default dump board", isCustom = true, customDomains = "",
-                    isDefault = true, isSpecialNonDeletable = true
-                ))
-            }
-            if (dao.getBoardById("board_my_save") == null) {
-                dao.insertBoard(BoardEntity(
-                    id = "board_my_save", title = "My Save", slug = "my-save",
-                    ownerUsername = "you", ownerDisplayName = "My Save", ownerAvatarUrl = "",
-                    pinCount = 0, followerCount = 0, boardUrl = "custom://my_save",
-                    description = "Custom board for saved items", isCustom = true, customDomains = "",
-                    isDefault = false, isSpecialNonDeletable = true
-                ))
-            }
-            if (dao.getBoardById("board_favorites") == null) {
-                dao.insertBoard(BoardEntity(
-                    id = "board_favorites", title = "Favorites", slug = "favorites",
-                    ownerUsername = "you", ownerDisplayName = "Favorites", ownerAvatarUrl = "",
-                    pinCount = 0, followerCount = 0, boardUrl = "custom://favorites",
-                    description = "Your favorite images", isCustom = true, customDomains = "",
-                    isDefault = false, isSpecialNonDeletable = true
-                ))
-            }
-        }
-    }
-}
-
-
-@OptIn(ExperimentalLayoutApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun FloatingShareDialog(
-    sharedLinks: List<String>,
-    sharedImageUris: List<Uri>,
-    onClose: () -> Unit,
-    onSaveToBoards: (targetBoardIds: List<String>, extractMultiple: Boolean) -> Unit
-) {
-    val context = androidx.compose.ui.platform.LocalContext.current
-    var boards by remember { mutableStateOf<List<BoardEntity>>(emptyList()) }
-    var isLoadingBoards by remember { mutableStateOf(true) }
-    var isSelectMode by remember { mutableStateOf(false) }
-    val selectedBoardIds = remember { mutableStateListOf<String>() }
-    var extractMultipleImages by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            val dao = AppDatabase.getDatabase(context).boardDao()
-            val list = dao.getAllBoards()
-            boards = list
-            val def = list.firstOrNull { it.isDefault }
-                ?: list.firstOrNull { it.id == "board_dump" }
-                ?: list.firstOrNull { it.id == "board_my_save" }
-                ?: list.firstOrNull()
-            def?.let { selectedBoardIds.add(it.id) }
-            isLoadingBoards = false
-        }
-    }
-
-    val itemCount = sharedLinks.size + sharedImageUris.size
-
-    Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)),
-        contentAlignment = Alignment.Center
-    ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(0.92f).wrapContentHeight()
-                .testTag("floating_share_dialog_card"),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
-        ) {
-            Column(modifier = Modifier.fillMaxWidth().padding(20.dp)) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier.size(36.dp).clip(CircleShape)
-                                .background(PinterestRed.copy(alpha = 0.12f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.Share, null, tint = PinterestRed, modifier = Modifier.size(20.dp))
-                        }
-                        Spacer(Modifier.width(10.dp))
-                        Column {
-                            Text("Save to PinBoard", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                            Text(
-                                if (itemCount > 1) "$itemCount items detected" else "1 item detected",
-                                fontSize = 12.sp, color = PinterestTextSecondary
-                            )
-                        }
-                    }
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(onClick = { isSelectMode = !isSelectMode }, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.Default.Checklist, "Toggle multi-select",
-                                tint = if (isSelectMode) PinterestRed else PinterestTextSecondary,
-                                modifier = Modifier.size(20.dp))
-                        }
-                        IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.Default.Close, "Close",
-                                tint = PinterestTextSecondary, modifier = Modifier.size(18.dp))
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-
-                if (sharedLinks.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth()
-                            .combinedClickable(
-                                onClick = { extractMultipleImages = !extractMultipleImages },
-                                onLongClick = { extractMultipleImages = !extractMultipleImages }
-                            )
-                            .padding(vertical = 4.dp)
-                            .testTag("share_extract_multiple_checkbox"),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = extractMultipleImages,
-                            onCheckedChange = { extractMultipleImages = it },
-                            colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Column {
-                            Text("Add multiple main images from webpage",
-                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Extract content images in order",
-                                fontSize = 10.sp, color = PinterestTextSecondary)
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    if (isSelectMode) "Select multiple destination boards:"
-                    else "Choose destination board (already saved to default):",
-                    fontSize = 12.sp, color = PinterestTextSecondary
-                )
-                Spacer(Modifier.height(10.dp))
-
-                if (isLoadingBoards) {
-                    Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = PinterestRed, strokeWidth = 2.dp)
-                    }
-                } else {
-                    FlowRow(
-                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        boards.forEach { board ->
-                            val isSelected = selectedBoardIds.contains(board.id)
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = if (isSelected) PinterestBlack else PinterestPillGray,
-                                modifier = Modifier
-                                    .combinedClickable(
-                                        onClick = {
-                                            if (isSelectMode) {
-                                                if (isSelected) selectedBoardIds.remove(board.id)
-                                                else selectedBoardIds.add(board.id)
-                                            } else {
-                                                selectedBoardIds.clear()
-                                                selectedBoardIds.add(board.id)
-                                                onSaveToBoards(listOf(board.id), extractMultipleImages)
-                                            }
-                                        },
-                                        onLongClick = {
-                                            isSelectMode = true
-                                            if (isSelected) selectedBoardIds.remove(board.id)
-                                            else selectedBoardIds.add(board.id)
-                                        }
-                                    )
-                                    .testTag("share_target_board_${board.id}")
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                                ) {
-                                    if (isSelected) {
-                                        Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(14.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                    }
-                                    Text(
-                                        board.title,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isSelected) Color.White else PinterestBlack,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                    if (board.isDefault) {
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("(Default)", fontSize = 10.sp,
-                                            color = if (isSelected) Color.LightGray else PinterestTextSecondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(16.dp))
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("X exits · already in default", fontSize = 11.sp, color = PinterestTextSecondary)
-                    Button(
-                        onClick = {
-                            if (selectedBoardIds.isNotEmpty()) {
-                                onSaveToBoards(selectedBoardIds.toList(), extractMultipleImages)
-                            } else {
-                                onClose()
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
-                        shape = RoundedCornerShape(20.dp),
-                        modifier = Modifier.testTag("share_dialog_save_btn")
-                    ) {
-                        Text(
-                            if (selectedBoardIds.size > 1) "Save to ${selectedBoardIds.size} Boards" else "Save",
-                            color = Color.White, fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-'''
-
-NEW_ADD_MANUAL = r'''package com.example.ui.dialogs
-
-import android.content.ClipboardManager
-import android.content.Context
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AddPhotoAlternate
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.ContentPaste
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.OutlinedTextFieldDefaults
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.example.model.PinterestBoard
-import com.example.ui.theme.PinterestBlack
-import com.example.ui.theme.PinterestPillGray
-import com.example.ui.theme.PinterestRed
-import com.example.ui.theme.PinterestTextSecondary
-import com.example.util.LinkExtractor
-
-
-@OptIn(ExperimentalLayoutApi::class)
-@Composable
-fun AddManualImagesDialog(
+fun DeleteSelectionDialog(
     isOpen: Boolean,
-    availableBoards: List<PinterestBoard>,
-    currentBoardId: String?,
-    currentAlbumTitle: String? = null,
+    pinCount: Int,
+    albumCount: Int,
     onDismiss: () -> Unit,
-    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean) -> Unit
+    onDissolve: () -> Unit,
+    onDeleteAll: () -> Unit
 ) {
     if (!isOpen) return
-
-    val context = LocalContext.current
-    var textInput by remember { mutableStateOf("") }
-    var extractMultipleImages by remember { mutableStateOf(false) }
-    var boardsExpanded by remember { mutableStateOf(false) }
-
-    val selectedBoardIds = remember(availableBoards, currentBoardId) {
-        val initial = mutableStateListOf<String>()
-        if (!currentBoardId.isNullOrBlank() && availableBoards.any { it.id == currentBoardId }) {
-            initial.add(currentBoardId)
-        } else {
-            (availableBoards.firstOrNull { it.isDefault }?.id
-                ?: availableBoards.firstOrNull()?.id)?.let { initial.add(it) }
-        }
-        initial
-    }
-
-    val extractedLinks = remember(textInput) { LinkExtractor.extractLinks(textInput) }
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.AddPhotoAlternate, null, tint = PinterestRed, modifier = Modifier.size(24.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Add Images Manually", fontWeight = FontWeight.Bold, fontSize = 18.sp)
-            }
+            Text(
+                text = "Choose how to delete selected albums:",
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp
+            )
         },
         text = {
-            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
-                Text("Paste image links or webpage URLs.",
-                    color = PinterestTextSecondary, fontSize = 13.sp)
-                if (!currentAlbumTitle.isNullOrBlank()) {
-                    Spacer(Modifier.height(6.dp))
-                    Text("Will be added to album: $currentAlbumTitle",
-                        color = PinterestRed, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                }
-                Spacer(Modifier.height(10.dp))
-
-                OutlinedTextField(
-                    value = textInput,
-                    onValueChange = { textInput = it },
-                    label = { Text("Links or Unstructured Text", fontSize = 13.sp) },
-                    placeholder = { Text("Paste text or links here...", fontSize = 13.sp) },
-                    minLines = 4, maxLines = 6,
-                    supportingText = {
-                        Text(
-                            if (extractedLinks.isNotEmpty()) "Found ${extractedLinks.size} link(s)"
-                            else "No links found yet",
-                            fontSize = 11.sp,
-                            fontWeight = if (extractedLinks.isNotEmpty()) FontWeight.Bold else FontWeight.Normal,
-                            color = if (extractedLinks.isNotEmpty()) PinterestRed else PinterestTextSecondary
-                        )
-                    },
-                    trailingIcon = {
-                        IconButton(onClick = {
-                            val cb = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
-                            val clipText = cb?.primaryClip?.getItemAt(0)?.text?.toString()
-                            if (!clipText.isNullOrBlank()) {
-                                textInput = if (textInput.isBlank()) clipText.trim()
-                                else textInput + "\n" + clipText.trim()
-                            }
-                        }) {
-                            Icon(Icons.Default.ContentPaste, "Paste", tint = PinterestRed, modifier = Modifier.size(20.dp))
-                        }
-                    },
-                    colors = OutlinedTextFieldDefaults.colors(
-                        focusedBorderColor = PinterestRed, cursorColor = PinterestRed),
-                    shape = RoundedCornerShape(12.dp),
-                    modifier = Modifier.fillMaxWidth().testTag("manual_images_input_field")
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    text = if (pinCount > 0)
+                        "$albumCount album(s) + $pinCount image(s) selected"
+                    else
+                        "$albumCount album(s) selected",
+                    fontSize = 12.sp,
+                    color = PinterestTextSecondary
                 )
-
-                Spacer(Modifier.height(10.dp))
-
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                        .clickable { extractMultipleImages = !extractMultipleImages }
-                        .padding(vertical = 4.dp)
-                        .testTag("extract_multiple_images_checkbox")
-                ) {
-                    Checkbox(
-                        checked = extractMultipleImages,
-                        onCheckedChange = { extractMultipleImages = it },
-                        colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
-                    )
-                    Spacer(Modifier.width(6.dp))
-                    Column {
-                        Text("Add multiple main images from webpage",
-                            fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-                        Text("Extract all content images from webpage in order",
-                            fontSize = 11.sp, color = PinterestTextSecondary)
-                    }
-                }
-
                 Spacer(Modifier.height(12.dp))
 
-                Row(
-                    modifier = Modifier.fillMaxWidth()
-                        .clickable { boardsExpanded = !boardsExpanded }
-                        .padding(vertical = 6.dp)
-                        .testTag("boards_selector_toggle"),
-                    verticalAlignment = Alignment.CenterVertically
+                // Option A: Dissolve
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = PinterestPillGray,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onDissolve() }
+                        .testTag("delete_option_dissolve")
                 ) {
-                    Text(
-                        "Adding to: ${selectedBoardIds.size} board${if (selectedBoardIds.size != 1) "s" else ""}",
-                        fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
-                        color = PinterestTextSecondary,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Text(if (boardsExpanded) "▲" else "▼", fontSize = 11.sp, color = PinterestRed)
-                }
-                AnimatedVisibility(visible = boardsExpanded) {
-                    Column {
-                        Spacer(Modifier.height(6.dp))
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp),
-                            modifier = Modifier.fillMaxWidth()
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFE3F2FD)),
+                            contentAlignment = Alignment.Center
                         ) {
-                            availableBoards.forEach { board ->
-                                val isChecked = selectedBoardIds.contains(board.id)
-                                Surface(
-                                    shape = RoundedCornerShape(16.dp),
-                                    color = if (isChecked) PinterestBlack else PinterestPillGray,
-                                    modifier = Modifier
-                                        .clickable {
-                                            if (isChecked) selectedBoardIds.remove(board.id)
-                                            else selectedBoardIds.add(board.id)
-                                        }
-                                        .testTag("select_target_board_${board.id}")
-                                ) {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                    ) {
-                                        if (isChecked) {
-                                            Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(14.dp))
-                                            Spacer(Modifier.width(4.dp))
-                                        }
-                                        Text(board.title, fontSize = 12.sp,
-                                            fontWeight = if (isChecked) FontWeight.Bold else FontWeight.Medium,
-                                            color = if (isChecked) Color.White else PinterestBlack)
-                                    }
-                                }
-                            }
+                            Icon(
+                                imageVector = Icons.Default.FolderOff,
+                                contentDescription = null,
+                                tint = Color(0xFF1976D2),
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Dissolve album, keep inside images",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                color = PinterestBlack
+                            )
+                            Text(
+                                "Images stay on the board as loose pins.",
+                                fontSize = 11.sp,
+                                color = PinterestTextSecondary
+                            )
                         }
                     }
                 }
 
                 Spacer(Modifier.height(8.dp))
-                Text("Tip: Any custom boards with matching domains will also receive these images.",
-                    fontSize = 11.sp, color = PinterestTextSecondary)
-            }
-        },
-        confirmButton = {
-            Button(
-                onClick = {
-                    if (extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty()) {
-                        onAddImages(textInput.trim(), selectedBoardIds.toList(), extractMultipleImages)
-                        onDismiss()
+
+                // Option B: Delete album + contents
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = PinterestPillGray,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { onDeleteAll() }
+                        .testTag("delete_option_with_contents")
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(32.dp)
+                                .clip(CircleShape)
+                                .background(PinterestRed.copy(alpha = 0.15f)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.DeleteOutline,
+                                contentDescription = null,
+                                tint = PinterestRed,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                        Spacer(Modifier.width(10.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Delete album + images inside",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 13.sp,
+                                color = PinterestBlack
+                            )
+                            Text(
+                                "Images are permanently removed. Undo is available.",
+                                fontSize = 11.sp,
+                                color = PinterestTextSecondary
+                            )
+                        }
                     }
-                },
-                enabled = extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty(),
-                colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
-                shape = RoundedCornerShape(20.dp),
-                modifier = Modifier.testTag("confirm_add_manual_images_btn")
-            ) {
-                Text("Add ${extractedLinks.size} Link${if (extractedLinks.size > 1) "s" else ""}",
-                    color = Color.White, fontWeight = FontWeight.Bold)
+                }
+
+                if (pinCount > 0) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "Explicitly selected images are deleted regardless of choice above.",
+                        fontSize = 11.sp,
+                        color = PinterestTextSecondary
+                    )
+                }
             }
         },
+        confirmButton = {},
         dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Cancel", color = PinterestBlack) }
+            TextButton(onClick = onDismiss) {
+                Text("Cancel", color = PinterestBlack)
+            }
         },
         shape = RoundedCornerShape(20.dp)
     )
 }
 '''
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(content, encoding="utf-8")
+    log("  ✓ created")
 
 
 # ============================================================
-# Fix function
+# PATCH 6 — Gallery screen
 # ============================================================
-def patch_fix_compile_errors():
-    log("\n=== FIX: Compile errors from prior album patch ===")
-
-    # 1. Full rewrite of two broken files
-    st = PROJECT_ROOT / "app/src/main/java/com/example/ui/ShareTargetActivity.kt"
-    st.write_text(NEW_SHARE_TARGET, encoding="utf-8")
-    log("  ✓ ShareTargetActivity.kt fully rewritten")
-
-    amd = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/AddManualImagesDialog.kt"
-    amd.write_text(NEW_ADD_MANUAL, encoding="utf-8")
-    log("  ✓ AddManualImagesDialog.kt fully rewritten")
-
-    # 2. Surgical fix for PinBoardGalleryScreen.kt
-    pgs = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    t = pgs.read_text(encoding="utf-8")
+def patch_gallery_screen():
+    log("\n=== PATCH: PinBoardGalleryScreen ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
     changed = False
 
-    # 2a. Remove misplaced scroll effect (before galleryItems)
-    misplaced = (
-        '    // Scroll to album when requested (after combine/creation)\n'
-        '    LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {\n'
-        '        val targetId = scrollToAlbumId ?: return@LaunchedEffect\n'
-        '        val idx = galleryItemsPlaceholder.indexOfFirst { it.album?.id == targetId }\n'
-        '        if (idx >= 0) {\n'
-        '            val hc = (if (browserWorker != null && isBrowserTestingVisible) 1 else 0) +\n'
-        '                     (if (currentBoard != null) 1 else 0) +\n'
-        '                     (if (isLoading) 1 else 0)\n'
-        '            boardGridState.animateScrollToItem(hc + idx)\n'
-        '            viewModel.consumeScrollRequest()\n'
-        '        }\n'
-        '    }\n'
-        '\n'
+    # (a) Album pins sort by dateAddedMillis (both board-level and opened-album)
+    old_sort1 = (
+        '            val albumPins = allPinsForAlbums.filter { it.albumId == entity.id }\n'
+        '                .sortedBy { it.boardPosition }\n'
     )
-    if misplaced in t:
-        t = t.replace(misplaced, "", 1); changed = True
-        log("  ✓ removed misplaced scroll-to-album effect")
-
-    # 2b. Add it correctly after galleryItemsPlaceholder declaration
-    gallery_anchor = '    val galleryItemsPlaceholder = galleryItems\n'
-    effect_after = (
-        '    val galleryItemsPlaceholder = galleryItems\n'
-        '\n'
-        '    // Scroll to album when requested (after combine/creation)\n'
-        '    LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {\n'
-        '        val targetId = scrollToAlbumId ?: return@LaunchedEffect\n'
-        '        val idx = galleryItemsPlaceholder.indexOfFirst { it.album?.id == targetId }\n'
-        '        if (idx >= 0) {\n'
-        '            val hc = (if (browserWorker != null && isBrowserTestingVisible) 1 else 0) +\n'
-        '                     (if (currentBoard != null) 1 else 0) +\n'
-        '                     (if (isLoading) 1 else 0)\n'
-        '            boardGridState.animateScrollToItem(hc + idx)\n'
-        '            viewModel.consumeScrollRequest()\n'
-        '        }\n'
-        '    }\n'
+    new_sort1 = (
+        '            val albumPins = allPinsForAlbums.filter { it.albumId == entity.id }\n'
+        '                .sortedByDescending { it.dateAddedMillis }\n'
     )
-    if gallery_anchor in t and "LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder)" not in t:
-        t = t.replace(gallery_anchor, effect_after, 1); changed = True
-        log("  ✓ scroll-to-album effect added after galleryItems")
+    if old_sort1 in t:
+        t = t.replace(old_sort1, new_sort1, 1); changed = True
+        log("  ✓ album pins sorted by dateAddedMillis")
 
-    # 2c. rememberUpdatedState import (use mutableStateOf anchor, not rememberSaveable)
-    if "import androidx.compose.runtime.rememberUpdatedState" not in t:
-        for anchor in [
-            'import androidx.compose.runtime.mutableStateOf\n',
-            'import androidx.compose.runtime.mutableFloatStateOf\n',
-        ]:
-            if anchor in t:
-                t = t.replace(anchor, anchor + 'import androidx.compose.runtime.rememberUpdatedState\n', 1)
+    # Also the opened-album pins get re-sorted at render
+    old_open = '                    val albumPins = activeAlbum!!.pins\n'
+    new_open = '                    val albumPins = activeAlbum!!.pins.sortedByDescending { it.dateAddedMillis }\n'
+    if old_open in t:
+        t = t.replace(old_open, new_open, 1); changed = True
+        log("  ✓ opened album pins sorted")
+
+    # (b) Collect new state
+    if "val deletedSelectionUndo" not in t and "val deletedPinsUndo by viewModel.deletedPinsUndo" in t:
+        anchor = '    val deletedPinsUndo by viewModel.deletedPinsUndo.collectAsStateWithLifecycle()\n'
+        add = (
+            anchor +
+            '    // (deletedPinsUndo now includes album info for mixed deletes)\n'
+        )
+        # No new state needed — we extended DeletedPinsUndoState
+        pass  # existing collection covers it
+
+    # (c) Delete button routing + dialog state
+    if "showDeleteSelectionDialog" not in t:
+        anchor = '    var showMoveDialog by remember { mutableStateOf(false) }\n'
+        add = (
+            '    var showMoveDialog by remember { mutableStateOf(false) }\n'
+            '    var showDeleteSelectionDialog by remember { mutableStateOf(false) }\n'
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ showDeleteSelectionDialog state")
+
+    # (d) Update MultiSelectBottomBar onDeleteSelected
+    old_del = (
+        '                    onDeleteSelected = {\n'
+        '                        if (selectedPinIds.isNotEmpty()) viewModel.deletePinsFromCurrentBoard(selectedPinIds)\n'
+        '                        if (selectedAlbumIds.isNotEmpty()) viewModel.deleteSelectedAlbums()\n'
+        '                    },\n'
+    )
+    new_del = (
+        '                    onDeleteSelected = {\n'
+        '                        if (selectedAlbumIds.isNotEmpty()) {\n'
+        '                            showDeleteSelectionDialog = true\n'
+        '                        } else if (selectedPinIds.isNotEmpty()) {\n'
+        '                            viewModel.deletePinsFromCurrentBoard(selectedPinIds)\n'
+        '                        }\n'
+        '                    },\n'
+    )
+    if old_del in t:
+        t = t.replace(old_del, new_del, 1); changed = True
+        log("  ✓ delete button routes to dialog when albums present")
+
+    # (e) Render DeleteSelectionDialog — insert after the Copy/Move dialogs, before the end of the composable
+    if "DeleteSelectionDialog(" not in t:
+        anchor = '    CopyOrMoveImagesDialog(\n        isOpen = showMoveDialog,\n'
+        # find the closing of Move dialog call; insert after it
+        idx = t.find(anchor)
+        if idx >= 0:
+            # find the closing "    )\n" of Move dialog
+            close_idx = t.find("    )\n", idx)
+            if close_idx >= 0:
+                insert_at = close_idx + len("    )\n")
+                dialog_block = (
+                    '\n'
+                    '    // Delete selection (albums involved) — ask how\n'
+                    '    DeleteSelectionDialog(\n'
+                    '        isOpen = showDeleteSelectionDialog,\n'
+                    '        pinCount = selectedPinIds.size,\n'
+                    '        albumCount = selectedAlbumIds.size,\n'
+                    '        onDismiss = { showDeleteSelectionDialog = false },\n'
+                    '        onDissolve = {\n'
+                    '            viewModel.deleteSelectionAndAlbums(selectedPinIds, selectedAlbumIds, com.example.viewmodel.DeleteSelectionMode.DISSOLVE)\n'
+                    '            showDeleteSelectionDialog = false\n'
+                    '        },\n'
+                    '        onDeleteAll = {\n'
+                    '            viewModel.deleteSelectionAndAlbums(selectedPinIds, selectedAlbumIds, com.example.viewmodel.DeleteSelectionMode.DELETE_WITH_CONTENTS)\n'
+                    '            showDeleteSelectionDialog = false\n'
+                    '        }\n'
+                    '    )\n'
+                )
+                t = t[:insert_at] + dialog_block + t[insert_at:]
                 changed = True
-                log("  ✓ rememberUpdatedState import added")
-                break
+                log("  ✓ DeleteSelectionDialog rendered")
 
-    # 2d. Wrap pending banner in full-screen Box so .align works
-    old_banner_start = (
-        '    // Pending album transfer banner (bottom, hides select bar)\n'
-        '    pendingAlbumTransfer?.let { transfer ->\n'
+    # Import DeleteSelectionDialog
+    if "import com.example.ui.dialogs.DeleteSelectionDialog" not in t:
+        t = t.replace(
+            'import com.example.ui.dialogs.DeleteFromAllConfirmationDialog\n',
+            'import com.example.ui.dialogs.DeleteFromAllConfirmationDialog\n'
+            'import com.example.ui.dialogs.DeleteSelectionDialog\n',
+            1,
+        )
+        changed = True
+
+    # (f) Banner button "Move here"/"Copy here"
+    old_banner_row = (
+        '                Text(\n'
+        '                    text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",\n'
+        '                    color = Color.White,\n'
+        '                    fontSize = 13.sp,\n'
+        '                    fontWeight = FontWeight.Medium,\n'
+        '                    modifier = Modifier.weight(1f)\n'
+        '                )\n'
     )
-    new_banner_start = (
-        '    // Pending album transfer banner (wrapped in full-screen Box for .align)\n'
-        '    androidx.compose.foundation.layout.Box(modifier = Modifier.fillMaxSize()) {\n'
-        '        pendingAlbumTransfer?.let { transfer ->\n'
+    new_banner_row = (
+        '                Text(\n'
+        '                    text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",\n'
+        '                    color = Color.White,\n'
+        '                    fontSize = 13.sp,\n'
+        '                    fontWeight = FontWeight.Medium,\n'
+        '                    modifier = Modifier.weight(1f)\n'
+        '                )\n'
+        '                androidx.compose.material3.TextButton(\n'
+        '                    onClick = { viewModel.executeAlbumTransferToCurrentBoard() },\n'
+        '                    modifier = Modifier.testTag("album_transfer_here_btn")\n'
+        '                ) {\n'
+        '                    Text(\n'
+        '                        text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",\n'
+        '                        color = Color(0xFF64B5F6),\n'
+        '                        fontWeight = FontWeight.Bold,\n'
+        '                        fontSize = 12.sp\n'
+        '                    )\n'
+        '                }\n'
     )
-    if old_banner_start in t:
-        t = t.replace(old_banner_start, new_banner_start, 1); changed = True
-        # Close the Box after the banner block
-        # Find the banner's closing: `    }\n\n    // Album position dialog`
-        close_marker = '    }\n\n    // Album position dialog\n'
-        close_new = '        }\n    }\n\n    // Album position dialog\n'
-        if close_marker in t:
-            t = t.replace(close_marker, close_new, 1)
-            changed = True
-            log("  ✓ pending banner wrapped in Box (align fixed)")
+    if old_banner_row in t:
+        t = t.replace(old_banner_row, new_banner_row, 1); changed = True
+        log("  ✓ banner Move here / Copy here button")
 
-    if changed:
-        pgs.write_text(t, encoding="utf-8")
-    else:
-        log("  ✓ PinBoardGalleryScreen.kt already OK")
+    # (g) Unified banner display for DeletedPinsUndoState (albums + pins)
+    old_banner_text = (
+        '                        Text(\n'
+        '                            text = "Deleted ${undoState.pins.size} image${if (undoState.pins.size > 1) "s" else ""}",\n'
+    )
+    new_banner_text = (
+        '                        Text(\n'
+        '                            text = run {\n'
+        '                                val pinCount = undoState.pins.size\n'
+        '                                val albumCount = undoState.albums.size\n'
+        '                                when {\n'
+        '                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DISSOLVE && albumCount > 0 && pinCount > 0 ->\n'
+        '                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""}, dissolved $albumCount album${if (albumCount > 1) "s" else ""}"\n'
+        '                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DISSOLVE && albumCount > 0 ->\n'
+        '                                        "Dissolved $albumCount album${if (albumCount > 1) "s" else ""}"\n'
+        '                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DELETE_WITH_CONTENTS && albumCount > 0 ->\n'
+        '                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""} + $albumCount album${if (albumCount > 1) "s" else ""}"\n'
+        '                                    else ->\n'
+        '                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""}"\n'
+        '                                }\n'
+        '                            },\n'
+    )
+    if old_banner_text in t:
+        t = t.replace(old_banner_text, new_banner_text, 1); changed = True
+        log("  ✓ undo banner label (albums + pins)")
 
-    # 3. Harden headless JVM config
-    gp = PROJECT_ROOT / "gradle.properties"
-    g = gp.read_text(encoding="utf-8")
-    gp_changed = False
-    for line in [
-        "systemProp.java.awt.headless=true",
-        "kotlin.daemon.jvmargs=-Xmx2g -Djava.awt.headless=true -Dfile.encoding=UTF-8",
-    ]:
-        if line.split("=")[0] not in g:
-            g += "\n" + line + "\n"
-            gp_changed = True
-    if gp_changed:
-        gp.write_text(g, encoding="utf-8")
-        log("  ✓ gradle.properties: extra headless props")
+    if changed: f.write_text(t, encoding="utf-8")
 
 
 # ============================================================
-# Build pipeline (unchanged)
+# Standard pipeline (unchanged from prior turns)
 # ============================================================
 def read_app_version():
     p = PROJECT_ROOT / "app/build.gradle.kts"
@@ -966,7 +975,6 @@ def ensure_release_keystore():
                         "-keypass", KEYSTORE_PASS, "-dname", KEYSTORE_DNAME],
                        capture_output=True, text=True)
     if r.returncode != 0: sys.exit(1)
-    log("  ✓ Generated")
 
 
 def find_braced(text, start):
@@ -1010,9 +1018,8 @@ def patch_build_gradle():
 
 def latest_gradle_version():
     try:
-        req = urllib.request.Request(
-            "https://api.github.com/repos/gradle/gradle/releases/latest",
-            headers={"User-Agent": "pinboard"})
+        req = urllib.request.Request("https://api.github.com/repos/gradle/gradle/releases/latest",
+                                     headers={"User-Agent": "pinboard"})
         with urllib.request.urlopen(req, timeout=30) as r:
             tag = json.load(r).get("tag_name", "").lstrip("v")
             if tag: return tag
@@ -1026,13 +1033,10 @@ def latest_gradle_version():
 
 def ensure_gradle_wrapper():
     log("\n=== gradle wrapper ===")
-    gw = PROJECT_ROOT / "gradlew"
-    gwb = PROJECT_ROOT / "gradlew.bat"
+    gw = PROJECT_ROOT / "gradlew"; gwb = PROJECT_ROOT / "gradlew.bat"
     jar = PROJECT_ROOT / "gradle/wrapper/gradle-wrapper.jar"
-    if gw.exists() and gwb.exists() and jar.exists():
-        log("  ✓ Present"); return
-    ver = latest_gradle_version()
-    base = f"https://raw.githubusercontent.com/gradle/gradle/v{ver}"
+    if gw.exists() and gwb.exists() and jar.exists(): log("  ✓"); return
+    ver = latest_gradle_version(); base = f"https://raw.githubusercontent.com/gradle/gradle/v{ver}"
     for url, dest in [(f"{base}/gradlew", gw), (f"{base}/gradlew.bat", gwb),
                       (f"{base}/gradle/wrapper/gradle-wrapper.jar", jar)]:
         if dest.exists() and dest.stat().st_size > 0: continue
@@ -1045,10 +1049,8 @@ def ensure_gradle_wrapper():
 
 def write_workflow():
     log("\n=== workflow ===")
-    wf = PROJECT_ROOT / ".github/workflows"
-    wf.mkdir(parents=True, exist_ok=True)
+    wf = PROJECT_ROOT / ".github/workflows"; wf.mkdir(parents=True, exist_ok=True)
     (wf / "build.yml").write_text(WORKFLOW_YAML, encoding="utf-8")
-    log("  ✓")
 
 
 def setup_git():
@@ -1072,8 +1074,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Fix compile errors: share activity + manual dialog rewrite, gallery fixes"])
-        log("  ✓ committed")
+        run(["git", "commit", "-m", "Select-mode round 2: label, save icon, album delete dialog, gestures, banner"])
 
 
 def verify_keystore_tracked():
@@ -1185,9 +1186,8 @@ def verify_apk(apk):
     if not s: log("  skip"); return
     r = subprocess.run([s, "verify", "--verbose", "--print-certs", str(apk)], capture_output=True, text=True)
     out = (r.stdout + r.stderr).strip()
-    log("\n".join(f"  {l}" for l in out.splitlines()[:10]))
-    if r.returncode != 0 or "Verifies" not in out:
-        log("  ✗"); sys.exit(1)
+    log("\n".join(f"  {l}" for l in out.splitlines()[:8]))
+    if r.returncode != 0 or "Verifies" not in out: log("  ✗"); sys.exit(1)
     log("  ✓")
 
 
@@ -1223,13 +1223,19 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — fix compile errors")
+    log("PinBoard — select-mode fixes round 2")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_fix_compile_errors()
+    patch_multiselect_bar()
+    patch_copy_move_dialog()
+    patch_album_card()
+    patch_new_delete_dialog()
+    patch_viewmodel()
+    patch_gallery_screen()
+
     ensure_release_keystore()
     patch_build_gradle()
     ensure_gradle_wrapper()

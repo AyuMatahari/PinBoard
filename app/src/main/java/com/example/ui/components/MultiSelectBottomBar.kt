@@ -102,15 +102,11 @@ fun MultiSelectBottomBar(
                     Spacer(modifier = Modifier.width(4.dp))
 
                     Text(
-                        text = buildString {
-                            append(selectedPinCount)
-                            append(" img")
-                            if (selectedAlbumCount > 0) {
-                                append(" · ")
-                                append(selectedAlbumCount)
-                                append(" alb")
-                            }
-                        },
+                        text = if (selectedPinCount > 0 && selectedAlbumCount > 0)
+                            "${selectedPinCount + selectedAlbumCount} itm"
+                        else if (selectedPinCount > 0) "$selectedPinCount img"
+                        else if (selectedAlbumCount > 0) "$selectedAlbumCount alb"
+                        else "0",
                         style = MaterialTheme.typography.titleSmall.copy(
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.sp

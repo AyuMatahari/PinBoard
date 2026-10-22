@@ -31,6 +31,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -84,6 +85,10 @@ fun AlbumCard(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val currentOnClick by rememberUpdatedState(onClick)
+    val currentOnLongClick by rememberUpdatedState(onLongClick)
+    val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)
+    val currentOnSwipePreview by rememberUpdatedState(onSwipePreview)
     val pins = album.pins
     val allAlbumPins = if (pins.isNotEmpty()) pins else album.subAlbums.flatMap { it.pins }
     val topPin = allAlbumPins.firstOrNull()
@@ -94,7 +99,7 @@ fun AlbumCard(
         modifier = modifier
             .fillMaxWidth()
             .testTag("album_card_${album.id}")
-            .pointerInput(album.id) {
+            .pointerInput(album.id, isSelectionMode) {
                 awaitEachGesture {
                     val down = awaitFirstDown(requireUnconsumed = false)
                     val startPos = down.position
@@ -132,7 +137,7 @@ fun AlbumCard(
                     if (timeoutResult == null && !isHorizontalSwipe) {
                         longPressed = true
                         down.consume()
-                        if (isSelectionMode) onSelectToggle() else onLongClick()
+                        if (isSelectionMode) currentOnClick() else currentOnLongClick()
                         do {
                             val event = awaitPointerEvent()
                             event.changes.forEach { it.consume() }
@@ -151,10 +156,10 @@ fun AlbumCard(
                         } while (event.changes.any { it.pressed })
 
                         if (kotlin.math.abs(totalDragX) > 30f) {
-                            onSwipePreview()
+                            currentOnSwipePreview()
                         }
                     } else if (timeoutResult == false && !longPressed) {
-                        if (isSelectionMode) onSelectToggle() else onClick()
+                        if (isSelectionMode) currentOnSelectToggle() else currentOnClick()
                     }
                 }
             }

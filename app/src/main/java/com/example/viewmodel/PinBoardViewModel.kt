@@ -38,12 +38,17 @@ import org.json.JSONObject
 data class DeletedPinsUndoState(
     val boardId: String,
     val pins: List<PinItem>,
-    val imageUrls: List<String> = pins.map { it.imageUrl }
+    val imageUrls: List<String> = pins.map { it.imageUrl },
+    val albums: List<com.example.data.local.CustomAlbumEntity> = emptyList(),
+    val dissolvedLinks: Map<String, String> = emptyMap(),
+    val mode: DeleteSelectionMode = DeleteSelectionMode.PINS_ONLY
 )
 
 enum class AlbumPosition { TOP_OF_BOARD, TOP_SELECTED, MIDDLE_SELECTED, BOTTOM_SELECTED }
 
 enum class AlbumTransferMode { COPY, MOVE }
+
+enum class DeleteSelectionMode { DISSOLVE, DELETE_WITH_CONTENTS, PINS_ONLY }
 
 data class PendingAlbumTransfer(
     val pinIds: Set<String>,
@@ -2218,12 +2223,19 @@ class PinBoardViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             val ctx = appContext ?: return@launch
             val dao = AppDatabase.getDatabase(ctx).boardDao()
+            if (undo.albums.isNotEmpty()) {
+                dao.insertAlbums(undo.albums)
+            }
             val entities = undo.pins.mapIndexed { idx, p -> PinEntity.fromPinItem(p, undo.boardId, idx) }
-            dao.insertPins(entities)
+            if (entities.isNotEmpty()) dao.insertPins(entities)
+            undo.dissolvedLinks.forEach { (pinId, albumId) ->
+                try { dao.movePinsToAlbum(listOf(pinId), albumId) } catch (_: Throwable) {}
+            }
             refreshAvailableBoardsFromDatabaseInternal(dao)
         }
 
-        _snackbarMessage.value = "Restored ${undo.pins.size} image${if (undo.pins.size > 1) "s" else ""}"
+        val albumMsg = if (undo.albums.isNotEmpty()) " + ${undo.albums.size} album${if (undo.albums.size > 1) "s" else ""}" else ""
+        _snackbarMessage.value = "Restored ${undo.pins.size} image${if (undo.pins.size > 1) "s" else ""}$albumMsg"
     }
 
     fun requestDeleteFromAllBoards() {
@@ -2799,6 +2811,7 @@ class PinBoardViewModel(
             savedSelectionPinIds = _selectedPinIds.value,
             savedSelectionAlbumIds = _selectedAlbumIds.value
         )
+        _isSelectionMode.value = false
     }
 
     fun cancelAlbumTransferAndRestore() {
@@ -2853,6 +2866,150 @@ class PinBoardViewModel(
                 clearSelection()
                 _snackbarMessage.value = "${if (mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${sourcePins.size} image(s) to \"${targetAlbum.title}\""
             }
+        }
+    }
+
+    fun deleteSelectionAndAlbums(pinIds: Set<String>, albumIds: Set<String>, mode: DeleteSelectionMode) {
+        val board = _currentBoard.value ?: return
+        if (pinIds.isEmpty() && albumIds.isEmpty()) return
+        viewModelScope.launch {
+            val ctx = appContext ?: return@launch
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            val allPins = _rawPins.value
+            val albums = _customAlbums.value.filter { albumIds.contains(it.id) }
+            val albumPins = allPins.filter { it.albumId != null && albumIds.contains(it.albumId!!) }
+            val explicitPins = allPins.filter { pinIds.contains(it.id) }
+
+            val pinsToDelete: List<PinItem>
+            val dissolvedLinks = mutableMapOf<String, String>()
+
+            when (mode) {
+                DeleteSelectionMode.DELETE_WITH_CONTENTS -> {
+                    pinsToDelete = (explicitPins + albumPins).distinctBy { it.id }
+                }
+                DeleteSelectionMode.DISSOLVE -> {
+                    pinsToDelete = explicitPins
+                    albumPins.forEach { p -> p.albumId?.let { dissolvedLinks[p.id] = it } }
+                }
+                DeleteSelectionMode.PINS_ONLY -> {
+                    pinsToDelete = explicitPins
+                }
+            }
+
+            withContext(Dispatchers.IO) {
+                if (pinsToDelete.isNotEmpty()) {
+                    dao.deletePinsFromBoard(board.id, pinsToDelete.map { it.id })
+                }
+                albums.forEach { dao.deleteAlbum(it.id) }
+            }
+
+            val remaining = allPins
+                .filterNot { p -> pinsToDelete.any { pd -> pd.id == p.id } }
+                .map { p ->
+                    if (mode == DeleteSelectionMode.DISSOLVE &&
+                        p.albumId != null && albumIds.contains(p.albumId!!)) {
+                        p.copy(albumId = null)
+                    } else p
+                }
+            val remainingAlbums = _customAlbums.value.filterNot { albumIds.contains(it.id) }
+
+            _deletedPinsUndo.value = DeletedPinsUndoState(
+                boardId = board.id,
+                pins = pinsToDelete,
+                imageUrls = pinsToDelete.map { it.imageUrl },
+                albums = albums,
+                dissolvedLinks = dissolvedLinks,
+                mode = mode
+            )
+
+            withContext(Dispatchers.Main) {
+                _rawPins.value = remaining
+                _customAlbums.value = remainingAlbums
+                _currentBoard.value = board.copy(pins = remaining, pinCount = remaining.size)
+                updateDisplayedPins()
+                clearSelection()
+            }
+        }
+    }
+
+    // Move pins/albums to top of the board (also dissolves empty albums)
+    private suspend fun moveToTopInternal(pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {
+        val board = _currentBoard.value ?: return
+        val allPins = _rawPins.value
+        val maxPinDate = allPins.maxOfOrNull { it.dateAddedMillis } ?: 0L
+        val maxAlbumDate = _customAlbums.value.maxOfOrNull { it.dateAddedMillis } ?: 0L
+        var nextDate = maxOf(maxPinDate, maxAlbumDate) + 60_000L
+
+        val affectedAlbumIds = mutableSetOf<String>()
+        val updatedPins = allPins.map { p ->
+            if (pinIds.contains(p.id)) {
+                p.albumId?.let { affectedAlbumIds.add(it) }
+                p.copy(albumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }
+            } else p
+        }
+
+        val updatedAlbums = _customAlbums.value.map { a ->
+            if (albumIds.contains(a.id)) {
+                a.copy(dateAddedMillis = nextDate).also { nextDate += 1000L }
+            } else a
+        }
+
+        val nonEmptyAlbumIds = updatedPins.mapNotNull { it.albumId }.toSet()
+        val dissolvedAlbumIds = affectedAlbumIds - nonEmptyAlbumIds
+        val finalAlbums = updatedAlbums.filterNot { it.id in dissolvedAlbumIds }
+
+        withContext(Dispatchers.IO) {
+            dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, board.id, i) })
+            updatedAlbums.filter { it.id in albumIds }.forEach { dao.insertAlbum(it) }
+            dissolvedAlbumIds.forEach { dao.deleteAlbum(it) }
+        }
+
+        withContext(Dispatchers.Main) {
+            _rawPins.value = updatedPins
+            _customAlbums.value = finalAlbums
+            _currentBoard.value = board.copy(pins = updatedPins, pinCount = updatedPins.size)
+            updateDisplayedPins(resetLimit = true)
+        }
+    }
+
+    fun executeAlbumTransferToCurrentBoard() {
+        val transfer = _pendingAlbumTransfer.value ?: return
+        val currentBoard = _currentBoard.value ?: return
+        val sourceBoardId = transfer.sourceBoardId
+        viewModelScope.launch {
+            val ctx = appContext ?: return@launch
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            if (currentBoard.id == sourceBoardId) {
+                if (transfer.mode == AlbumTransferMode.MOVE) {
+                    moveToTopInternal(transfer.pinIds, emptySet(), dao)
+                    _snackbarMessage.value = "Moved ${transfer.pinIds.size} to top of board"
+                } else {
+                    _snackbarMessage.value = "Already on this board"
+                }
+            } else {
+                val pins = _rawPins.value.filter { transfer.pinIds.contains(it.id) }
+                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(currentBoard.id).toSet() }
+                val baseDate = System.currentTimeMillis()
+                val toAdd = pins.filter { !existingUrls.contains(it.imageUrl) }
+                    .mapIndexed { i, p -> p.copy(albumId = null, dateAddedMillis = baseDate + i * 1000L) }
+                withContext(Dispatchers.IO) {
+                    dao.insertPins(toAdd.mapIndexed { i, p -> PinEntity.fromPinItem(p, currentBoard.id, i) })
+                    if (transfer.mode == AlbumTransferMode.MOVE) {
+                        dao.deletePinsFromBoard(sourceBoardId, transfer.pinIds.toList())
+                    }
+                }
+                if (transfer.mode == AlbumTransferMode.MOVE) {
+                    val remaining = _rawPins.value.filterNot { transfer.pinIds.contains(it.id) }
+                    withContext(Dispatchers.Main) {
+                        _rawPins.value = remaining
+                        _currentBoard.value = currentBoard.copy(pins = remaining, pinCount = remaining.size)
+                        updateDisplayedPins()
+                    }
+                }
+                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${toAdd.size} to ${currentBoard.title}"
+            }
+            _pendingAlbumTransfer.value = null
+            withContext(Dispatchers.Main) { clearSelection() }
         }
     }
 
