@@ -327,7 +327,8 @@ object BackupManager {
         fun collectFrom(dir: File) {
             if (dir.exists() && dir.isDirectory) {
                 dir.listFiles { f ->
-                    f.isFile && f.extension.equals("json", ignoreCase = true)
+                    f.isFile && f.extension.equals("json", ignoreCase = true) &&
+                            f.name != "master_pins_archive.json"
                 }?.let { files.addAll(it) }
             }
         }
@@ -355,11 +356,32 @@ object BackupManager {
                 return@withContext Result.failure(Exception("Backup file does not exist or cannot be read"))
             }
 
-            val jsonStr = backupFile.readText()
-            val rootJson = JSONObject(jsonStr)
+            // Tolerant: pretty or compact JSON, strips UTF-8 BOM, trims whitespace.
+            val rawStr = backupFile.readText()
+            val jsonStr = rawStr.trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+            if (jsonStr.isBlank()) {
+                return@withContext Result.failure(Exception("Backup file is empty"))
+            }
+            val rootJson = try {
+                JSONObject(jsonStr)
+            } catch (t: Throwable) {
+                return@withContext Result.failure(
+                    Exception("Not a valid JSON backup: ${t.message ?: t.javaClass.simpleName}")
+                )
+            }
 
             val db = AppDatabase.getDatabase(context)
             val dao = db.boardDao()
+
+            val hasBoards = rootJson.has("boards")
+            val hasPins = rootJson.has("pins")
+            val hasSettings = rootJson.has("settings")
+            val hasHistory = rootJson.has("board_history")
+            if (!hasBoards && !hasPins && !hasSettings && !hasHistory) {
+                return@withContext Result.failure(
+                    Exception("Not a PinBoard backup (missing boards/pins/settings)")
+                )
+            }
 
             var restoredBoardsCount = 0
             var restoredPinsCount = 0
@@ -483,7 +505,7 @@ object BackupManager {
             Result.success(RestoreSummary(restoredBoardsCount, restoredPinsCount, settingsRestored))
         } catch (t: Throwable) {
             t.printStackTrace()
-            Result.failure(t)
+            Result.failure(Exception("Restore failed: ${t.message ?: t.javaClass.simpleName}"))
         }
     }
 }

@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery - Release Build + Deploy (auto)
-------------------------------------------------
-New features added on top of the previous script:
-  * Fullscreen image refresh button (reloads image from source URL)
-  * Unlimited option for backup files retention
-  * Restore dialog lists ALL .json files in the backup folder
-  * Backups are pretty-printed (compact restore still works)
+PinBoard Gallery
+----------------
+CURRENT CHANGE: Restore compat
+  * Restore dialog lists every .json in the backup folder
+    (except the internal master_pins_archive.json)
+  * Compact (old, single-line) AND pretty-printed JSON both restore
+  * UTF-8 BOM / stray whitespace tolerated
+  * Clear error message if a file isn't a PinBoard backup
 
-Plus the earlier fixes:
-  * Disable Arrow Navigation wiring
-  * release.keystore signing + assembleRelease CI
-  * Signature verification + device install
+FULL PIPELINE (runs every time):
+  1. apply restore-compat patch to BackupManager.kt
+  2. verify release.keystore + patch app/build.gradle.kts
+  3. ensure gradle wrapper + write CI workflow
+  4. commit + push to <user>/PinBoard
+  5. trigger CI → poll → download app-release artifact
+  6. save APK as  PinBoard-v{versionName}-{versionCode}.apk
+     into the folder from 'Apk Directory.txt'
+  7. verify signature (apksigner) → uninstall+install on device
 """
 
 import os
@@ -27,6 +33,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.resolve()
 REPO_NAME    = "PinBoard"
+APP_NAME     = "PinBoard"
 ARTIFACT     = "app-release"
 PACKAGE_ID   = "com.aistudio.pinboardgallery.kzwvpt"
 
@@ -133,155 +140,10 @@ def tool_available(name):
 
 
 # ============================================================
-# NEW PATCH 1: Fullscreen image refresh button
+# THIS TASK'S ONLY CODE PATCH — Restore compat
 # ============================================================
-def patch_fullscreen_refresh_button():
-    log("\n=== PATCH: Fullscreen image refresh button ===")
-    path = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
-    if not path.exists():
-        log(f"  ✗ {path} not found"); sys.exit(1)
-
-    text = path.read_text(encoding="utf-8")
-
-    if "fullscreen_refresh_image_button" in text:
-        log("  ✓ Already patched."); return
-
-    changed = False
-
-    # 1. Import Refresh icon
-    if "import androidx.compose.material.icons.filled.Refresh\n" not in text:
-        text = text.replace(
-            "import androidx.compose.material.icons.filled.Download\n",
-            "import androidx.compose.material.icons.filled.Download\n"
-            "import androidx.compose.material.icons.filled.Refresh\n",
-            1,
-        )
-        changed = True
-
-    # 2. Import mutableStateMapOf
-    if "import androidx.compose.runtime.mutableStateMapOf\n" not in text:
-        text = text.replace(
-            "import androidx.compose.runtime.mutableStateOf\n",
-            "import androidx.compose.runtime.mutableStateMapOf\n"
-            "import androidx.compose.runtime.mutableStateOf\n",
-            1,
-        )
-        changed = True
-
-    # 3. Add per-pin refresh counter state (next to pinForImageHoldDialog)
-    anchor_state = "    var pinForImageHoldDialog by remember { mutableStateOf<PinItem?>(null) }\n"
-    if anchor_state in text and "imageRefreshKeys" not in text:
-        text = text.replace(
-            anchor_state,
-            anchor_state +
-            "    // Per-pin refresh counter; increment forces a fresh network fetch\n"
-            "    val imageRefreshKeys = remember { mutableStateMapOf<String, Int>() }\n",
-            1,
-        )
-        changed = True
-
-    # 4. Insert refresh button right after the favorite toggle button
-    fav_block = (
-        "                        // Favorite toggle button (User requirement)\n"
-        "                        IconButton(\n"
-        "                            onClick = { onToggleFavorite(currentPin) },\n"
-        "                            modifier = Modifier\n"
-        "                                .size(38.dp)\n"
-        "                                .testTag(\"fullscreen_favorite_button\")\n"
-        "                        ) {\n"
-        "                            Icon(\n"
-        "                                imageVector = if (pinIsFavorite) Icons.Default.Favorite else Icons.Default.FavoriteBorder,\n"
-        "                                contentDescription = \"Toggle favorite\",\n"
-        "                                tint = if (pinIsFavorite) PinterestRed else Color.White\n"
-        "                            )\n"
-        "                        }\n"
-    )
-    refresh_insert = (
-        "\n"
-        "                        // Refresh image button (reloads from source URL, bypasses cache)\n"
-        "                        IconButton(\n"
-        "                            onClick = {\n"
-        "                                val key = currentPin.id\n"
-        "                                imageRefreshKeys[key] = (imageRefreshKeys[key] ?: 0) + 1\n"
-        "                                Toast.makeText(context, \"Refreshing image...\", Toast.LENGTH_SHORT).show()\n"
-        "                            },\n"
-        "                            modifier = Modifier\n"
-        "                                .size(38.dp)\n"
-        "                                .testTag(\"fullscreen_refresh_image_button\")\n"
-        "                        ) {\n"
-        "                            Icon(\n"
-        "                                imageVector = Icons.Default.Refresh,\n"
-        "                                contentDescription = \"Refresh image\",\n"
-        "                                tint = Color.White\n"
-        "                            )\n"
-        "                        }\n"
-    )
-    if fav_block in text and "fullscreen_refresh_image_button" not in text:
-        text = text.replace(fav_block, fav_block + refresh_insert, 1)
-        changed = True
-
-    # 5. Use refresh key in the pager's AsyncImage so a fresh network fetch happens
-    img_old = (
-        "                AsyncImage(\n"
-        "                    model = ImageRequest.Builder(context)\n"
-        "                        .data(pin.imageUrl)\n"
-        "                        .crossfade(true)\n"
-        "                        .build(),\n"
-        "                    contentDescription = pin.title,\n"
-        "                    contentScale = ContentScale.Fit,\n"
-        "                    modifier = Modifier\n"
-        "                        .fillMaxSize()\n"
-        "                        .graphicsLayer {\n"
-        "                            scaleX = scale\n"
-        "                            scaleY = scale\n"
-        "                            translationX = offsetX\n"
-        "                            translationY = offsetY\n"
-        "                        }\n"
-        "                )"
-    )
-    img_new = (
-        "                val pageRefreshKey = imageRefreshKeys[pin.id] ?: 0\n"
-        "                AsyncImage(\n"
-        "                    model = ImageRequest.Builder(context)\n"
-        "                        .data(pin.imageUrl)\n"
-        "                        .apply {\n"
-        "                            if (pageRefreshKey > 0) {\n"
-        "                                memoryCacheKey(\"${pin.imageUrl}#refresh=$pageRefreshKey\")\n"
-        "                                diskCacheKey(\"${pin.imageUrl}#refresh=$pageRefreshKey\")\n"
-        "                            }\n"
-        "                        }\n"
-        "                        .crossfade(true)\n"
-        "                        .build(),\n"
-        "                    contentDescription = pin.title,\n"
-        "                    contentScale = ContentScale.Fit,\n"
-        "                    modifier = Modifier\n"
-        "                        .fillMaxSize()\n"
-        "                        .graphicsLayer {\n"
-        "                            scaleX = scale\n"
-        "                            scaleY = scale\n"
-        "                            translationX = offsetX\n"
-        "                            translationY = offsetY\n"
-        "                        }\n"
-        "                )"
-    )
-    if img_old in text:
-        text = text.replace(img_old, img_new, 1)
-        changed = True
-    else:
-        log("  ⚠ Could not locate AsyncImage block in pager")
-
-    if changed:
-        path.write_text(text, encoding="utf-8")
-        log("  ✓ Patched FullscreenGalleryViewer.kt (refresh button + cache-bust)")
-    else:
-        log("  ⚠ Nothing changed — manual inspection may be needed")
-
-
-# ============================================================
-# NEW PATCH 2: BackupManager (unlimited files + all files + pretty JSON)
-# ============================================================
-def patch_backup_manager():
-    log("\n=== PATCH: BackupManager (unlimited + all files + pretty JSON) ===")
+def patch_backup_restore_compat():
+    log("\n=== PATCH: Restore compat (all .json files + compact JSON) ===")
     path = PROJECT_ROOT / "app/src/main/java/com/example/util/BackupManager.kt"
     if not path.exists():
         log(f"  ✗ {path} not found"); sys.exit(1)
@@ -289,237 +151,134 @@ def patch_backup_manager():
     text = path.read_text(encoding="utf-8")
     changed = False
 
-    # 1. Add UNLIMITED constant
-    if "UNLIMITED_MAX_BACKUP_FILES" not in text:
-        text = text.replace(
-            "    const val DEFAULT_MAX_BACKUP_FILES = 5\n",
-            "    const val DEFAULT_MAX_BACKUP_FILES = 5\n"
-            "    /** Value 0 means unlimited: never prune old backup files. */\n"
-            "    const val UNLIMITED_MAX_BACKUP_FILES = 0\n",
-            1,
-        )
-        changed = True
-
-    # 2. Add 0 (Unlimited) to the options list
-    old_opts = "val MAX_FILES_OPTIONS: List<Int> = listOf(1, 2, 3, 5, 10, 15, 20, 30, 50)"
-    new_opts = "val MAX_FILES_OPTIONS: List<Int> = listOf(0, 1, 2, 3, 5, 10, 15, 20, 30, 50)  // 0 = Unlimited"
-    if old_opts in text:
-        text = text.replace(old_opts, new_opts, 1)
-        changed = True
-
-    # 3. setMaxBackupFiles - accept 0 = unlimited, skip pruning then
-    set_old = (
-        "    fun setMaxBackupFiles(context: Context, maxFiles: Int) {\n"
-        "        val clamped = maxFiles.coerceAtLeast(1)\n"
-        "        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)\n"
-        "        prefs.edit().putInt(KEY_MAX_BACKUP_FILES, clamped).apply()\n"
-        "        try {\n"
-        "            val dir = getBackupDirectory(context)\n"
-        "            pruneOldBackups(dir, clamped)\n"
-        "        } catch (_: Exception) {}\n"
-        "    }"
+    # (A) getAvailableBackups: list ALL .json, exclude internal master archive
+    prev_form = (
+        "                dir.listFiles { f ->\n"
+        "                    f.isFile && f.extension.equals(\"json\", ignoreCase = true)\n"
+        "                }?.let { files.addAll(it) }\n"
     )
-    set_new = (
-        "    fun setMaxBackupFiles(context: Context, maxFiles: Int) {\n"
-        "        val clamped = maxFiles.coerceAtLeast(0)  // 0 = Unlimited\n"
-        "        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)\n"
-        "        prefs.edit().putInt(KEY_MAX_BACKUP_FILES, clamped).apply()\n"
-        "        if (clamped > 0) {\n"
-        "            try {\n"
-        "                val dir = getBackupDirectory(context)\n"
-        "                pruneOldBackups(dir, clamped)\n"
-        "            } catch (_: Exception) {}\n"
-        "        }\n"
-        "    }"
-    )
-    if set_old in text:
-        text = text.replace(set_old, set_new, 1)
-        changed = True
-
-    # 4. pruneOldBackups - return early when unlimited
-    prune_anchor = (
-        "    private fun pruneOldBackups(backupDir: File, maxCount: Int) {\n"
-        "        try {"
-    )
-    prune_new = (
-        "    private fun pruneOldBackups(backupDir: File, maxCount: Int) {\n"
-        "        if (maxCount <= 0) return  // Unlimited: never delete old backups\n"
-        "        try {"
-    )
-    if prune_anchor in text:
-        text = text.replace(prune_anchor, prune_new, 1)
-        changed = True
-
-    # 5. Pretty-printed main backup JSON (restore still accepts compact)
-    if "val jsonString = rootJson.toString()" in text:
-        text = text.replace(
-            "            val jsonString = rootJson.toString()\n",
-            "            // Pretty-printed (indent = 2) for human readability; compact JSON\n"
-            "            // files can still be restored because JSONObject() accepts both.\n"
-            "            val jsonString = rootJson.toString(2)\n",
-            1,
-        )
-        changed = True
-
-    # 6. getAvailableBackups - list ALL .json files in the backup folder
-    get_old = (
-        "    fun getAvailableBackups(context: Context): List<File> {\n"
-        "        val primaryDir = getBackupDirectory(context)\n"
-        "        val files = mutableListOf<File>()\n"
-        "\n"
-        "        fun collectFrom(dir: File) {\n"
-        "            if (dir.exists() && dir.isDirectory) {\n"
+    orig_form = (
         "                dir.listFiles { f ->\n"
         "                    f.isFile && f.extension.equals(\"json\", ignoreCase = true) &&\n"
         "                            (f.name.startsWith(\"pinboard_backup_\") || f.name == \"latest_backup.json\")\n"
         "                }?.let { files.addAll(it) }\n"
-        "            }\n"
-        "        }\n"
-        "\n"
-        "        collectFrom(primaryDir)\n"
-        "        // Also check parent folder in case previous backups were placed there\n"
-        "        primaryDir.parentFile?.let { parent ->\n"
-        "            if (parent.name == \"PinterestViewerDownloads\") {\n"
-        "                collectFrom(parent)\n"
-        "            }\n"
-        "        }\n"
-        "\n"
-        "        return files.distinctBy { it.absolutePath }\n"
-        "            .sortedByDescending { it.lastModified() }\n"
-        "    }"
     )
-    get_new = (
-        "    fun getAvailableBackups(context: Context): List<File> {\n"
-        "        // Return ALL .json files in the backup folder (and its parent\n"
-        "        // PinterestViewerDownloads folder, if any), so user-created or\n"
-        "        // manually-copied backups are listed. Compact and pretty JSON are\n"
-        "        // both supported by the restore path.\n"
-        "        val primaryDir = getBackupDirectory(context)\n"
-        "        val files = mutableListOf<File>()\n"
-        "\n"
-        "        fun collectFrom(dir: File) {\n"
-        "            if (dir.exists() && dir.isDirectory) {\n"
+    new_form = (
         "                dir.listFiles { f ->\n"
-        "                    f.isFile && f.extension.equals(\"json\", ignoreCase = true)\n"
+        "                    f.isFile && f.extension.equals(\"json\", ignoreCase = true) &&\n"
+        "                            f.name != \"master_pins_archive.json\"\n"
         "                }?.let { files.addAll(it) }\n"
+    )
+    if new_form in text:
+        log("  ✓ getAvailableBackups already lists all .json (excl. master archive)")
+    elif prev_form in text:
+        text = text.replace(prev_form, new_form, 1); changed = True
+        log("  ✓ getAvailableBackups: excluding master_pins_archive.json")
+    elif orig_form in text:
+        text = text.replace(orig_form, new_form, 1); changed = True
+        log("  ✓ getAvailableBackups: listing ALL .json")
+
+    # (B) restoreBackup: tolerant parse — compact OR pretty, BOM stripped
+    old_parse = (
+        "            val jsonStr = backupFile.readText()\n"
+        "            val rootJson = JSONObject(jsonStr)\n"
+    )
+    new_parse = (
+        "            // Tolerant: pretty or compact JSON, strips UTF-8 BOM, trims whitespace.\n"
+        "            val rawStr = backupFile.readText()\n"
+        "            val jsonStr = rawStr.trimStart('\\uFEFF', ' ', '\\t', '\\r', '\\n')\n"
+        "            if (jsonStr.isBlank()) {\n"
+        "                return@withContext Result.failure(Exception(\"Backup file is empty\"))\n"
         "            }\n"
-        "        }\n"
-        "\n"
-        "        collectFrom(primaryDir)\n"
-        "        primaryDir.parentFile?.let { parent ->\n"
-        "            if (parent.name == \"PinterestViewerDownloads\") {\n"
-        "                collectFrom(parent)\n"
+        "            val rootJson = try {\n"
+        "                JSONObject(jsonStr)\n"
+        "            } catch (t: Throwable) {\n"
+        "                return@withContext Result.failure(\n"
+        "                    Exception(\"Not a valid JSON backup: ${t.message ?: t.javaClass.simpleName}\")\n"
+        "                )\n"
         "            }\n"
-        "        }\n"
+    )
+    if new_parse in text:
+        log("  ✓ restoreBackup already has tolerant parse")
+    elif old_parse in text:
+        text = text.replace(old_parse, new_parse, 1); changed = True
+        log("  ✓ restoreBackup: BOM strip + safe JSONObject parse")
+
+    # (C) Structure validation — reject non-PinBoard JSON with a clear error
+    old_valid = (
+        "            var restoredBoardsCount = 0\n"
+        "            var restoredPinsCount = 0\n"
+        "            var settingsRestored = false\n"
+    )
+    new_valid = (
+        "            val hasBoards = rootJson.has(\"boards\")\n"
+        "            val hasPins = rootJson.has(\"pins\")\n"
+        "            val hasSettings = rootJson.has(\"settings\")\n"
+        "            val hasHistory = rootJson.has(\"board_history\")\n"
+        "            if (!hasBoards && !hasPins && !hasSettings && !hasHistory) {\n"
+        "                return@withContext Result.failure(\n"
+        "                    Exception(\"Not a PinBoard backup (missing boards/pins/settings)\")\n"
+        "                )\n"
+        "            }\n"
         "\n"
-        "        return files.distinctBy { it.absolutePath }\n"
-        "            .sortedByDescending { it.lastModified() }\n"
+        "            var restoredBoardsCount = 0\n"
+        "            var restoredPinsCount = 0\n"
+        "            var settingsRestored = false\n"
+    )
+    if "missing boards/pins/settings" in text:
+        log("  ✓ restoreBackup already validates structure")
+    elif old_valid in text:
+        text = text.replace(old_valid, new_valid, 1); changed = True
+        log("  ✓ restoreBackup: added structure validation")
+
+    # (D) Clearer outer failure message
+    old_err = (
+        "            Result.success(RestoreSummary(restoredBoardsCount, restoredPinsCount, settingsRestored))\n"
+        "        } catch (t: Throwable) {\n"
+        "            t.printStackTrace()\n"
+        "            Result.failure(t)\n"
+        "        }\n"
         "    }"
     )
-    if get_old in text:
-        text = text.replace(get_old, get_new, 1)
-        changed = True
+    new_err = (
+        "            Result.success(RestoreSummary(restoredBoardsCount, restoredPinsCount, settingsRestored))\n"
+        "        } catch (t: Throwable) {\n"
+        "            t.printStackTrace()\n"
+        "            Result.failure(Exception(\"Restore failed: ${t.message ?: t.javaClass.simpleName}\"))\n"
+        "        }\n"
+        "    }"
+    )
+    if "Restore failed: ${t.message" in text:
+        log("  ✓ restoreBackup already wraps failures clearly")
+    elif old_err in text:
+        text = text.replace(old_err, new_err, 1); changed = True
+        log("  ✓ restoreBackup: clearer failure message")
 
     if changed:
         path.write_text(text, encoding="utf-8")
-        log("  ✓ Patched BackupManager.kt")
+        log("  ✓ BackupManager.kt updated")
     else:
-        log("  ✓ Already patched (or no matching anchors found)")
+        log("  ✓ Already patched — no changes")
 
 
 # ============================================================
-# NEW PATCH 3: SettingsDialog — Unlimited label handling
+# Versioned APK naming
 # ============================================================
-def patch_settings_dialog():
-    log("\n=== PATCH: SettingsDialog (Unlimited label) ===")
-    path = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/SettingsDialog.kt"
-    if not path.exists():
-        log(f"  ✗ {path} not found"); sys.exit(1)
-
-    text = path.read_text(encoding="utf-8")
-
-    if 'if (maxBackupFiles == 0) "Unlimited ▾"' in text:
-        log("  ✓ Already patched."); return
-
-    changed = False
-
-    # 1. Header/current selection label
-    sel_old = '                                        text = "$maxBackupFiles files ▾",'
-    sel_new = (
-        '                                        text = if (maxBackupFiles == 0) "Unlimited ▾" '
-        'else "$maxBackupFiles files ▾",'
+def read_app_version():
+    build_path = PROJECT_ROOT / "app/build.gradle.kts"
+    if not build_path.exists():
+        return ("unknown", "0")
+    text = build_path.read_text(encoding="utf-8")
+    vn = re.search(r'versionName\s*=\s*"([^"]+)"', text)
+    vc = re.search(r"versionCode\s*=\s*(\d+)", text)
+    return (
+        vn.group(1) if vn else "unknown",
+        vc.group(1) if vc else "0",
     )
-    if sel_old in text:
-        text = text.replace(sel_old, sel_new, 1)
-        changed = True
-
-    # 2. Dropdown item label
-    item_old = (
-        "                                            Text(\n"
-        '                                                text = "$count file${if (count > 1) "s" else ""}",\n'
-    )
-    item_new = (
-        "                                            Text(\n"
-        "                                                text = if (count == 0) \"Unlimited\" "
-        "else \"$count file${if (count > 1) \"s\" else \"\"}\",\n"
-    )
-    if item_old in text:
-        text = text.replace(item_old, item_new, 1)
-        changed = True
-
-    if changed:
-        path.write_text(text, encoding="utf-8")
-        log("  ✓ Patched SettingsDialog.kt")
-    else:
-        log("  ⚠ Could not locate the exact label strings — inspect manually.")
 
 
 # ============================================================
-# EXISTING PATCH: Disable Arrow Navigation wiring
-# ============================================================
-def fix_disable_arrow_navigation():
-    log("\n=== PATCH: Disable Arrow Navigation wiring ===")
-    path = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    if not path.exists():
-        log(f"  ✗ {path} not found"); sys.exit(1)
-
-    text = path.read_text(encoding="utf-8")
-    if "onToggleDisableArrowNavigation = { viewModel.setDisableArrowNavigation(it) }" in text:
-        log("  ✓ Already wired."); return
-
-    old = (
-        "        portraitAlbumCards = portraitAlbumCards,\n"
-        "        onTogglePortraitAlbumCards = { viewModel.setPortraitAlbumCards(it) },\n"
-        "        isBrowserTestingVisible = isBrowserTestingVisible,\n"
-    )
-    new = (
-        "        portraitAlbumCards = portraitAlbumCards,\n"
-        "        onTogglePortraitAlbumCards = { viewModel.setPortraitAlbumCards(it) },\n"
-        "        disableArrowNavigation = disableArrowNavigation,\n"
-        "        onToggleDisableArrowNavigation = { viewModel.setDisableArrowNavigation(it) },\n"
-        "        isBrowserTestingVisible = isBrowserTestingVisible,\n"
-    )
-    if old in text:
-        text = text.replace(old, new, 1)
-    else:
-        m = re.search(
-            r"(onTogglePortraitAlbumCards\s*=\s*\{[^}]+\}\s*,\s*\n)(\s*isBrowserTestingVisible\s*=)",
-            text,
-        )
-        if not m:
-            log("  ✗ Could not locate SettingsDialog anchor."); sys.exit(1)
-        inject = (
-            "        disableArrowNavigation = disableArrowNavigation,\n"
-            "        onToggleDisableArrowNavigation = { viewModel.setDisableArrowNavigation(it) },\n"
-        )
-        text = text[:m.end(1)] + inject + text[m.end(1):]
-
-    path.write_text(text, encoding="utf-8")
-    log("  ✓ Wired disableArrowNavigation into SettingsDialog")
-
-
-# ============================================================
-# EXISTING PATCH: release.keystore
+# Build infrastructure
 # ============================================================
 def ensure_release_keystore():
     log("\n=== Ensuring release.keystore ===")
@@ -532,7 +291,7 @@ def ensure_release_keystore():
         if r.returncode == 0 and KEYSTORE_ALIAS in r.stdout:
             log(f"  ✓ {KEYSTORE_FILE} OK (alias '{KEYSTORE_ALIAS}')")
             return
-        log(f"  ✗ {KEYSTORE_FILE} exists but password/alias mismatch. Delete it and re-run.")
+        log(f"  ✗ {KEYSTORE_FILE} exists but password/alias mismatch. Delete and re-run.")
         sys.exit(1)
 
     log(f"  Generating {KEYSTORE_FILE}…")
@@ -607,7 +366,9 @@ def patch_build_gradle():
                 rel_open, rel_close = rel_span
                 block = text[rel_open + 1:rel_close]
                 if "isDebuggable = true" in block:
-                    text = text[:rel_open + 1] + block.replace("isDebuggable = true", "isDebuggable = false") + text[rel_close:]
+                    text = (text[:rel_open + 1]
+                            + block.replace("isDebuggable = true", "isDebuggable = false")
+                            + text[rel_close:])
                     log("  ✓ release buildType: isDebuggable -> false")
                 elif "isDebuggable" not in block:
                     nb = block.replace("isMinifyEnabled = false",
@@ -620,9 +381,6 @@ def patch_build_gradle():
         p.write_text(text, encoding="utf-8")
 
 
-# ============================================================
-# Gradle wrapper / workflow / git / CI / adb (from previous script)
-# ============================================================
 def latest_gradle_version():
     try:
         req = urllib.request.Request(
@@ -673,6 +431,9 @@ def write_workflow():
     log("  ✓ Written.")
 
 
+# ============================================================
+# Git + GitHub
+# ============================================================
 def setup_git():
     log("\n=== Setting up git repo ===")
     if not (PROJECT_ROOT / ".git").exists():
@@ -705,7 +466,7 @@ def setup_git():
     if subprocess.run(["git", "status", "--porcelain"],
                       capture_output=True, text=True).stdout.strip():
         run(["git", "commit", "-m",
-             "Add fullscreen refresh + unlimited backups + all-files restore + pretty JSON"])
+             "Restore compat: list all .json + support compact JSON"])
         log("  ✓ Committed.")
 
 
@@ -745,6 +506,9 @@ def ensure_github_repo():
     return full
 
 
+# ============================================================
+# CI trigger + download
+# ============================================================
 def trigger_and_download(repo_full):
     log("\n=== Triggering CI ===")
     for attempt in range(6):
@@ -798,6 +562,37 @@ def trigger_and_download(repo_full):
     return dl
 
 
+# ============================================================
+# Move APK to target with versioned filename
+# ============================================================
+def move_apk(dl_dir):
+    log("\n=== Moving APK to target (name + version) ===")
+    apks = list(dl_dir.glob("*.apk"))
+    if not apks: log("  ✗ No APK."); sys.exit(1)
+    apk = apks[0]
+
+    version_name, version_code = read_app_version()
+    log(f"  App version: {version_name} (code {version_code})")
+
+    tf = PROJECT_ROOT / "Apk Directory.txt"
+    target_dir = (Path(tf.read_text(encoding="utf-8").strip())
+                  if tf.exists() else Path.home() / "Downloads")
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    dest = target_dir / f"{APP_NAME}-v{version_name}-{version_code}{apk.suffix}"
+    if dest.exists():
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        dest = target_dir / f"{APP_NAME}-v{version_name}-{version_code}_{ts}{apk.suffix}"
+        log("  Prior copy exists → timestamped name")
+
+    shutil.copy2(apk, dest)
+    log(f"  ✓ APK -> {dest}")
+    return dest
+
+
+# ============================================================
+# Signature + device install
+# ============================================================
 def find_apksigner():
     for sdk in [
         Path(os.environ.get("ANDROID_HOME", "")),
@@ -819,6 +614,7 @@ def find_apksigner():
 
 
 def verify_apk_signature(apk):
+    log("\n=== Verifying APK signature ===")
     signer = find_apksigner()
     if not signer:
         log("  (apksigner not found locally — CI already verified)"); return
@@ -853,23 +649,6 @@ def adb_device_connected(adb):
         return False
 
 
-def move_apk(dl_dir):
-    apks = list(dl_dir.glob("*.apk"))
-    if not apks: log("  ✗ No APK."); sys.exit(1)
-    apk = apks[0]
-    tf = PROJECT_ROOT / "Apk Directory.txt"
-    target_dir = (Path(tf.read_text(encoding="utf-8").strip())
-                  if tf.exists() else Path.home() / "Downloads")
-    target_dir.mkdir(parents=True, exist_ok=True)
-    dest = target_dir / apk.name
-    if dest.exists():
-        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        dest = target_dir / f"{apk.stem}_{ts}{apk.suffix}"
-    shutil.copy2(apk, dest)
-    log(f"  ✓ APK -> {dest}")
-    return dest
-
-
 def device_install(apk_path):
     log("\n=== Device install ===")
     adb = find_adb()
@@ -878,7 +657,8 @@ def device_install(apk_path):
         log(f"    adb uninstall {PACKAGE_ID}")
         log(f'    adb install "{apk_path}"')
         return
-    subprocess.run([adb, "uninstall", PACKAGE_ID], capture_output=True, text=True, timeout=60)
+    subprocess.run([adb, "uninstall", PACKAGE_ID],
+                   capture_output=True, text=True, timeout=60)
     r = subprocess.run([adb, "install", str(apk_path)],
                        capture_output=True, text=True, timeout=300)
     out = (r.stdout + r.stderr).strip()
@@ -891,7 +671,7 @@ def device_install(apk_path):
 # ============================================================
 def main():
     log("=" * 70)
-    log("PinBoard Gallery - Feature patches + release build")
+    log("PinBoard Gallery - Restore compat + full build pipeline")
     log("=" * 70)
 
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists():
@@ -900,27 +680,28 @@ def main():
         if not tool_available(t):
             log(f"ERROR: {t} not found in PATH"); sys.exit(1)
 
-    # Code patches
-    patch_fullscreen_refresh_button()
-    patch_backup_manager()
-    patch_settings_dialog()
-    fix_disable_arrow_navigation()
+    # ── 1. This task's change ─────────────────────────────────
+    patch_backup_restore_compat()
 
-    # Build infrastructure
+    # ── 2. Build infrastructure ───────────────────────────────
     ensure_release_keystore()
     patch_build_gradle()
     ensure_gradle_wrapper()
     write_workflow()
 
-    # Repo + CI
+    # ── 3. Git + GitHub repo ──────────────────────────────────
     setup_git()
     verify_release_keystore_tracked()
     repo = ensure_github_repo()
-    dl   = trigger_and_download(repo)
 
-    # Output
-    apk = move_apk(dl)
+    # ── 4. CI: trigger → poll → download artifact ─────────────
+    dl = trigger_and_download(repo)
+
+    # ── 5. Versioned move + signature verify ──────────────────
+    apk = move_apk(dl)                       # PinBoard-v{ver}-{code}.apk
     verify_apk_signature(apk)
+
+    # ── 6. Device install ─────────────────────────────────────
     device_install(apk)
 
     log("\n" + "=" * 70)
