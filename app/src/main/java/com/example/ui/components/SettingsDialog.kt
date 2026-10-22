@@ -987,16 +987,64 @@ fun SettingsDialog(
     )
 
     if (showRestoreDialog) {
+        // Refresh the list on ON_RESUME — user may have just granted
+        // All Files Access in system Settings. Runs regardless of which
+        // branch (empty vs list) is currently shown.
+        val backupLcOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+        androidx.compose.runtime.DisposableEffect(backupLcOwner) {
+            val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                    val refreshed = com.example.util.BackupManager.getAvailableBackups(context)
+                    availableBackups = refreshed
+                    if (selectedBackupFile == null ||
+                        refreshed.none { it.absolutePath == selectedBackupFile?.absolutePath }) {
+                        selectedBackupFile = refreshed.firstOrNull()
+                    }
+                }
+            }
+            backupLcOwner.lifecycle.addObserver(obs)
+            onDispose { backupLcOwner.lifecycle.removeObserver(obs) }
+        }
+
         if (availableBackups.isEmpty()) {
             AlertDialog(
                 onDismissRequest = { showRestoreDialog = false },
                 title = { Text("No Backups Found", fontWeight = FontWeight.Bold, fontSize = 16.sp) },
                 text = {
-                    Text(
-                        "No .json backup files found in /Download/PinterestViewerDownloads/Backup. Tap 'Backup Now' to create one first.",
-                        fontSize = 13.sp,
-                        color = PinterestTextSecondary
-                    )
+                    Column {
+                        if (!com.example.util.BackupManager.hasAllFilesAccess()) {
+                            androidx.compose.material3.Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = PinterestPillGray,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Text(
+                                        text = "All Files Access is needed to see every .json in the backup folder, including backups from previous app installs.",
+                                        fontSize = 11.sp,
+                                        color = PinterestBlack,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    androidx.compose.material3.Button(
+                                        onClick = { com.example.util.BackupManager.requestAllFilesAccess(context) },
+                                        colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
+                                        shape = RoundedCornerShape(14.dp),
+                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                        modifier = Modifier.testTag("no_backups_all_files_btn")
+                                    ) {
+                                        Text("Grant All Files Access", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+                        Text(
+                            "No .json backup files found in /Download/PinterestViewerDownloads/Backup. Tap 'Backup Now' to create one first.",
+                            fontSize = 13.sp,
+                            color = PinterestTextSecondary
+                        )
+                    }
                 },
                 confirmButton = {
                     Button(

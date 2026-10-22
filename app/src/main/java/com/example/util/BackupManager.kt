@@ -571,6 +571,32 @@ object BackupManager {
                 }
             }
 
+            // 2b. Restore custom albums (non-sort albums from multi-image links)
+            val albumsArray = rootJson.optJSONArray("custom_albums")
+            if (albumsArray != null && albumsArray.length() > 0) {
+                val albumEntities = mutableListOf<com.example.data.local.CustomAlbumEntity>()
+                for (i in 0 until albumsArray.length()) {
+                    val aObj = albumsArray.optJSONObject(i) ?: continue
+                    val aId = aObj.optString("id")
+                    if (aId.isBlank()) continue
+                    albumEntities.add(
+                        com.example.data.local.CustomAlbumEntity(
+                            id = aId,
+                            boardId = aObj.optString("boardId"),
+                            parentAlbumId = aObj.optString("parentAlbumId", "").ifBlank { null },
+                            title = aObj.optString("title", ""),
+                            sourceUrl = aObj.optString("sourceUrl", ""),
+                            dateAddedMillis = aObj.optLong("dateAddedMillis", System.currentTimeMillis()),
+                            orderIndex = aObj.optInt("orderIndex", 0),
+                            isFavorite = aObj.optBoolean("isFavorite", false)
+                        )
+                    )
+                }
+                if (albumEntities.isNotEmpty()) {
+                    dao.insertAlbums(albumEntities)
+                }
+            }
+
             // 3. Restore App Settings SharedPreferences
             val settingsObj = rootJson.optJSONObject("settings")
             if (settingsObj != null) {
