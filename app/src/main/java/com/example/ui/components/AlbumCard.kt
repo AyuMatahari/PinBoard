@@ -2,6 +2,7 @@ package com.example.ui.components
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -20,6 +21,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -73,8 +75,11 @@ fun AlbumCard(
     columnCount: Int,
     isFavorite: Boolean,
     isPortrait: Boolean = false,
+    isSelected: Boolean = false,
+    isSelectionMode: Boolean = false,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
+    onSelectToggle: () -> Unit = {},
     onSwipePreview: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -127,7 +132,7 @@ fun AlbumCard(
                     if (timeoutResult == null && !isHorizontalSwipe) {
                         longPressed = true
                         down.consume()
-                        onLongClick()
+                        if (isSelectionMode) onSelectToggle() else onLongClick()
                         do {
                             val event = awaitPointerEvent()
                             event.changes.forEach { it.consume() }
@@ -149,7 +154,7 @@ fun AlbumCard(
                             onSwipePreview()
                         }
                     } else if (timeoutResult == false && !longPressed) {
-                        onClick()
+                        if (isSelectionMode) onSelectToggle() else onClick()
                     }
                 }
             }
@@ -260,8 +265,39 @@ fun AlbumCard(
                                 modifier = Modifier.fillMaxSize()
                             )
 
+                            // Selection overlay
+                            if (isSelectionMode) {
+                                Box(
+                                    modifier = Modifier
+                                        .matchParentSize()
+                                        .background(
+                                            if (isSelected) PinterestRed.copy(alpha = 0.28f)
+                                            else Color.Black.copy(alpha = 0.10f)
+                                        )
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(8.dp)
+                                        .size(28.dp)
+                                        .clip(CircleShape)
+                                        .background(if (isSelected) PinterestRed else Color.Black.copy(alpha = 0.45f))
+                                        .border(2.dp, Color.White, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (isSelected) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = "Album Selected",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+
                             // Heart Badge if favorited
-                            if (isFavorite) {
+                            if (isFavorite && !isSelectionMode) {
                                 Surface(
                                     shape = CircleShape,
                                     color = Color.Black.copy(alpha = 0.65f),

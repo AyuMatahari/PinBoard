@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Share
@@ -76,6 +77,7 @@ fun CopyOrMoveImagesDialog(
     availableBoards: List<PinterestBoard>,
     currentBoardId: String?,
     onDismiss: () -> Unit,
+    onTransferToAlbum: (() -> Unit)? = null,
     onConfirm: (targetBoardIds: List<String>) -> Unit
 ) {
     if (!isOpen) return
@@ -329,6 +331,45 @@ fun CopyOrMoveImagesDialog(
                     Spacer(modifier = Modifier.height(12.dp))
                     HorizontalDivider()
                     Spacer(modifier = Modifier.height(12.dp))
+                }
+
+                // Transfer to album button (new feature)
+                if (onTransferToAlbum != null) {
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = if (isMove) Color(0xFFFFF3E0) else Color(0xFFE3F2FD),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            if (isMove) Color(0xFFFF9800) else Color(0xFF2196F3)
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 3.dp)
+                            .clickable { onTransferToAlbum() }
+                            .testTag("action_transfer_to_album")
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Folder,
+                                contentDescription = null,
+                                tint = if (isMove) Color(0xFFFF9800) else Color(0xFF2196F3),
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "${if (isMove) "Move" else "Copy"} to Album",
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 13.sp,
+                                color = PinterestBlack
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
                 }
 
                 Text(

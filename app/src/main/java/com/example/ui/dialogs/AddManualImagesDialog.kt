@@ -64,18 +64,16 @@ fun AddManualImagesDialog(
     isOpen: Boolean,
     availableBoards: List<PinterestBoard>,
     currentBoardId: String?,
-    availableAlbums: List<DateAlbum> = emptyList(),
-    currentAlbumId: String? = null,
+    currentAlbumTitle: String? = null,
     onDismiss: () -> Unit,
-    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean, putIntoAlbum: Boolean, targetAlbumId: String?) -> Unit
+    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean) -> Unit
 ) {
     if (!isOpen) return
 
     val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
     var extractMultipleImages by remember { mutableStateOf(false) }
-    var putIntoAlbum by remember { mutableStateOf(false) }
-    var selectedAlbumId by remember(currentAlbumId) { mutableStateOf(currentAlbumId) }
+    var boardsExpanded by remember { mutableStateOf(false) }
 
     // Selected boards (defaults to active board or default board)
     val selectedBoardIds = remember(availableBoards, currentBoardId) {
@@ -216,52 +214,31 @@ fun AddManualImagesDialog(
                     }
                 }
 
-                // Checklist 2: Shown only when user checks extractMultipleImages
-                if (extractMultipleImages) {
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(start = 24.dp)
-                            .clickable { putIntoAlbum = !putIntoAlbum }
-                            .padding(vertical = 4.dp)
-                            .testTag("put_into_album_checkbox")
-                    ) {
-                        Checkbox(
-                            checked = putIntoAlbum,
-                            onCheckedChange = { putIntoAlbum = it },
-                            colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Column {
-                            Text(
-                                text = "Put into album",
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = PinterestBlack
-                            )
-                            Text(
-                                text = "Group images as an album on the board instead of loading separately.",
-                                fontSize = 11.sp,
-                                color = PinterestTextSecondary
-                            )
-                        }
-                    }
-                }
-
                 Spacer(modifier = Modifier.height(12.dp))
 
-                Text(
-                    text = "SELECT BOARDS TO INCLUDE",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.8.sp,
-                        fontSize = 11.sp,
-                        color = PinterestTextSecondary
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { boardsExpanded = !boardsExpanded }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Adding to: ${selectedBoardIds.size} board${if (selectedBoardIds.size != 1) "s" else ""}",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        color = PinterestTextSecondary,
+                        modifier = Modifier.weight(1f)
                     )
-                )
-                Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = if (boardsExpanded) "▲" else "▼",
+                        fontSize = 11.sp,
+                        color = PinterestRed
+                    )
+                }
+                androidx.compose.animation.AnimatedVisibility(visible = boardsExpanded) {
+                    Column {
+                        Spacer(modifier = Modifier.height(6.dp))
 
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -304,58 +281,8 @@ fun AddManualImagesDialog(
                     }
                 }
 
-                // If non-sort custom albums exist, user can add directly to an album
-                if (availableAlbums.isNotEmpty()) {
-                    Spacer(modifier = Modifier.height(12.dp))
-                    Text(
-                        text = "OR ADD DIRECTLY TO ALBUM",
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            letterSpacing = 0.8.sp,
-                            fontSize = 11.sp,
-                            color = PinterestTextSecondary
-                        )
-                    )
-                    Spacer(modifier = Modifier.height(6.dp))
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp),
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        availableAlbums.forEach { album ->
-                            val isSelected = selectedAlbumId == album.id
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = if (isSelected) PinterestRed else PinterestPillGray,
-                                modifier = Modifier
-                                    .clickable {
-                                        selectedAlbumId = if (isSelected) null else album.id
-                                    }
-                                    .testTag("select_target_album_${album.id}")
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Folder,
-                                        contentDescription = null,
-                                        tint = if (isSelected) Color.White else PinterestRed,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(4.dp))
-                                    Text(
-                                        text = album.title,
-                                        fontSize = 12.sp,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isSelected) Color.White else PinterestBlack
-                                    )
-                                }
-                            }
-                        }
                     }
                 }
-
                 Spacer(modifier = Modifier.height(8.dp))
                 Text(
                     text = "Tip: Any other custom boards with matching domains will also receive the images automatically.",
@@ -367,25 +294,22 @@ fun AddManualImagesDialog(
         confirmButton = {
             Button(
                 onClick = {
-                    if (extractedLinks.isNotEmpty() && (selectedBoardIds.isNotEmpty() || selectedAlbumId != null)) {
+                    if (extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty()) {
                         onAddImages(
                             textInput.trim(),
                             selectedBoardIds.toList(),
-                            extractMultipleImages,
-                            putIntoAlbum,
-                            selectedAlbumId
+                            extractMultipleImages
                         )
                         onDismiss()
                     }
                 },
-                enabled = extractedLinks.isNotEmpty() && (selectedBoardIds.isNotEmpty() || selectedAlbumId != null),
+                enabled = extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty(),
                 colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
                 shape = RoundedCornerShape(20.dp),
                 modifier = Modifier.testTag("confirm_add_manual_images_btn")
             ) {
                 Text(
-                    text = if (putIntoAlbum) "Create Album (${extractedLinks.size} URL${if (extractedLinks.size > 1) "s" else ""})"
-                    else "Add ${extractedLinks.size} Link${if (extractedLinks.size > 1) "s" else ""}",
+                    text = "Add ${extractedLinks.size} Link${if (extractedLinks.size > 1) "s" else ""}",
                     color = Color.White,
                     fontWeight = FontWeight.Bold
                 )

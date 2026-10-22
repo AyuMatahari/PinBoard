@@ -181,6 +181,18 @@ interface BoardDao {
     @Query("DELETE FROM custom_albums WHERE id = :albumId")
     suspend fun deleteAlbum(albumId: String)
 
+    @Query("UPDATE pins SET albumId = NULL WHERE albumId = :albumId")
+    suspend fun detachPinsFromAlbum(albumId: String)
+
+    @Transaction
+    suspend fun deleteAlbumAndDetachPins(albumId: String) {
+        detachPinsFromAlbum(albumId)
+        deleteAlbum(albumId)
+    }
+
+    @Query("UPDATE custom_albums SET dateAddedMillis = :date WHERE id = :albumId")
+    suspend fun updateAlbumDate(albumId: String, date: Long)
+
     @Query("DELETE FROM custom_albums WHERE boardId = :boardId")
     suspend fun deleteAlbumsForBoard(boardId: String)
 

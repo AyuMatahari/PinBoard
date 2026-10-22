@@ -113,12 +113,15 @@ class ShareTargetActivity : ComponentActivity() {
             }
         }
 
+        // Auto-save to default board immediately
+        autoSaveToDefaultBoard(sharedLinks, sharedImageUris)
+
         setContent {
             MyApplicationTheme {
                 FloatingShareDialog(
                     sharedLinks = sharedLinks,
                     sharedImageUris = sharedImageUris,
-                    onDismissAndSaveDefault = {
+                    onClose = {
                         saveAndFinish(
                             targetBoardIds = emptyList(),
                             links = sharedLinks,
@@ -128,17 +131,60 @@ class ShareTargetActivity : ComponentActivity() {
                             targetAlbumId = null
                         )
                     },
-                    onSaveToBoards = { targetBoardIds, extractMultiple, putAlbum, targetAlbumId ->
+                    onSaveToBoards = { targetBoardIds, extractMultiple ->
                         saveAndFinish(
                             targetBoardIds = targetBoardIds,
                             links = sharedLinks,
                             imageUris = sharedImageUris,
-                            extractMultipleImages = extractMultiple,
-                            putIntoAlbum = putAlbum,
-                            targetAlbumId = targetAlbumId
+                            extractMultipleImages = extractMultiple
                         )
                     }
                 )
+            }
+        }
+    }
+
+    private fun autoSaveToDefaultBoard(links: List<String>, imageUris: List<Uri>) {
+        val appCtx = applicationContext
+        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+            try {
+                val dao = AppDatabase.getDatabase(appCtx).boardDao()
+                ensureDefaultBoardsExist(dao)
+                val allBoards = dao.getAllBoards()
+                val defaultBoard = allBoards.firstOrNull { it.isDefault }
+                    ?: allBoards.firstOrNull { it.id == "board_dump" }
+                    ?: allBoards.firstOrNull() ?: return@launch
+                val resolvedPins = mutableListOf<PinItem>()
+                for (link in links) {
+                    resolvedPins.add(ImageLinkResolver.resolveLink(link, defaultBoard.title))
+                }
+                for (uri in imageUris) {
+                    val uriStr = uri.toString()
+                    resolvedPins.add(PinItem(
+                        id = ImageLinkResolver.generateDeterministicPinId(uriStr),
+                        title = "Shared Photo",
+                        imageUrl = uriStr,
+                        thumbnailUrl = uriStr,
+                        author = "Shared from device",
+                        sourceUrl = uriStr,
+                        dateAddedMillis = System.currentTimeMillis()
+                    ))
+                }
+                val existingIds = dao.getPinIdsForBoard(defaultBoard.id).toSet()
+                val existingUrls = dao.getImageUrlsForBoard(defaultBoard.id).toSet()
+                val toInsert = resolvedPins.filter { !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl) }
+                if (toInsert.isNotEmpty()) {
+                    dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })
+                }
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        this@ShareTargetActivity,
+                        "Saved to ${defaultBoard.title}",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } catch (t: Throwable) {
+                t.printStackTrace()
             }
         }
     }
@@ -147,9 +193,7 @@ class ShareTargetActivity : ComponentActivity() {
         targetBoardIds: List<String>,
         links: List<String>,
         imageUris: List<Uri>,
-        extractMultipleImages: Boolean = false,
-        putIntoAlbum: Boolean = false,
-        targetAlbumId: String? = null
+        extractMultipleImages: Boolean = false
     ) {
         val appCtx = applicationContext
         lifecycleScopeLaunch {
@@ -357,26 +401,22 @@ class ShareTargetActivity : ComponentActivity() {
 private fun FloatingShareDialog(
     sharedLinks: List<String>,
     sharedImageUris: List<Uri>,
-    onDismissAndSaveDefault: () -> Unit,
-    onSaveToBoards: (targetBoardIds: List<String>, extractMultiple: Boolean, putAlbum: Boolean, targetAlbumId: String?) -> Unit
+    onClose: () -> Unit,
+    onSaveToBoards: (targetBoardIds: List<String>, extractMultiple: Boolean) -> Unit
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     var boards by remember { mutableStateOf<List<BoardEntity>>(emptyList()) }
-    var albums by remember { mutableStateOf<List<CustomAlbumEntity>>(emptyList()) }
     var isLoadingBoards by remember { mutableStateOf(true) }
     var isSelectMode by remember { mutableStateOf(false) }
     val selectedBoardIds = remember { mutableStateListOf<String>() }
-    var selectedAlbumId by remember { mutableStateOf<String?>(null) }
 
     var extractMultipleImages by remember { mutableStateOf(false) }
-    var putIntoAlbum by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
             val dao = AppDatabase.getDatabase(context).boardDao()
             val list = dao.getAllBoards()
             boards = list
-            albums = dao.getAllAlbums()
             val defaultB = list.firstOrNull { it.isDefault } ?: list.firstOrNull { it.id == "board_dump" } ?: list.firstOrNull { it.id == "board_my_save" } ?: list.firstOrNull()
             defaultB?.let { selectedBoardIds.add(it.id) }
             isLoadingBoards = false
@@ -388,8 +428,7 @@ private fun FloatingShareDialog(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.55f))
-            .clickable { onDismissAndSaveDefault() },
+            .background(Color.Black.copy(alpha = 0.55f)),
         contentAlignment = Alignment.Center
     ) {
         Card(
@@ -458,7 +497,7 @@ private fun FloatingShareDialog(
                         }
                         Spacer(modifier = Modifier.width(4.dp))
                         IconButton(
-                            onClick = onDismissAndSaveDefault,
+                            onClick = onClose,
                             modifier = Modifier.size(32.dp)
                         ) {
                             Icon(
@@ -490,7 +529,6 @@ private fun FloatingShareDialog(
                             checked = extractMultipleImages,
                             onCheckedChange = {
                                 extractMultipleImages = it
-                                if (!it) putIntoAlbum = false
                             },
                             colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
                         )
@@ -633,40 +671,6 @@ private fun FloatingShareDialog(
                             }
                         }
 
-                        // Also allow selecting existing non-sort albums
-                        albums.forEach { album ->
-                            val isAlbumSelected = selectedAlbumId == album.id
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = if (isAlbumSelected) PinterestRed else PinterestPillGray,
-                                modifier = Modifier
-                                    .clickable {
-                                        selectedAlbumId = if (isAlbumSelected) null else album.id
-                                    }
-                                    .testTag("share_target_album_${album.id}")
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Folder,
-                                        contentDescription = null,
-                                        tint = if (isAlbumSelected) Color.White else PinterestRed,
-                                        modifier = Modifier.size(14.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = album.title,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (isAlbumSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isAlbumSelected) Color.White else PinterestBlack,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                        }
                     }
                 }
 
@@ -686,12 +690,10 @@ private fun FloatingShareDialog(
 
                     Button(
                         onClick = {
-                            if (selectedAlbumId != null) {
-                                onSaveToBoards(emptyList(), extractMultipleImages, putIntoAlbum, selectedAlbumId)
-                            } else if (selectedBoardIds.isNotEmpty()) {
-                                onSaveToBoards(selectedBoardIds.toList(), extractMultipleImages, putIntoAlbum, null)
+                            if (selectedBoardIds.isNotEmpty()) {
+                                onSaveToBoards(selectedBoardIds.toList(), extractMultipleImages)
                             } else {
-                                onDismissAndSaveDefault()
+                                onClose()
                             }
                         },
                         colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
@@ -699,9 +701,7 @@ private fun FloatingShareDialog(
                         modifier = Modifier.testTag("share_dialog_save_btn")
                     ) {
                         Text(
-                            text = if (putIntoAlbum) "Save as Album"
-                            else if (selectedAlbumId != null) "Add to Album"
-                            else if (selectedBoardIds.size > 1) "Save to ${selectedBoardIds.size} Boards"
+                            text = if (selectedBoardIds.size > 1) "Save to ${selectedBoardIds.size} Boards"
                             else "Save",
                             color = Color.White,
                             fontWeight = FontWeight.Bold

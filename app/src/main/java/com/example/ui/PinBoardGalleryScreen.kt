@@ -145,6 +145,11 @@ fun PinBoardGalleryScreen(
     var previewAlbum by remember { mutableStateOf<DateAlbum?>(null) }
     val searchQuery by viewModel.searchQuery.collectAsStateWithLifecycle()
     val selectedPinIds by viewModel.selectedPinIds.collectAsStateWithLifecycle()
+    val selectedAlbumIds by viewModel.selectedAlbumIds.collectAsStateWithLifecycle()
+    val pendingAlbumTransfer by viewModel.pendingAlbumTransfer.collectAsStateWithLifecycle()
+    val repositioningAlbumId by viewModel.repositioningAlbumId.collectAsStateWithLifecycle()
+    val scrollToAlbumId by viewModel.scrollToAlbumId.collectAsStateWithLifecycle()
+    val snackbarActionLabel by viewModel.snackbarActionLabel.collectAsStateWithLifecycle()
     val isSelectionMode by viewModel.isSelectionMode.collectAsStateWithLifecycle()
     val isLoading by viewModel.isLoading.collectAsStateWithLifecycle()
     val isSyncing by viewModel.isSyncing.collectAsStateWithLifecycle()
@@ -178,7 +183,13 @@ fun PinBoardGalleryScreen(
     var isReorderBoardsDialogOpen by remember { mutableStateOf(false) }
     val forceBoardTypeOrder by viewModel.forceBoardTypeOrder.collectAsStateWithLifecycle()
 
-    val gridState = rememberLazyStaggeredGridState()
+    val boardGridState = rememberLazyStaggeredGridState()
+    val albumGridState = rememberLazyStaggeredGridState()
+    val gridState = if (activeAlbum != null) albumGridState else boardGridState
+
+    // Per-board/album scroll positions
+    val boardScrollStates = remember { androidx.compose.runtime.mutableStateMapOf<String, Pair<Int, Int>>() }
+    val albumScrollStates = remember { androidx.compose.runtime.mutableStateMapOf<String, Pair<Int, Int>>() }
     val boardsListScrollState = rememberSaveable(saver = androidx.compose.foundation.lazy.LazyListState.Saver) {
         androidx.compose.foundation.lazy.LazyListState(
             firstVisibleItemIndex = viewModel.boardsListScrollIndex,
@@ -199,6 +210,19 @@ fun PinBoardGalleryScreen(
                 viewModel.boardsListScrollIndex,
                 viewModel.boardsListScrollOffset
             )
+        }
+    }
+
+    // Scroll to album when requested (after combine/creation)
+    LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {
+        val targetId = scrollToAlbumId ?: return@LaunchedEffect
+        val idx = galleryItemsPlaceholder.indexOfFirst { it.album?.id == targetId }
+        if (idx >= 0) {
+            val hc = (if (browserWorker != null && isBrowserTestingVisible) 1 else 0) +
+                     (if (currentBoard != null) 1 else 0) +
+                     (if (isLoading) 1 else 0)
+            boardGridState.animateScrollToItem(hc + idx)
+            viewModel.consumeScrollRequest()
         }
     }
 
@@ -246,6 +270,23 @@ fun PinBoardGalleryScreen(
     val loosePins = remember(allPinsForAlbums) {
         allPinsForAlbums.filter { it.albumId == null }
     }
+
+    // Merged gallery items (albums + loose pins) sorted by date
+    data class GalleryItem(
+        val album: DateAlbum? = null,
+        val pin: PinItem? = null,
+        val pinIndexInLoose: Int = -1,
+        val dateAdded: Long
+    )
+    val galleryItems = remember(topLevelCustomAlbums, displayedPins) {
+        val loosePinsForGallery = if (topLevelCustomAlbums.isNotEmpty()) displayedPins.filter { it.albumId == null } else displayedPins
+        val items = mutableListOf<GalleryItem>()
+        topLevelCustomAlbums.forEach { a -> items.add(GalleryItem(album = a, dateAdded = a.dateMillis)) }
+        loosePinsForGallery.forEachIndexed { i, p -> items.add(GalleryItem(pin = p, pinIndexInLoose = i, dateAdded = p.dateAddedMillis)) }
+        items.sortByDescending { it.dateAdded }
+        items
+    }
+    val galleryItemsPlaceholder = galleryItems
 
     // Date groups for "separate images by date" gallery layout
     val dateGroups = remember(displayedPins, separateByDate, topLevelCustomAlbums) {
@@ -389,10 +430,42 @@ fun PinBoardGalleryScreen(
         }
     }
 
-    // Reset scroll to top when board changes or newest pin changes so images refresh cleanly at top
+    // Per-context (board or album) scroll save/restore
+    val currentContext = activeAlbum?.id ?: currentBoard?.id ?: "none"
+    LaunchedEffect(currentContext) {
+        val key = currentContext
+        val isAlbum = activeAlbum != null
+        val targetState = if (isAlbum) albumGridState else boardGridState
+        if (key != "none") {
+            val saved = if (isAlbum) albumScrollStates[key] else boardScrollStates[key]
+            if (saved != null) targetState.scrollToItem(saved.first, saved.second)
+            else if (!isAlbum) targetState.scrollToItem(0)
+        }
+        try { kotlinx.coroutines.awaitCancellation() } finally {
+            if (key != "none") {
+                val idx = targetState.firstVisibleItemIndex
+                val off = targetState.firstVisibleItemScrollOffset
+                if (isAlbum) albumScrollStates[key] = idx to off
+                else boardScrollStates[key] = idx to off
+            }
+        }
+    }
+
+    // Newest-pin change on the SAME board: scroll to top (not on board switch)
+    var lastBoardId by remember { mutableStateOf<String?>(null) }
+    var lastFirstPinId by remember { mutableStateOf<String?>(null) }
+    val currentActiveAlbum by rememberUpdatedState(activeAlbum)
     LaunchedEffect(currentBoard?.id, currentBoard?.pins?.firstOrNull()?.id) {
-        gridState.scrollToItem(0)
-        topBarVisible = true
+        val bId = currentBoard?.id
+        val pId = currentBoard?.pins?.firstOrNull()?.id
+        val boardChanged = bId != lastBoardId
+        val pinChanged = pId != null && pId != lastFirstPinId
+        lastBoardId = bId
+        lastFirstPinId = pId
+        if (!boardChanged && pinChanged && currentActiveAlbum == null) {
+            boardGridState.scrollToItem(0)
+            topBarVisible = true
+        }
     }
 
     // Regular backup check (User requirement 1)
@@ -400,10 +473,17 @@ fun PinBoardGalleryScreen(
         com.example.util.BackupManager.checkAndPerformScheduledBackup(context)
     }
 
-    // Handle snackbar messages
-    LaunchedEffect(snackbarMessage) {
-        snackbarMessage?.let {
-            snackbarHostState.showSnackbar(it)
+    // Handle snackbar messages (with optional action)
+    LaunchedEffect(snackbarMessage, snackbarActionLabel) {
+        snackbarMessage?.let { msg ->
+            val result = snackbarHostState.showSnackbar(
+                message = msg,
+                actionLabel = snackbarActionLabel,
+                duration = if (snackbarActionLabel != null) androidx.compose.material3.SnackbarDuration.Long else androidx.compose.material3.SnackbarDuration.Short
+            )
+            if (result == androidx.compose.material3.SnackbarResult.ActionPerformed) {
+                viewModel.executeSnackbarAction()
+            }
             viewModel.dismissSnackbar()
         }
     }
@@ -417,19 +497,24 @@ fun PinBoardGalleryScreen(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
-            if (fullscreenPinIndex == null) {
+            if (fullscreenPinIndex == null && pendingAlbumTransfer == null) {
                 MultiSelectBottomBar(
                     isVisible = isSelectionMode,
-                    selectedCount = selectedPinIds.size,
+                    selectedPinCount = selectedPinIds.size,
+                    selectedAlbumCount = selectedAlbumIds.size,
                     totalCount = displayedPins.size,
                     onSelectAll = { viewModel.selectAll() },
                     onDeselectAll = { viewModel.deselectAll() },
                     onClearSelection = { viewModel.clearSelection() },
                     onDownloadSelected = { viewModel.downloadSelected(context) },
                     onMoveToTop = { viewModel.moveSelectedPinsToTop() },
-                    onDeleteSelected = { viewModel.deletePinsFromCurrentBoard(selectedPinIds) },
+                    onDeleteSelected = {
+                        if (selectedPinIds.isNotEmpty()) viewModel.deletePinsFromCurrentBoard(selectedPinIds)
+                        if (selectedAlbumIds.isNotEmpty()) viewModel.deleteSelectedAlbums()
+                    },
                     onCopySelected = { showCopyDialog = true },
-                    onMoveSelected = { showMoveDialog = true }
+                    onMoveSelected = { showMoveDialog = true },
+                    onCreateAlbum = { viewModel.combineSelectedPinsToNewAlbum() }
                 )
             }
         }
@@ -879,64 +964,66 @@ fun PinBoardGalleryScreen(
                         }
                     }
                 } else {
-                    // 4. Standard Masonry Pin Items with Top-Level Custom Albums
-                    if (topLevelCustomAlbums.isNotEmpty()) {
-                        items(
-                            items = topLevelCustomAlbums,
-                            key = { album -> "board_custom_album_${album.id}_${album.isFavorite}" }
-                        ) { album ->
+                    // 4. Standard Masonry — merged albums + pins, sorted by date
+                    items(
+                        items = galleryItems,
+                        key = { item ->
+                            item.album?.let { "album_${it.id}" } ?: "pin_${item.pin?.id}"
+                        }
+                    ) { item ->
+                        if (item.album != null) {
+                            val album = item.album
+                            val isSelectedAlbum = selectedAlbumIds.contains(album.id)
                             AlbumCard(
                                 album = album,
                                 columnCount = columnCount,
                                 isFavorite = album.isFavorite,
                                 isPortrait = portraitAlbumCards,
+                                isSelected = isSelectedAlbum,
+                                isSelectionMode = isSelectionMode,
                                 onClick = {
-                                    viewModel.openAlbum(album)
+                                    when {
+                                        pendingAlbumTransfer != null -> viewModel.executeAlbumTransfer(album, currentBoard?.id ?: "")
+                                        else -> viewModel.openAlbum(album)
+                                    }
                                 },
                                 onLongClick = {
                                     viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)
+                                },
+                                onSelectToggle = {
+                                    viewModel.toggleAlbumSelection(album.id)
                                 },
                                 onSwipePreview = {
                                     previewAlbum = album
                                 }
                             )
+                        } else if (item.pin != null) {
+                            val pin = item.pin
+                            val isSelected = selectedPinIds.contains(pin.id)
+                            val isFav = favoritePinKeys.contains(pin.id) || favoritePinKeys.contains(pin.imageUrl)
+                            PinCard(
+                                pin = pin,
+                                columnCount = columnCount,
+                                isSelected = isSelected,
+                                isSelectionMode = isSelectionMode,
+                                isFavorite = isFav,
+                                hideTitleAndAuthor = hidePinTitlesAndAuthors,
+                                onClick = {
+                                    if (isSelectionMode) {
+                                        viewModel.toggleSelection(pin.id)
+                                    } else {
+                                        viewModel.openFullscreen(item.pinIndexInLoose)
+                                    }
+                                },
+                                onLongClick = {
+                                    if (isSelectionMode) {
+                                        viewModel.toggleSelection(pin.id)
+                                    } else {
+                                        viewModel.toggleFavorite(pin)
+                                    }
+                                }
+                            )
                         }
-                    }
-
-                    val pinsToShow = if (topLevelCustomAlbums.isNotEmpty()) {
-                        displayedPins.filter { it.albumId == null }
-                    } else {
-                        displayedPins
-                    }
-
-                    itemsIndexed(
-                        items = pinsToShow,
-                        key = { index, pin -> "${pin.id}_$index" }
-                    ) { index, pin ->
-                        val isSelected = selectedPinIds.contains(pin.id)
-                        val isFav = favoritePinKeys.contains(pin.id) || favoritePinKeys.contains(pin.imageUrl)
-                        PinCard(
-                            pin = pin,
-                            columnCount = columnCount,
-                            isSelected = isSelected,
-                            isSelectionMode = isSelectionMode,
-                            isFavorite = isFav,
-                            hideTitleAndAuthor = hidePinTitlesAndAuthors,
-                            onClick = {
-                                if (isSelectionMode) {
-                                    viewModel.toggleSelection(pin.id)
-                                } else {
-                                    viewModel.openFullscreen(index)
-                                }
-                            },
-                            onLongClick = {
-                                if (isSelectionMode) {
-                                    viewModel.toggleSelection(pin.id)
-                                } else {
-                                    viewModel.toggleFavorite(pin)
-                                }
-                            }
-                        )
                     }
                 }
 
@@ -1318,6 +1405,91 @@ fun PinBoardGalleryScreen(
         }
     }
 
+    // Pending album transfer banner (bottom, hides select bar)
+    pendingAlbumTransfer?.let { transfer ->
+        androidx.compose.material3.Surface(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
+                .fillMaxWidth()
+                .testTag("pending_album_transfer_banner"),
+            shape = RoundedCornerShape(16.dp),
+            color = PinterestBlack,
+            shadowElevation = 8.dp
+        ) {
+            androidx.compose.foundation.layout.Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                androidx.compose.material3.IconButton(
+                    onClick = { viewModel.cancelAlbumTransferAndRestore() },
+                    modifier = Modifier.testTag("album_transfer_back_btn")
+                ) {
+                    androidx.compose.material3.Icon(
+                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = "Back to selection",
+                        tint = Color.White
+                    )
+                }
+                Text(
+                    text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+        }
+    }
+
+    // Album position dialog
+    repositioningAlbumId?.let { albumId ->
+        val positions = listOf(
+            com.example.viewmodel.AlbumPosition.TOP_OF_BOARD to "Top of board",
+            com.example.viewmodel.AlbumPosition.TOP_SELECTED to "Top selected image",
+            com.example.viewmodel.AlbumPosition.MIDDLE_SELECTED to "Middle selected image",
+            com.example.viewmodel.AlbumPosition.BOTTOM_SELECTED to "Bottom selected image"
+        )
+        var picked by remember { mutableStateOf(com.example.viewmodel.AlbumPosition.TOP_SELECTED) }
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { viewModel.closeAlbumPositionDialog() },
+            title = { Text("Album position", fontWeight = FontWeight.Bold, fontSize = 16.sp) },
+            text = {
+                Column {
+                    positions.forEach { (pos, label) ->
+                        androidx.compose.foundation.layout.Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { picked = pos }
+                                .padding(vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            androidx.compose.material3.RadioButton(
+                                selected = picked == pos,
+                                onClick = { picked = pos }
+                            )
+                            Text(label, fontSize = 13.sp)
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                androidx.compose.material3.Button(
+                    onClick = {
+                        viewModel.repositionAlbum(albumId, picked)
+                        viewModel.closeAlbumPositionDialog()
+                    },
+                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = PinterestRed)
+                ) { Text("Apply", color = Color.White) }
+            },
+            dismissButton = {
+                androidx.compose.material3.TextButton(onClick = { viewModel.closeAlbumPositionDialog() }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
     // Board Link Dialog with History of Boards Links
     BoardLinkDialog(
         isOpen = isLinkDialogOpen,
@@ -1407,11 +1579,10 @@ fun PinBoardGalleryScreen(
         isOpen = isAddManualImagesDialogOpen,
         availableBoards = availableBoards,
         currentBoardId = currentBoard?.id,
-        availableAlbums = customDateAlbums,
-        currentAlbumId = activeAlbum?.id,
+        currentAlbumTitle = activeAlbum?.title,
         onDismiss = { isAddManualImagesDialogOpen = false },
-        onAddImages = { text, targetBoards, extractMultiple, putIntoAlbum, targetAlbumId ->
-            viewModel.addManualImages(text, targetBoards, extractMultiple, putIntoAlbum, targetAlbumId)
+        onAddImages = { text, targetBoards, extractMultiple ->
+            viewModel.addManualImages(text, targetBoards, extractMultiple)
         }
     )
 
@@ -1428,10 +1599,14 @@ fun PinBoardGalleryScreen(
         isOpen = showCopyDialog,
         mode = BoardTransferMode.COPY,
         selectedPins = displayedPins.filter { selectedPinIds.contains(it.id) },
-        selectedCount = selectedPinIds.size,
+        selectedCount = selectedPinIds.size + selectedAlbumIds.size,
         availableBoards = availableBoards,
         currentBoardId = currentBoard?.id,
         onDismiss = { showCopyDialog = false },
+        onTransferToAlbum = {
+            showCopyDialog = false
+            viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.COPY)
+        },
         onConfirm = { targetBoardIds ->
             viewModel.copySelectedPinsToBoards(targetBoardIds, selectedPinIds)
         }
@@ -1442,10 +1617,14 @@ fun PinBoardGalleryScreen(
         isOpen = showMoveDialog,
         mode = BoardTransferMode.MOVE,
         selectedPins = displayedPins.filter { selectedPinIds.contains(it.id) },
-        selectedCount = selectedPinIds.size,
+        selectedCount = selectedPinIds.size + selectedAlbumIds.size,
         availableBoards = availableBoards,
         currentBoardId = currentBoard?.id,
         onDismiss = { showMoveDialog = false },
+        onTransferToAlbum = {
+            showMoveDialog = false
+            viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.MOVE)
+        },
         onConfirm = { targetBoardIds ->
             viewModel.moveSelectedPinsToBoards(targetBoardIds, selectedPinIds)
         }

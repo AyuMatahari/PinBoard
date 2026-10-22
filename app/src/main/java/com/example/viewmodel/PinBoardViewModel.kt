@@ -41,6 +41,18 @@ data class DeletedPinsUndoState(
     val imageUrls: List<String> = pins.map { it.imageUrl }
 )
 
+enum class AlbumPosition { TOP_OF_BOARD, TOP_SELECTED, MIDDLE_SELECTED, BOTTOM_SELECTED }
+
+enum class AlbumTransferMode { COPY, MOVE }
+
+data class PendingAlbumTransfer(
+    val pinIds: Set<String>,
+    val mode: AlbumTransferMode,
+    val sourceBoardId: String,
+    val savedSelectionPinIds: Set<String>,
+    val savedSelectionAlbumIds: Set<String>
+)
+
 data class DeletedBoardUndoState(
     val board: PinterestBoard,
     val pins: List<PinItem>
@@ -85,6 +97,23 @@ class PinBoardViewModel(
 
     private val _selectedPinIds = MutableStateFlow<Set<String>>(emptySet())
     val selectedPinIds: StateFlow<Set<String>> = _selectedPinIds.asStateFlow()
+
+    private val _selectedAlbumIds = MutableStateFlow<Set<String>>(emptySet())
+    val selectedAlbumIds: StateFlow<Set<String>> = _selectedAlbumIds.asStateFlow()
+
+    private val _snackbarActionLabel = MutableStateFlow<String?>(null)
+    val snackbarActionLabel: StateFlow<String?> = _snackbarActionLabel.asStateFlow()
+
+    private val _snackbarAction = MutableStateFlow<(() -> Unit)?>(null)
+
+    private val _pendingAlbumTransfer = MutableStateFlow<PendingAlbumTransfer?>(null)
+    val pendingAlbumTransfer: StateFlow<PendingAlbumTransfer?> = _pendingAlbumTransfer.asStateFlow()
+
+    private val _repositioningAlbumId = MutableStateFlow<String?>(null)
+    val repositioningAlbumId: StateFlow<String?> = _repositioningAlbumId.asStateFlow()
+
+    private val _scrollToAlbumId = MutableStateFlow<String?>(null)
+    val scrollToAlbumId: StateFlow<String?> = _scrollToAlbumId.asStateFlow()
 
     private val _isSelectionMode = MutableStateFlow(false)
     val isSelectionMode: StateFlow<Boolean> = _isSelectionMode.asStateFlow()
@@ -959,10 +988,10 @@ class PinBoardViewModel(
             addBoardToHistory(board)
             saveOpenedBoardState(board)
 
-            // Auto-load new images only applied to custom boards, not Pinterest boards (User request 1)
+            // Observe ALL boards so share-to-default updates reflect immediately
             boardPinsObserverJob?.cancel()
             val ctx = appContext
-            if (ctx != null && board.isCustom && board.id != "board_favorites") {
+            if (ctx != null) {
                 boardPinsObserverJob = viewModelScope.launch(Dispatchers.IO) {
                     val dao = AppDatabase.getDatabase(ctx).boardDao()
                     launch {
@@ -1590,10 +1619,14 @@ class PinBoardViewModel(
     fun addManualImages(
         unstructuredText: String,
         targetBoardIds: List<String>,
-        extractMultipleImages: Boolean = false,
-        putIntoAlbum: Boolean = false,
-        targetAlbumId: String? = null
+        extractMultipleImages: Boolean = false
     ) {
+        // Implicit: if user is inside an album on the target board, add to that album
+        val _activeAlbumId = _activeAlbum.value?.let { alb ->
+            if (_currentBoard.value != null && targetBoardIds.contains(_currentBoard.value!!.id)) alb.id else null
+        }
+        val targetAlbumId: String? = _activeAlbumId
+        val putIntoAlbum = false
         val ctx = appContext ?: return
         val links = LinkExtractor.extractLinks(unstructuredText)
         if (links.isEmpty()) {
@@ -1744,7 +1777,7 @@ class PinBoardViewModel(
         val ctx = appContext ?: return
         viewModelScope.launch(Dispatchers.IO) {
             val dao = AppDatabase.getDatabase(ctx).boardDao()
-            dao.deleteAlbum(albumId)
+            dao.deleteAlbumAndDetachPins(albumId)
             val cur = _currentBoard.value
             if (cur != null) {
                 val albums = dao.getAlbumsForBoard(cur.id)
@@ -2544,13 +2577,23 @@ class PinBoardViewModel(
         _isSelectionMode.value = true
     }
 
+    fun selectAllAlbums(albumIds: Set<String>) {
+        _selectedAlbumIds.value = albumIds
+    }
+
     fun deselectAll() {
         _selectedPinIds.value = emptySet()
     }
 
     fun clearSelection() {
         _selectedPinIds.value = emptySet()
+        _selectedAlbumIds.value = emptySet()
         _isSelectionMode.value = false
+    }
+
+    fun toggleAlbumSelection(albumId: String) {
+        val current = _selectedAlbumIds.value
+        _selectedAlbumIds.value = if (current.contains(albumId)) current - albumId else current + albumId
     }
 
     fun enterSelectionMode(initialPinId: String? = null) {
@@ -2623,12 +2666,194 @@ class PinBoardViewModel(
         }
     }
 
+    fun executeSnackbarAction() {
+        _snackbarAction.value?.invoke()
+    }
+
     fun dismissSnackbar() {
         _snackbarMessage.value = null
+        _snackbarActionLabel.value = null
+        _snackbarAction.value = null
     }
+
+    fun showSnackbarWithAction(message: String, actionLabel: String, onAction: () -> Unit) {
+        _snackbarActionLabel.value = actionLabel
+        _snackbarAction.value = onAction
+        _snackbarMessage.value = message
+    }
+
+    fun requestScrollToAlbum(albumId: String) { _scrollToAlbumId.value = albumId }
+    fun consumeScrollRequest() { _scrollToAlbumId.value = null }
+    fun openAlbumPositionDialog(albumId: String) { _repositioningAlbumId.value = albumId }
+    fun closeAlbumPositionDialog() { _repositioningAlbumId.value = null }
 
     fun clearDownloadProgress() {
         _downloadProgress.value = null
+    }
+
+    fun deleteSelectedAlbums() {
+        val ids = _selectedAlbumIds.value
+        if (ids.isEmpty()) return
+        val ctx = appContext ?: return
+        viewModelScope.launch {
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            withContext(Dispatchers.IO) {
+                ids.forEach { dao.deleteAlbumAndDetachPins(it) }
+            }
+            val cur = _currentBoard.value
+            if (cur != null) {
+                val pins = dao.getPinsForBoard(cur.id).map { it.toPinItem() }
+                val albums = dao.getAlbumsForBoard(cur.id)
+                withContext(Dispatchers.Main) {
+                    _rawPins.value = pins
+                    _customAlbums.value = albums
+                    _currentBoard.value = cur.copy(pins = pins, pinCount = pins.size)
+                    updateDisplayedPins()
+                }
+            }
+            clearSelection()
+            _snackbarMessage.value = "Deleted ${ids.size} album${if (ids.size > 1) "s" else ""}"
+        }
+    }
+
+    private fun resolveInsertionMillis(position: AlbumPosition, pins: List<PinItem>, currentPins: List<PinItem>): Long {
+        if (pins.isEmpty()) return System.currentTimeMillis()
+        val sortedSel = pins.map { it.dateAddedMillis }.sorted()
+        return when (position) {
+            AlbumPosition.TOP_OF_BOARD -> (currentPins.maxOfOrNull { it.dateAddedMillis } ?: 0L) + 60_000L
+            AlbumPosition.TOP_SELECTED -> sortedSel.last() + 60_000L
+            AlbumPosition.MIDDLE_SELECTED -> sortedSel[sortedSel.size / 2]
+            AlbumPosition.BOTTOM_SELECTED -> sortedSel.first() - 60_000L
+        }
+    }
+
+    fun combineSelectedPinsToNewAlbum(position: AlbumPosition = AlbumPosition.TOP_SELECTED) {
+        val selectedIds = _selectedPinIds.value
+        if (selectedIds.size < 2) {
+            _snackbarMessage.value = "Select at least 2 images to create an album"
+            return
+        }
+        val board = _currentBoard.value ?: return
+        val ctx = appContext ?: return
+        val selectedPins = _rawPins.value.filter { selectedIds.contains(it.id) }
+        viewModelScope.launch {
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            val albumId = "album_${System.currentTimeMillis()}_${(1000..9999).random()}"
+            val albumDate = resolveInsertionMillis(position, selectedPins, _rawPins.value)
+            val entity = CustomAlbumEntity(
+                id = albumId, boardId = board.id, parentAlbumId = null,
+                title = "Album (${selectedPins.size} images)",
+                sourceUrl = "", dateAddedMillis = albumDate,
+                orderIndex = 0, isFavorite = false
+            )
+            withContext(Dispatchers.IO) { dao.insertAlbum(entity) }
+            val updatedPins = _rawPins.value.map { p ->
+                if (selectedIds.contains(p.id)) p.copy(albumId = albumId) else p
+            }
+            withContext(Dispatchers.IO) {
+                dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, board.id, i) })
+            }
+            val albums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(board.id) }
+            withContext(Dispatchers.Main) {
+                _rawPins.value = updatedPins
+                _customAlbums.value = albums
+                _currentBoard.value = board.copy(pins = updatedPins, pinCount = updatedPins.size)
+                clearSelection()
+                updateDisplayedPins(resetLimit = true)
+                requestScrollToAlbum(albumId)
+                showSnackbarWithAction(
+                    message = "Album created · ${selectedPins.size} images",
+                    actionLabel = "Change position"
+                ) { openAlbumPositionDialog(albumId) }
+            }
+        }
+    }
+
+    fun repositionAlbum(albumId: String, position: AlbumPosition) {
+        val ctx = appContext ?: return
+        viewModelScope.launch {
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            val albumPins = withContext(Dispatchers.IO) {
+                dao.getPinsForAlbum(albumId).map { it.toPinItem() }
+            }
+            if (albumPins.isEmpty()) return@launch
+            val date = resolveInsertionMillis(position, albumPins, _rawPins.value)
+            withContext(Dispatchers.IO) { dao.updateAlbumDate(albumId, date) }
+            val cur = _currentBoard.value
+            if (cur != null) {
+                val albums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(cur.id) }
+                withContext(Dispatchers.Main) {
+                    _customAlbums.value = albums
+                    closeAlbumPositionDialog()
+                    requestScrollToAlbum(albumId)
+                }
+            }
+        }
+    }
+
+    fun beginAlbumTransfer(pinIds: Set<String>, mode: AlbumTransferMode) {
+        if (pinIds.isEmpty()) return
+        val board = _currentBoard.value ?: return
+        _pendingAlbumTransfer.value = PendingAlbumTransfer(
+            pinIds = pinIds, mode = mode, sourceBoardId = board.id,
+            savedSelectionPinIds = _selectedPinIds.value,
+            savedSelectionAlbumIds = _selectedAlbumIds.value
+        )
+    }
+
+    fun cancelAlbumTransferAndRestore() {
+        val transfer = _pendingAlbumTransfer.value ?: return
+        _pendingAlbumTransfer.value = null
+        _selectedPinIds.value = transfer.savedSelectionPinIds
+        _selectedAlbumIds.value = transfer.savedSelectionAlbumIds
+        _isSelectionMode.value = true
+    }
+
+    fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {
+        val transfer = _pendingAlbumTransfer.value ?: return
+        val ctx = appContext ?: return
+        viewModelScope.launch {
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            val sourcePins = _rawPins.value.filter { transfer.pinIds.contains(it.id) }
+            val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(targetBoardId).toSet() }
+            val mode = transfer.mode
+            val albumId = targetAlbum.id
+            if (transfer.sourceBoardId == targetBoardId) {
+                // Same board: just assign albumId
+                val updatedPins = _rawPins.value.map { p ->
+                    if (transfer.pinIds.contains(p.id)) p.copy(albumId = albumId) else p
+                }
+                withContext(Dispatchers.IO) {
+                    dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, targetBoardId, i) })
+                }
+                withContext(Dispatchers.Main) {
+                    _rawPins.value = updatedPins
+                    _currentBoard.value = _currentBoard.value?.copy(pins = updatedPins, pinCount = updatedPins.size)
+                }
+            } else {
+                val toAdd = sourcePins.filter { !existingUrls.contains(it.imageUrl) }
+                    .map { it.copy(albumId = albumId) }
+                withContext(Dispatchers.IO) {
+                    dao.insertPins(toAdd.mapIndexed { i, p -> PinEntity.fromPinItem(p, targetBoardId, i) })
+                    if (mode == AlbumTransferMode.MOVE) {
+                        dao.deletePinsFromBoard(transfer.sourceBoardId, transfer.pinIds.toList())
+                    }
+                }
+                if (mode == AlbumTransferMode.MOVE) {
+                    val remaining = _rawPins.value.filterNot { transfer.pinIds.contains(it.id) }
+                    withContext(Dispatchers.Main) {
+                        _rawPins.value = remaining
+                        _currentBoard.value = _currentBoard.value?.copy(pins = remaining, pinCount = remaining.size)
+                        updateDisplayedPins()
+                    }
+                }
+            }
+            _pendingAlbumTransfer.value = null
+            withContext(Dispatchers.Main) {
+                clearSelection()
+                _snackbarMessage.value = "${if (mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${sourcePins.size} image(s) to \"${targetAlbum.title}\""
+            }
+        }
     }
 
     override fun onCleared() {

@@ -346,6 +346,7 @@ object BackupManager {
                     albumsArray.put(aObj)
                 }
                 rootJson.put("custom_albums", albumsArray)
+            rootJson.put("album_ordering_version", 2)
             } catch (_: Exception) {}
 
             val timestampStr = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -595,6 +596,24 @@ object BackupManager {
                 if (albumEntities.isNotEmpty()) {
                     dao.insertAlbums(albumEntities)
                 }
+            }
+
+            // Legacy album migration: if backup is v1 (no album_ordering_version),
+            // reposition each album to the median of its pins' dateAddedMillis
+            // so they intersperse naturally with pins instead of stacking on top.
+            val albumOrderVer = rootJson.optInt("album_ordering_version", 1)
+            if (albumOrderVer < 2) {
+                try {
+                    val allAlbums = dao.getAllAlbums()
+                    for (album in allAlbums) {
+                        val albumPins = dao.getPinsForAlbum(album.id)
+                        if (albumPins.size > 1) {
+                            val dates = albumPins.map { it.dateAddedMillis }.sorted()
+                            val median = dates[dates.size / 2]
+                            dao.updateAlbumDate(album.id, median)
+                        }
+                    }
+                } catch (_: Throwable) {}
             }
 
             // 3. Restore App Settings SharedPreferences

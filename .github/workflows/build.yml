@@ -9,59 +9,32 @@ jobs:
     env:
       JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v3
         with:
           packages: ''
-
-      - name: Accept Android licenses
-        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
-
-      - name: Install SDK components
-        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
-
-      - name: Verify release.keystore is committed
+      - run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
+      - run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+      - name: Verify keystore
         run: |
-          if [ ! -f release.keystore ]; then
-            echo "ERROR: release.keystore missing from repo"
-            exit 1
-          fi
-          if ! keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload; then
-            echo "ERROR: alias 'upload' not found in release.keystore"
-            exit 1
-          fi
-          echo "release.keystore OK"
-
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v3
+          [ -f release.keystore ] || { echo "release.keystore missing"; exit 1; }
+          keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload || { echo "alias 'upload' not found"; exit 1; }
+      - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: wrapper
-
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Build Release APK
-        run: ./gradlew :app:assembleRelease --stacktrace --no-daemon
-
-      - name: Verify APK signature
+      - run: chmod +x ./gradlew
+      - run: ./gradlew :app:assembleRelease --stacktrace --no-daemon
+      - name: Verify signature
         run: |
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
-          if [ -z "$APK" ]; then echo "ERROR: no release APK produced"; exit 1; fi
-          echo "APK: $APK"
+          [ -n "$APK" ] || { echo "no APK"; exit 1; }
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
           "$BT/apksigner" verify --verbose --print-certs "$APK"
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: app-release
           path: app/build/outputs/apk/release/*.apk

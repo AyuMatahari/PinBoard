@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.CheckBox
 import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.VerticalAlignTop
@@ -47,7 +48,8 @@ import com.example.ui.theme.PinterestRed
 @Composable
 fun MultiSelectBottomBar(
     isVisible: Boolean,
-    selectedCount: Int,
+    selectedPinCount: Int = 0,
+    selectedAlbumCount: Int = 0,
     totalCount: Int,
     onSelectAll: () -> Unit,
     onDeselectAll: () -> Unit = {},
@@ -57,6 +59,7 @@ fun MultiSelectBottomBar(
     onDeleteSelected: () -> Unit = {},
     onCopySelected: () -> Unit = {},
     onMoveSelected: () -> Unit = {},
+    onCreateAlbum: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     AnimatedVisibility(
@@ -99,10 +102,18 @@ fun MultiSelectBottomBar(
                     Spacer(modifier = Modifier.width(4.dp))
 
                     Text(
-                        text = "$selectedCount",
+                        text = buildString {
+                            append(selectedPinCount)
+                            append(" img")
+                            if (selectedAlbumCount > 0) {
+                                append(" · ")
+                                append(selectedAlbumCount)
+                                append(" alb")
+                            }
+                        },
                         style = MaterialTheme.typography.titleSmall.copy(
                             fontWeight = FontWeight.Bold,
-                            fontSize = 13.sp
+                            fontSize = 12.sp
                         ),
                         color = MaterialTheme.colorScheme.onSurface
                     )
@@ -113,7 +124,7 @@ fun MultiSelectBottomBar(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(3.dp)
                 ) {
-                    val allSelected = selectedCount > 0 && selectedCount >= totalCount
+                    val allSelected = (selectedPinCount + selectedAlbumCount) > 0 && (selectedPinCount + selectedAlbumCount) >= totalCount
                     Surface(
                         shape = RoundedCornerShape(12.dp),
                         color = if (allSelected) PinterestRed.copy(alpha = 0.12f) else PinterestPillGray,
@@ -147,7 +158,7 @@ fun MultiSelectBottomBar(
                     // Copy to other boards action (User requirement)
                     IconButton(
                         onClick = onCopySelected,
-                        enabled = selectedCount > 0,
+                        enabled = (selectedPinCount + selectedAlbumCount) > 0,
                         modifier = Modifier
                             .size(32.dp)
                             .testTag("multi_select_copy_btn")
@@ -155,7 +166,7 @@ fun MultiSelectBottomBar(
                         Icon(
                             imageVector = Icons.Default.ContentCopy,
                             contentDescription = "Copy to boards",
-                            tint = if (selectedCount > 0) MaterialTheme.colorScheme.onSurface else Color.Gray,
+                            tint = if ((selectedPinCount + selectedAlbumCount) > 0) MaterialTheme.colorScheme.onSurface else Color.Gray,
                             modifier = Modifier.size(17.dp)
                         )
                     }
@@ -163,7 +174,7 @@ fun MultiSelectBottomBar(
                     // Move to other boards action (User requirement)
                     IconButton(
                         onClick = onMoveSelected,
-                        enabled = selectedCount > 0,
+                        enabled = (selectedPinCount + selectedAlbumCount) > 0,
                         modifier = Modifier
                             .size(32.dp)
                             .testTag("multi_select_move_btn")
@@ -171,7 +182,7 @@ fun MultiSelectBottomBar(
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.DriveFileMove,
                             contentDescription = "Move to boards",
-                            tint = if (selectedCount > 0) MaterialTheme.colorScheme.onSurface else Color.Gray,
+                            tint = if ((selectedPinCount + selectedAlbumCount) > 0) MaterialTheme.colorScheme.onSurface else Color.Gray,
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -179,7 +190,7 @@ fun MultiSelectBottomBar(
                     // Put at Top action (User requirement)
                     IconButton(
                         onClick = onMoveToTop,
-                        enabled = selectedCount > 0,
+                        enabled = selectedPinCount > 0,
                         modifier = Modifier
                             .size(32.dp)
                             .testTag("multi_select_move_to_top_btn")
@@ -187,7 +198,7 @@ fun MultiSelectBottomBar(
                         Icon(
                             imageVector = Icons.Default.VerticalAlignTop,
                             contentDescription = "Put images at top",
-                            tint = if (selectedCount > 0) MaterialTheme.colorScheme.onSurface else Color.Gray,
+                            tint = if ((selectedPinCount + selectedAlbumCount) > 0) MaterialTheme.colorScheme.onSurface else Color.Gray,
                             modifier = Modifier.size(18.dp)
                         )
                     }
@@ -195,7 +206,7 @@ fun MultiSelectBottomBar(
                     // Delete action (User requirement)
                     IconButton(
                         onClick = onDeleteSelected,
-                        enabled = selectedCount > 0,
+                        enabled = (selectedPinCount + selectedAlbumCount) > 0,
                         modifier = Modifier
                             .size(32.dp)
                             .testTag("multi_select_delete_btn")
@@ -203,15 +214,32 @@ fun MultiSelectBottomBar(
                         Icon(
                             imageVector = Icons.Default.DeleteOutline,
                             contentDescription = "Delete selected images",
-                            tint = if (selectedCount > 0) PinterestRed else Color.Gray,
+                            tint = if ((selectedPinCount + selectedAlbumCount) > 0) PinterestRed else Color.Gray,
                             modifier = Modifier.size(18.dp)
                         )
+                    }
+
+                    // Create Album button (pins only, >=2)
+                    if (selectedPinCount >= 2) {
+                        IconButton(
+                            onClick = onCreateAlbum,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .testTag("multi_select_create_album_btn")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CreateNewFolder,
+                                contentDescription = "Create album from selected images",
+                                tint = PinterestRed,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
                     }
 
                     // Download Button
                     Button(
                         onClick = onDownloadSelected,
-                        enabled = selectedCount > 0,
+                        enabled = selectedPinCount > 0,
                         colors = ButtonDefaults.buttonColors(
                             containerColor = PinterestRed,
                             disabledContainerColor = PinterestPillGray
@@ -225,7 +253,7 @@ fun MultiSelectBottomBar(
                         Icon(
                             imageVector = Icons.Default.Download,
                             contentDescription = null,
-                            tint = if (selectedCount > 0) Color.White else Color.Gray,
+                            tint = if ((selectedPinCount + selectedAlbumCount) > 0) Color.White else Color.Gray,
                             modifier = Modifier.size(14.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
@@ -233,7 +261,7 @@ fun MultiSelectBottomBar(
                             text = "Save",
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
-                            color = if (selectedCount > 0) Color.White else Color.Gray
+                            color = if ((selectedPinCount + selectedAlbumCount) > 0) Color.White else Color.Gray
                         )
                     }
                 }
