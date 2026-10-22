@@ -107,6 +107,7 @@ class PinterestBrowserWorker(
 
 
     @SuppressLint("SetJavaScriptEnabled")
+    @Suppress("DEPRECATION")
     private fun initWebView() {
         if (webView != null) return
 
@@ -601,7 +602,7 @@ class PinterestBrowserWorker(
                         val imagesObj = candidateObj.optJSONObject("images")
                         val highResUrl = if (imagesObj != null) extractImageUrl(imagesObj) ?: existing.imageUrl else existing.imageUrl
                         val rawTitle = candidateObj.optString("title", "")
-                        val rawDesc = candidateObj.optString("description", candidateObj.optString("grid_title", ""))
+                        val rawDesc = candidateObj.optString("description", candidateObj.optString("grid_title", "").orEmpty())
                         val title = if (rawTitle.isNotBlank()) rawTitle else if (rawDesc.isNotBlank() && rawDesc.length <= 60) rawDesc else existing.title
                         val pinterestCreatedAt = candidateObj.optString("board_pinned_at", candidateObj.optString("created_at", existing.pinterestCreatedAt))
                         val saves = candidateObj.optInt("repin_count", candidateObj.optInt("save_count", existing.savesCount))
@@ -636,7 +637,7 @@ class PinterestBrowserWorker(
                 // Section 16 & 17: board_position and first_seen_at
                 val observedPosition = boardPositionCounter.getAndIncrement()
                 val artificialPinnedMillis = (nowMillis - (observedPosition * 60000L)).coerceAtLeast(0L)
-                val pinterestCreatedAt = candidateObj.optString("board_pinned_at", candidateObj.optString("created_at", null))
+                val pinterestCreatedAt = candidateObj.optString("board_pinned_at", candidateObj.optString("created_at", ""))
                 val saves = candidateObj.optInt("repin_count", candidateObj.optInt("save_count", 0))
 
                 val pinItem = PinItem(

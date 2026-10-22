@@ -74,6 +74,7 @@ object ImageCacheManager {
         return size
     }
 
+    @OptIn(coil.annotation.ExperimentalCoilApi::class)
     fun clearCache(context: Context) {
         try {
             Coil.imageLoader(context).diskCache?.clear()

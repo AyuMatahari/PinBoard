@@ -33,13 +33,13 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Height
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.Login
+import androidx.compose.material.icons.automirrored.filled.Login
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Shield
-import androidx.compose.material.icons.filled.Sort
+import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material.icons.filled.Visibility
@@ -338,7 +338,7 @@ fun BrowserWorkerTestingPanel(
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier.height(36.dp).testTag("reorder_pins_btn")
                         ) {
-                            Icon(Icons.Default.Sort, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (!isCustomBoard) PinterestRed else Color.Gray)
+                            Icon(Icons.AutoMirrored.Filled.Sort, contentDescription = null, modifier = Modifier.size(16.dp), tint = if (!isCustomBoard) PinterestRed else Color.Gray)
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Reorder Pins", fontSize = 12.sp, color = if (!isCustomBoard) PinterestRed else Color.Gray, fontWeight = FontWeight.Bold)
                         }
@@ -362,7 +362,7 @@ fun BrowserWorkerTestingPanel(
                             shape = RoundedCornerShape(10.dp),
                             modifier = Modifier.height(36.dp)
                         ) {
-                            Icon(Icons.Default.Login, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Icon(Icons.AutoMirrored.Filled.Login, contentDescription = null, modifier = Modifier.size(16.dp))
                             Spacer(modifier = Modifier.width(4.dp))
                             Text("Pinterest Login", fontSize = 12.sp)
                         }

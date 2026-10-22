@@ -124,6 +124,7 @@ object CrashMonitor {
         defaultHandler?.uncaughtException(thread, throwable) ?: Process.killProcess(Process.myPid())
     }
 
+    @Suppress("DEPRECATION")
     private fun buildCrashReport(threadName: String, throwable: Throwable, contextTag: String): String {
         val sw = StringWriter()
         val pw = PrintWriter(sw)

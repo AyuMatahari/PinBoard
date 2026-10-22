@@ -99,14 +99,14 @@ class ShareTargetActivity : ComponentActivity() {
                         }
                     }
                 } else if (intent.type?.startsWith("image/") == true) {
-                    (intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM))?.let { uri ->
+                    androidx.core.content.IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let { uri ->
                         sharedImageUris.add(uri)
                     }
                 }
             }
             Intent.ACTION_SEND_MULTIPLE -> {
                 if (intent.type?.startsWith("image/") == true) {
-                    intent.getParcelableArrayListExtra<Uri>(Intent.EXTRA_STREAM)?.let { list ->
+                    androidx.core.content.IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let { list ->
                         sharedImageUris.addAll(list)
                     }
                 }
