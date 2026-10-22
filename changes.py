@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery - Fix + Build + Deploy Script (self-contained)
----------------------------------------------------------------
+PinBoard Gallery - Fix + Build + Deploy Script
+----------------------------------------------
 1. Fixes Disable Arrow Navigation toggle wiring in SettingsDialog call
 2. Ensures gradlew / gradlew.bat / gradle-wrapper.jar exist
-3. Ensures debug.keystore exists (generates if missing)
-4. Writes GitHub Actions workflow (with tools-package fix)
+3. Ensures debug.keystore exists (generates if missing) + force-commits it
+4. Writes GitHub Actions workflow (tools-package fix + keystore fallback)
 5. Pushes to GitHub (repo: PinBoard)
 6. Triggers CI build, downloads APK
 7. Moves APK into directory from 'Apk Directory.txt'
@@ -26,7 +26,9 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 REPO_NAME    = "PinBoard"
 ARTIFACT     = "app-debug"
 
-# FIX: pass packages: '' so sdkmanager does not try to install the removed 'tools' package.
+# The Android debug keystore is a well-known, non-secret artifact:
+#   storePassword=android, keyAlias=androiddebugkey, keyPassword=android
+# Committing it is fine and gives consistent signing across CI runs.
 WORKFLOW_YAML = """\
 name: Build APK
 
@@ -58,6 +60,22 @@ jobs:
       - name: Install Android SDK components
         run: |
           sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+
+      - name: Ensure debug.keystore
+        run: |
+          if [ ! -f debug.keystore ]; then
+            echo "debug.keystore missing — generating fallback..."
+            keytool -genkeypair -v \\
+              -keystore debug.keystore \\
+              -alias androiddebugkey \\
+              -keyalg RSA -keysize 2048 \\
+              -validity 10000 \\
+              -storepass android -keypass android \\
+              -dname "CN=Android Debug,O=Android,C=US"
+          else
+            echo "debug.keystore present."
+            ls -la debug.keystore
+          fi
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
@@ -207,8 +225,9 @@ def ensure_gradle_wrapper():
 def ensure_debug_keystore():
     log("\n=== [3/8] Ensuring debug.keystore ===")
     ks = PROJECT_ROOT / "debug.keystore"
-    if ks.exists():
-        log("  debug.keystore exists."); return
+    if ks.exists() and ks.stat().st_size > 0:
+        log("  debug.keystore already exists."); return
+
     log("  Generating debug.keystore...")
     try:
         subprocess.run([
@@ -237,6 +256,7 @@ def write_workflow():
 # ---------- 5. Local git ----------
 def setup_git():
     log("\n=== [5/8] Setting up git repo ===")
+
     if not (PROJECT_ROOT / ".git").exists():
         run(["git", "init"])
         run(["git", "branch", "-M", "main"])
@@ -251,21 +271,37 @@ def setup_git():
                           capture_output=True, text=True).stdout.strip():
         run(["git", "config", "--global", "user.email", "pinboard@build.local"])
 
+    # Merge required .gitignore lines (in case a stale .gitignore exists)
     gi = PROJECT_ROOT / ".gitignore"
-    if not gi.exists():
-        gi.write_text(
-            "build/\n*/build/\n.gradle/\nlocal.properties\n*.iml\n.idea/\n.cxx/\n.DS_Store\n"
-            ".kotlin/\n.env\n_downloads/\n"
-            "*.jks\n*.keystore\n!debug.keystore\n",
-            encoding="utf-8",
-        )
-        log("  Created .gitignore")
+    required = [
+        "build/", "*/build/", ".gradle/", "local.properties",
+        "*.iml", ".idea/", ".cxx/", ".DS_Store",
+        ".kotlin/", ".env", "_downloads/",
+        "*.jks", "*.keystore", "!debug.keystore",
+    ]
+    existing = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    merged = list(existing)
+    for line in required:
+        if line not in merged:
+            merged.append(line)
+    gi.write_text("\n".join(merged) + "\n", encoding="utf-8")
+    log("  Ensured .gitignore has '!debug.keystore' exception.")
 
+    # Stage everything
+    run(["git", "add", "-A"])
+
+    # Force-add debug.keystore — critical: .gitignore from an older run may
+    # have ignored it, in which case 'git add -A' won't include it.
+    ks = PROJECT_ROOT / "debug.keystore"
+    if ks.exists():
+        run(["git", "add", "-f", "debug.keystore"], check=False)
+        log("  Force-added debug.keystore.")
+
+    # Commit if anything changed
     if subprocess.run(["git", "status", "--porcelain"],
                       capture_output=True, text=True).stdout.strip():
-        run(["git", "add", "-A"])
         run(["git", "commit", "-m",
-             "Fix Disable Arrow Navigation toggle wiring + CI build"])
+             "Fix Disable Arrow Navigation toggle + commit debug.keystore for CI"])
         log("  Committed.")
     else:
         log("  Nothing to commit.")
@@ -301,8 +337,6 @@ def ensure_github_repo():
             if subprocess.run(["gh", "repo", "view", full],
                               capture_output=True).returncode != 0:
                 sys.exit(1)
-        else:
-            log("  Created and pushed.")
 
     if subprocess.run(["git", "remote", "get-url", "origin"],
                       capture_output=True).returncode != 0:

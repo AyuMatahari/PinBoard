@@ -16,3 +16,13 @@
 local.properties
 .env
 debug.keystore
+build/
+*/build/
+.gradle/
+.idea/
+.cxx/
+.kotlin/
+_downloads/
+*.jks
+*.keystore
+!debug.keystore
