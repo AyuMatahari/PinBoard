@@ -1469,6 +1469,17 @@ fun PinBoardGalleryScreen(
                         fontSize = 12.sp
                     )
                 }
+                androidx.compose.material3.TextButton(
+                    onClick = { viewModel.executeAlbumTransferToCurrentBoard() },
+                    modifier = Modifier.testTag("album_transfer_here_btn")
+                ) {
+                    Text(
+                        text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",
+                        color = Color(0xFF64B5F6),
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
         }
