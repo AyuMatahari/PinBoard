@@ -22,28 +22,22 @@ jobs:
           packages: ''
 
       - name: Accept Android licenses
-        run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+        run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
-      - name: Install Android SDK components
-        run: |
-          sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
+      - name: Install SDK components
+        run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
 
-      - name: Ensure debug.keystore
+      - name: Verify release.keystore is committed
         run: |
-          if [ ! -f debug.keystore ]; then
-            echo "debug.keystore missing — generating fallback..."
-            keytool -genkeypair -v \
-              -keystore debug.keystore \
-              -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 \
-              -validity 10000 \
-              -storepass android -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US"
-          else
-            echo "debug.keystore present."
-            ls -la debug.keystore
+          if [ ! -f release.keystore ]; then
+            echo "ERROR: release.keystore missing from repo"
+            exit 1
           fi
+          if ! keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload; then
+            echo "ERROR: alias 'upload' not found in release.keystore"
+            exit 1
+          fi
+          echo "release.keystore OK"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
@@ -53,12 +47,23 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
-      - name: Build Debug APK
-        run: ./gradlew :app:assembleDebug --stacktrace --no-daemon
+      - name: Build Release APK
+        run: ./gradlew :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Verify APK signature
+        run: |
+          APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
+          if [ -z "$APK" ]; then
+            echo "ERROR: no release APK produced"
+            exit 1
+          fi
+          echo "APK: $APK"
+          BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
+          "$BT/apksigner" verify --verbose --print-certs "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: app-debug
-          path: app/build/outputs/apk/debug/*.apk
+          name: app-release
+          path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error

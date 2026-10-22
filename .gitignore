@@ -26,3 +26,4 @@ _downloads/
 *.jks
 *.keystore
 !debug.keystore
+!release.keystore
