@@ -1,6 +1,10 @@
 package com.example.util
 
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import android.os.Environment
 import com.example.data.local.AppDatabase
 import kotlinx.coroutines.Dispatchers
@@ -38,6 +42,30 @@ object BackupManager {
         "6 months" to 259200L,
         "1 year" to 525600L
     )
+
+    /**
+     * True when this app can read arbitrary files under shared Download/.
+     * On Android 11+ this needs MANAGE_EXTERNAL_STORAGE, granted via
+     * Settings -> Special app access -> All files access. Without it the
+     * File API returns only files created by THIS installation, which is
+     * why backups from previous installs disappear from the Restore list.
+     */
+    fun hasAllFilesAccess(): Boolean =
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) true
+        else try { Environment.isExternalStorageManager() } catch (_: Throwable) { false }
+
+    /** Opens the system All-files-access screen for this app. */
+    fun requestAllFilesAccess(context: Context) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return
+        try {
+            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                data = Uri.parse("package:" + context.packageName)
+            }
+            context.startActivity(intent)
+            return
+        } catch (_: Throwable) {}
+        try { context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) } catch (_: Throwable) {}
+    }
 
     fun isBackupEnabled(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)

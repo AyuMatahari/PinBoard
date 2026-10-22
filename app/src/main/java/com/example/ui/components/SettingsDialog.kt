@@ -1026,6 +1026,59 @@ fun SettingsDialog(
                         )
                         Spacer(modifier = Modifier.height(10.dp))
 
+                        // Android 11+ needs All Files Access so backups written by
+                        // previous installs in Download/… become visible here.
+                        if (!com.example.util.BackupManager.hasAllFilesAccess()) {
+                            androidx.compose.material3.Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = PinterestPillGray,
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(modifier = Modifier.padding(10.dp)) {
+                                    Text(
+                                        text = "All Files Access is needed to see every .json in the backup folder, including backups from previous app installs.",
+                                        fontSize = 11.sp,
+                                        color = PinterestBlack,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                    androidx.compose.material3.Button(
+                                        onClick = {
+                                            com.example.util.BackupManager.requestAllFilesAccess(context)
+                                        },
+                                        colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
+                                        shape = RoundedCornerShape(14.dp),
+                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                        modifier = Modifier.testTag("backup_all_files_access_btn")
+                                    ) {
+                                        Text("Grant All Files Access", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                        }
+
+                        // Refresh the list when the app resumes (i.e. after the
+                        // user toggles All Files Access in system Settings).
+                        val backupLifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+                        DisposableEffect(backupLifecycleOwner, showRestoreDialog) {
+                            val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && showRestoreDialog) {
+                                    val refreshed = com.example.util.BackupManager.getAvailableBackups(context)
+                                    if (refreshed.isNotEmpty()) {
+                                        availableBackups = refreshed
+                                        if (selectedBackupFile == null ||
+                                            refreshed.none { it.absolutePath == selectedBackupFile?.absolutePath }
+                                        ) {
+                                            selectedBackupFile = refreshed.firstOrNull()
+                                        }
+                                    }
+                                }
+                            }
+                            backupLifecycleOwner.lifecycle.addObserver(obs)
+                            onDispose { backupLifecycleOwner.lifecycle.removeObserver(obs) }
+                        }
+
                         availableBackups.forEach { file ->
                             val isSelected = selectedBackupFile?.absolutePath == file.absolutePath
                             val fileDate = java.text.SimpleDateFormat("MMM dd, yyyy HH:mm", java.util.Locale.getDefault()).format(java.util.Date(file.lastModified()))

@@ -2,22 +2,19 @@
 """
 PinBoard Gallery
 ----------------
-CURRENT CHANGE: Full backup completeness
-  * pins: every (id, boardId) pair is preserved (no more dedup-by-id-only)
-  * pins: albumId is serialized and restored (non-sort albums keep membership)
-  * custom_albums table is backed up & restored
-  * additional prefs backed up & restored: board_layout_prefs,
-    image_cache_prefs, backup_prefs (minus last_backup_time)
-  * ViewModel reloads custom albums + favorites after a restore
+CURRENT CHANGE: Restore sees backups from previous installs
+  * Manifest gains MANAGE_EXTERNAL_STORAGE (+ READ_EXTERNAL_STORAGE for API 29-32)
+  * BackupManager gets hasAllFilesAccess() + requestAllFilesAccess()
+  * Restore dialog shows a "Grant All Files Access" banner when the
+    permission is missing; auto-refreshes the file list on ON_RESUME
 
 FULL PIPELINE runs after the patch:
   1. apply this patch
-  2. verify release.keystore + patch app/build.gradle.kts
+  2. ensure release.keystore + patch app/build.gradle.kts
   3. ensure gradle wrapper + write CI workflow
   4. commit + push to <user>/PinBoard
   5. trigger CI -> poll -> download app-release artifact
-  6. save as  PinBoard-v{versionName}-{versionCode}.apk
-     into the folder from 'Apk Directory.txt'
+  6. save as PinBoard-v{versionName}-{versionCode}.apk into 'Apk Directory.txt'
   7. verify signature -> uninstall + install on device
 """
 
@@ -141,377 +138,181 @@ def tool_available(name):
 
 
 # ============================================================
-# THIS TASK'S ONLY CODE PATCH — Backup completeness
+# THIS TASK'S ONLY CODE PATCH
 # ============================================================
-def patch_backup_completeness():
-    log("\n=== PATCH: Backup completeness (pins, albums, prefs) ===")
+def patch_restore_all_files_access():
+    log("\n=== PATCH: Restore sees backups from previous installs (All Files Access) ===")
+
+    # ---------- 1. AndroidManifest.xml ----------
+    manifest = PROJECT_ROOT / "app/src/main/AndroidManifest.xml"
+    if not manifest.exists(): log(f"  ✗ {manifest} not found"); sys.exit(1)
+    m = manifest.read_text(encoding="utf-8")
+    if "MANAGE_EXTERNAL_STORAGE" not in m:
+        anchor = '    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />\n'
+        if anchor not in m:
+            log("  ✗ manifest anchor not found"); sys.exit(1)
+        m = m.replace(
+            anchor,
+            anchor +
+            '\n'
+            '    <!-- Android 11+ scoped storage: File.listFiles() on shared Download/ only\n'
+            '         sees files created by the CURRENT install. This permission lets the\n'
+            '         Restore dialog see every .json in Download/PinterestViewerDownloads/Backup,\n'
+            '         including backups written by PREVIOUS installations. User grants\n'
+            '         via Settings -> Special app access -> All files access. -->\n'
+            '    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n'
+            '    <uses-permission\n'
+            '        android:name="android.permission.READ_EXTERNAL_STORAGE"\n'
+            '        android:maxSdkVersion="32" />\n',
+            1,
+        )
+        manifest.write_text(m, encoding="utf-8")
+        log("  ✓ manifest: MANAGE_EXTERNAL_STORAGE + READ_EXTERNAL_STORAGE")
+    else:
+        log("  ✓ manifest: permission already present")
+
+    # ---------- 2. BackupManager helpers ----------
     bm = PROJECT_ROOT / "app/src/main/java/com/example/util/BackupManager.kt"
-    vm = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
     if not bm.exists(): log(f"  ✗ {bm} not found"); sys.exit(1)
-    if not vm.exists(): log(f"  ✗ {vm} not found"); sys.exit(1)
+    b = bm.read_text(encoding="utf-8")
+    b_changed = False
 
-    t = bm.read_text(encoding="utf-8")
-    changed = False
+    if "fun hasAllFilesAccess()" not in b:
+        # Ensure imports are present
+        imp_pairs = [
+            ("import android.content.Intent\n",     "import android.content.Context\n"),
+            ("import android.net.Uri\n",            "import android.content.Intent\n"),
+            ("import android.os.Build\n",           "import android.net.Uri\n"),
+            ("import android.provider.Settings\n",  "import android.os.Build\n"),
+        ]
+        for imp, after in imp_pairs:
+            if imp in b: continue
+            if after in b:
+                b = b.replace(after, after + imp, 1)
+            else:
+                b = b.replace("\nobject BackupManager", "\n" + imp + "object BackupManager", 1)
 
-    # Marker check — skip if fully applied
-    fully_done = (
-        "fullPinsList.add(pObj)" in t
-        and 'put("albumId", p.albumId ?: "")' in t
-        and "rootJson.put(\"custom_albums\", albumsArray)" in t
-        and "board_layout_prefs" in t
-        and "restorePrefsObject" in t
-        and "albumId = pObj.optString(\"albumId\", \"\").ifBlank { null }" in t
+        anchor = "    fun isBackupEnabled(context: Context): Boolean {\n"
+        if anchor not in b:
+            log("  ✗ BackupManager isBackupEnabled anchor not found"); sys.exit(1)
+        helpers = (
+            "    /**\n"
+            "     * True when this app can read arbitrary files under shared Download/.\n"
+            "     * On Android 11+ this needs MANAGE_EXTERNAL_STORAGE, granted via\n"
+            "     * Settings -> Special app access -> All files access. Without it the\n"
+            "     * File API returns only files created by THIS installation, which is\n"
+            "     * why backups from previous installs disappear from the Restore list.\n"
+            "     */\n"
+            "    fun hasAllFilesAccess(): Boolean =\n"
+            "        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) true\n"
+            "        else try { Environment.isExternalStorageManager() } catch (_: Throwable) { false }\n"
+            "\n"
+            "    /** Opens the system All-files-access screen for this app. */\n"
+            "    fun requestAllFilesAccess(context: Context) {\n"
+            "        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return\n"
+            "        try {\n"
+            "            val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {\n"
+            "                data = Uri.parse(\"package:\" + context.packageName)\n"
+            "            }\n"
+            "            context.startActivity(intent)\n"
+            "            return\n"
+            "        } catch (_: Throwable) {}\n"
+            "        try { context.startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)) } catch (_: Throwable) {}\n"
+            "    }\n"
+            "\n"
+        )
+        b = b.replace(anchor, helpers + anchor, 1)
+        b_changed = True
+        log("  ✓ BackupManager: hasAllFilesAccess() + requestAllFilesAccess()")
+
+    if b_changed:
+        bm.write_text(b, encoding="utf-8")
+
+    # ---------- 3. SettingsDialog: banner + auto-refresh on resume ----------
+    sd = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/SettingsDialog.kt"
+    if not sd.exists(): log(f"  ✗ {sd} not found"); sys.exit(1)
+    s = sd.read_text(encoding="utf-8")
+
+    if "backup_all_files_access_btn" in s:
+        log("  ✓ SettingsDialog: banner already present")
+        return
+
+    anchor = (
+        '                        Text(\n'
+        '                            "Select a backup from /Download/PinterestViewerDownloads/Backup to restore:",\n'
+        '                            fontSize = 12.sp,\n'
+        '                            color = PinterestTextSecondary\n'
+        '                        )\n'
+        '                        Spacer(modifier = Modifier.height(10.dp))\n'
     )
-    if fully_done:
-        log("  ✓ BackupManager.kt already patched")
-    else:
-        # --- FIX 1: pin serialization — albumId + full (non-deduped) list ---
-        if "fullPinsList.add(pObj)" in t and 'put("albumId", p.albumId ?: "")' in t:
-            log("  ✓ pin serialization already patched")
-        else:
-            old_pin = (
-                "                val pObj = JSONObject().apply {\n"
-                "                    put(\"id\", p.id)\n"
-                "                    put(\"boardId\", p.boardId)\n"
-                "                    put(\"title\", p.title)\n"
-                "                    put(\"description\", p.description)\n"
-                "                    put(\"imageUrl\", p.imageUrl)\n"
-                "                    put(\"thumbnailUrl\", p.thumbnailUrl)\n"
-                "                    put(\"author\", p.author)\n"
-                "                    put(\"boardName\", p.boardName)\n"
-                "                    put(\"sourceUrl\", p.sourceUrl)\n"
-                "                    put(\"width\", p.width)\n"
-                "                    put(\"height\", p.height)\n"
-                "                    put(\"dominantColor\", p.dominantColor)\n"
-                "                    put(\"dateAddedMillis\", p.dateAddedMillis)\n"
-                "                    put(\"savesCount\", p.savesCount)\n"
-                "                    put(\"likesCount\", p.likesCount)\n"
-                "                    put(\"fileSizeKb\", p.fileSizeKb)\n"
-                "                    put(\"orderIndex\", p.orderIndex)\n"
-                "                    put(\"boardPosition\", p.boardPosition)\n"
-                "                    put(\"firstSeenAt\", p.firstSeenAt)\n"
-                "                    put(\"firstSeenAtMillis\", p.firstSeenAtMillis)\n"
-                "                    put(\"pinterestCreatedAt\", p.pinterestCreatedAt ?: \"\")\n"
-                "                    put(\"mimeType\", p.mimeType)\n"
-                "                    put(\"sourceDomain\", p.sourceDomain)\n"
-                "                    put(\"isBrokenOrUnreachable\", p.isBrokenOrUnreachable)\n"
-                "                }\n"
-                "                val key = p.id.ifBlank { p.imageUrl }\n"
-                "                archivedPinsMap[key] = pObj\n"
-                "            }"
-            )
-            new_pin = (
-                "                val pObj = JSONObject().apply {\n"
-                "                    put(\"id\", p.id)\n"
-                "                    put(\"boardId\", p.boardId)\n"
-                "                    put(\"title\", p.title)\n"
-                "                    put(\"description\", p.description)\n"
-                "                    put(\"imageUrl\", p.imageUrl)\n"
-                "                    put(\"thumbnailUrl\", p.thumbnailUrl)\n"
-                "                    put(\"author\", p.author)\n"
-                "                    put(\"boardName\", p.boardName)\n"
-                "                    put(\"sourceUrl\", p.sourceUrl)\n"
-                "                    put(\"width\", p.width)\n"
-                "                    put(\"height\", p.height)\n"
-                "                    put(\"dominantColor\", p.dominantColor)\n"
-                "                    put(\"dateAddedMillis\", p.dateAddedMillis)\n"
-                "                    put(\"savesCount\", p.savesCount)\n"
-                "                    put(\"likesCount\", p.likesCount)\n"
-                "                    put(\"fileSizeKb\", p.fileSizeKb)\n"
-                "                    put(\"orderIndex\", p.orderIndex)\n"
-                "                    put(\"boardPosition\", p.boardPosition)\n"
-                "                    put(\"firstSeenAt\", p.firstSeenAt)\n"
-                "                    put(\"firstSeenAtMillis\", p.firstSeenAtMillis)\n"
-                "                    put(\"pinterestCreatedAt\", p.pinterestCreatedAt ?: \"\")\n"
-                "                    put(\"mimeType\", p.mimeType)\n"
-                "                    put(\"sourceDomain\", p.sourceDomain)\n"
-                "                    put(\"isBrokenOrUnreachable\", p.isBrokenOrUnreachable)\n"
-                "                    put(\"albumId\", p.albumId ?: \"\")\n"
-                "                }\n"
-                "                val key = p.id.ifBlank { p.imageUrl }\n"
-                "                archivedPinsMap[key] = pObj\n"
-                "                fullPinsList.add(pObj)\n"
-                "            }"
-            )
-            if old_pin in t:
-                t = t.replace(old_pin, new_pin, 1); changed = True
-                log("  ✓ pin JSON: albumId + fullPinsList")
+    if anchor not in s:
+        log("  ✗ SettingsDialog restore-dialog anchor not found"); sys.exit(1)
 
-        # Declare fullPinsList
-        decl_anchor = "            val archivedPinsMap = linkedMapOf<String, JSONObject>()\n"
-        if decl_anchor in t and "val fullPinsList = mutableListOf<JSONObject>()" not in t:
-            t = t.replace(
-                decl_anchor,
-                decl_anchor + "            val fullPinsList = mutableListOf<JSONObject>()\n",
-                1,
-            )
-            changed = True
-            log("  ✓ fullPinsList declared")
-
-        # --- FIX 2: split archive-write from backup-write + add custom_albums ---
-        old_write = (
-            "            val pinsArray = JSONArray()\n"
-            "            archivedPinsMap.values.forEach { pinsArray.put(it) }\n"
-            "            rootJson.put(\"pins\", pinsArray)\n"
-            "\n"
-            "            try {\n"
-            "                archiveFile.writeText(pinsArray.toString())\n"
-            "            } catch (_: Exception) {}\n"
-        )
-        new_write = (
-            "            // Archive: deduped by pin id (metadata preservation after deletion)\n"
-            "            val archivePinsArray = JSONArray()\n"
-            "            archivedPinsMap.values.forEach { archivePinsArray.put(it) }\n"
-            "            try {\n"
-            "                archiveFile.writeText(archivePinsArray.toString())\n"
-            "            } catch (_: Exception) {}\n"
-            "\n"
-            "            // Backup pins: ALL (id, boardId) pairs, NO dedup — preserves pins\n"
-            "            // that live on multiple boards (Dump / My Save / Favorites / custom).\n"
-            "            val pinsArray = JSONArray()\n"
-            "            fullPinsList.forEach { pinsArray.put(it) }\n"
-            "            rootJson.put(\"pins\", pinsArray)\n"
-            "\n"
-            "            // Custom albums (non-sort albums created from multi-image links)\n"
-            "            try {\n"
-            "                val customAlbums = dao.getAllAlbums()\n"
-            "                val albumsArray = JSONArray()\n"
-            "                customAlbums.forEach { a ->\n"
-            "                    val aObj = JSONObject().apply {\n"
-            "                        put(\"id\", a.id)\n"
-            "                        put(\"boardId\", a.boardId)\n"
-            "                        put(\"parentAlbumId\", a.parentAlbumId ?: \"\")\n"
-            "                        put(\"title\", a.title)\n"
-            "                        put(\"sourceUrl\", a.sourceUrl)\n"
-            "                        put(\"dateAddedMillis\", a.dateAddedMillis)\n"
-            "                        put(\"orderIndex\", a.orderIndex)\n"
-            "                        put(\"isFavorite\", a.isFavorite)\n"
-            "                    }\n"
-            "                    albumsArray.put(aObj)\n"
-            "                }\n"
-            "                rootJson.put(\"custom_albums\", albumsArray)\n"
-            "            } catch (_: Exception) {}\n"
-        )
-        if old_write in t:
-            t = t.replace(old_write, new_write, 1); changed = True
-            log("  ✓ pins: full list + custom_albums")
-
-        # --- FIX 3: extra prefs in performBackup ---
-        old_prefs = (
-            "            // Export board history\n"
-            "            val historyPrefs = context.getSharedPreferences(\"pinterest_board_history\", Context.MODE_PRIVATE)\n"
-        )
-        new_prefs = (
-            "            // Board layout prefs (per-board columns and sort)\n"
-            "            try {\n"
-            "                val blPrefs = context.getSharedPreferences(\"board_layout_prefs\", Context.MODE_PRIVATE)\n"
-            "                val blObj = JSONObject()\n"
-            "                blPrefs.all.forEach { (k, v) -> blObj.put(k, v ?: JSONObject.NULL) }\n"
-            "                rootJson.put(\"board_layout_prefs\", blObj)\n"
-            "            } catch (_: Exception) {}\n"
-            "\n"
-            "            // Image cache prefs\n"
-            "            try {\n"
-            "                val icPrefs = context.getSharedPreferences(\"image_cache_prefs\", Context.MODE_PRIVATE)\n"
-            "                val icObj = JSONObject()\n"
-            "                icPrefs.all.forEach { (k, v) -> icObj.put(k, v ?: JSONObject.NULL) }\n"
-            "                rootJson.put(\"image_cache_prefs\", icObj)\n"
-            "            } catch (_: Exception) {}\n"
-            "\n"
-            "            // Backup prefs (excluding last_backup_time)\n"
-            "            try {\n"
-            "                val bPrefs = context.getSharedPreferences(\"pinboard_backup_prefs\", Context.MODE_PRIVATE)\n"
-            "                val bObj = JSONObject()\n"
-            "                bPrefs.all.forEach { (k, v) ->\n"
-            "                    if (k != \"last_backup_time\") bObj.put(k, v ?: JSONObject.NULL)\n"
-            "                }\n"
-            "                rootJson.put(\"backup_prefs\", bObj)\n"
-            "            } catch (_: Exception) {}\n"
-            "\n"
-            "            // Export board history\n"
-            "            val historyPrefs = context.getSharedPreferences(\"pinterest_board_history\", Context.MODE_PRIVATE)\n"
-        )
-        if old_prefs in t and "board_layout_prefs" not in t:
-            t = t.replace(old_prefs, new_prefs, 1); changed = True
-            log("  ✓ extra prefs in backup")
-
-        # --- FIX 4a: restore pin.albumId ---
-        old_rpin = (
-            "                                sourceDomain = pObj.optString(\"sourceDomain\", \"\"),\n"
-            "                                isBrokenOrUnreachable = pObj.optBoolean(\"isBrokenOrUnreachable\", false)\n"
-            "                            )\n"
-            "                        )\n"
-        )
-        new_rpin = (
-            "                                sourceDomain = pObj.optString(\"sourceDomain\", \"\"),\n"
-            "                                isBrokenOrUnreachable = pObj.optBoolean(\"isBrokenOrUnreachable\", false),\n"
-            "                                albumId = pObj.optString(\"albumId\", \"\").ifBlank { null }\n"
-            "                            )\n"
-            "                        )\n"
-        )
-        if old_rpin in t and "albumId = pObj.optString(\"albumId\"" not in t:
-            t = t.replace(old_rpin, new_rpin, 1); changed = True
-            log("  ✓ restore: pin.albumId")
-
-        # --- FIX 4b: restore custom_albums ---
-        old_rend = (
-            "                if (pinEntities.isNotEmpty()) {\n"
-            "                    dao.upsertPinsSafely(pinEntities)\n"
-            "                    restoredPinsCount = pinEntities.size\n"
-            "                }\n"
-            "            }\n"
-        )
-        new_rend = (
-            "                if (pinEntities.isNotEmpty()) {\n"
-            "                    dao.upsertPinsSafely(pinEntities)\n"
-            "                    restoredPinsCount = pinEntities.size\n"
-            "                }\n"
-            "            }\n"
-            "\n"
-            "            // 2b. Restore custom albums (non-sort albums)\n"
-            "            val albumsArray = rootJson.optJSONArray(\"custom_albums\")\n"
-            "            if (albumsArray != null && albumsArray.length() > 0) {\n"
-            "                val albumEntities = mutableListOf<com.example.data.local.CustomAlbumEntity>()\n"
-            "                for (i in 0 until albumsArray.length()) {\n"
-            "                    val aObj = albumsArray.getJSONObject(i)\n"
-            "                    val aId = aObj.optString(\"id\")\n"
-            "                    if (aId.isBlank()) continue\n"
-            "                    albumEntities.add(\n"
-            "                        com.example.data.local.CustomAlbumEntity(\n"
-            "                            id = aId,\n"
-            "                            boardId = aObj.optString(\"boardId\"),\n"
-            "                            parentAlbumId = aObj.optString(\"parentAlbumId\", \"\").ifBlank { null },\n"
-            "                            title = aObj.optString(\"title\", \"\"),\n"
-            "                            sourceUrl = aObj.optString(\"sourceUrl\", \"\"),\n"
-            "                            dateAddedMillis = aObj.optLong(\"dateAddedMillis\", System.currentTimeMillis()),\n"
-            "                            orderIndex = aObj.optInt(\"orderIndex\", 0),\n"
-            "                            isFavorite = aObj.optBoolean(\"isFavorite\", false)\n"
-            "                        )\n"
-            "                    )\n"
-            "                }\n"
-            "                if (albumEntities.isNotEmpty()) {\n"
-            "                    dao.insertAlbums(albumEntities)\n"
-            "                }\n"
-            "            }\n"
-        )
-        if old_rend in t and "custom_albums" not in t:
-            t = t.replace(old_rend, new_rend, 1); changed = True
-            log("  ✓ restore: custom albums")
-
-        # --- FIX 4c: restore extra prefs ---
-        old_send = (
-            "                editor.apply()\n"
-            "                settingsRestored = true\n"
-            "            }\n"
-        )
-        new_send = (
-            "                editor.apply()\n"
-            "                settingsRestored = true\n"
-            "            }\n"
-            "\n"
-            "            // 3b. Restore board_layout_prefs\n"
-            "            restorePrefsObject(context, rootJson.optJSONObject(\"board_layout_prefs\"), \"board_layout_prefs\")\n"
-            "\n"
-            "            // 3c. Restore image_cache_prefs\n"
-            "            restorePrefsObject(context, rootJson.optJSONObject(\"image_cache_prefs\"), \"image_cache_prefs\")\n"
-            "\n"
-            "            // 3d. Restore backup_prefs (skip last_backup_time)\n"
-            "            run {\n"
-            "                val bPrefs = rootJson.optJSONObject(\"backup_prefs\")\n"
-            "                if (bPrefs != null) {\n"
-            "                    val ed = context.getSharedPreferences(\"pinboard_backup_prefs\", Context.MODE_PRIVATE).edit()\n"
-            "                    val ks = bPrefs.keys()\n"
-            "                    while (ks.hasNext()) {\n"
-            "                        val k = ks.next()\n"
-            "                        if (k == \"last_backup_time\") continue\n"
-            "                        when (val v = bPrefs.get(k)) {\n"
-            "                            is Boolean -> ed.putBoolean(k, v)\n"
-            "                            is Int -> ed.putInt(k, v)\n"
-            "                            is Long -> ed.putLong(k, v)\n"
-            "                            is Float -> ed.putFloat(k, v)\n"
-            "                            is String -> ed.putString(k, v)\n"
-            "                        }\n"
-            "                    }\n"
-            "                    ed.apply()\n"
-            "                }\n"
-            "            }\n"
-        )
-        if old_send in t and "restorePrefsObject" not in t:
-            t = t.replace(old_send, new_send, 1); changed = True
-            log("  ✓ restore: extra prefs")
-
-        # --- FIX 4d: restorePrefsObject helper ---
-        helper_anchor = "    suspend fun restoreBackup(context: Context, backupFile: File): Result<RestoreSummary> = withContext(Dispatchers.IO) {\n"
-        if helper_anchor in t and "private fun restorePrefsObject" not in t:
-            helper = (
-                "    private fun restorePrefsObject(context: Context, prefsObj: JSONObject?, prefsName: String) {\n"
-                "        if (prefsObj == null) return\n"
-                "        try {\n"
-                "            val editor = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).edit()\n"
-                "            val keys = prefsObj.keys()\n"
-                "            while (keys.hasNext()) {\n"
-                "                val key = keys.next()\n"
-                "                when (val value = prefsObj.get(key)) {\n"
-                "                    is Boolean -> editor.putBoolean(key, value)\n"
-                "                    is Int -> editor.putInt(key, value)\n"
-                "                    is Long -> editor.putLong(key, value)\n"
-                "                    is Float -> editor.putFloat(key, value)\n"
-                "                    is Double -> editor.putFloat(key, value.toFloat())\n"
-                "                    is String -> editor.putString(key, value)\n"
-                "                }\n"
-                "            }\n"
-                "            editor.apply()\n"
-                "        } catch (_: Exception) {}\n"
-                "    }\n"
-                "\n"
-            )
-            t = t.replace(helper_anchor, helper + helper_anchor, 1)
-            changed = True
-            log("  ✓ restorePrefsObject helper added")
-
-        if changed:
-            bm.write_text(t, encoding="utf-8")
-            log("  ✓ BackupManager.kt updated")
-
-    # --- FIX 5: ViewModel reload after restore ---
-    v = vm.read_text(encoding="utf-8")
-    if "// Reload custom albums & favorites after restore" in v:
-        log("  ✓ ViewModel already patched")
-    else:
-        old_vm = (
-            "            _currentBoard.value?.let { curr ->\n"
-            "                val updatedPins = withContext(Dispatchers.IO) { dao.getPinsForBoard(curr.id) }.map { it.toPinItem() }\n"
-            "                _rawPins.value = updatedPins\n"
-            "                _currentBoard.value = curr.copy(pins = updatedPins, pinCount = updatedPins.size)\n"
-            "                updateDisplayedPins()\n"
-            "            }\n"
-        )
-        new_vm = (
-            "            _currentBoard.value?.let { curr ->\n"
-            "                val updatedPins = withContext(Dispatchers.IO) { dao.getPinsForBoard(curr.id) }.map { it.toPinItem() }\n"
-            "                _rawPins.value = updatedPins\n"
-            "                _currentBoard.value = curr.copy(pins = updatedPins, pinCount = updatedPins.size)\n"
-            "                updateDisplayedPins()\n"
-            "                val albums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(curr.id) }\n"
-            "                _customAlbums.value = albums\n"
-            "            }\n"
-            "\n"
-            "            // Reload custom albums & favorites after restore\n"
-            "            val restoredFavIds = withContext(Dispatchers.IO) { dao.getFavoritesPinIds(\"board_favorites\") }\n"
-            "            val restoredFavUrls = withContext(Dispatchers.IO) { dao.getFavoritesImageUrls(\"board_favorites\") }\n"
-            "            _favoritePinKeys.value = (restoredFavIds + restoredFavUrls).toSet()\n"
-            "            val restoredFavPins = withContext(Dispatchers.IO) { dao.getPinsForBoard(\"board_favorites\") }\n"
-            "            restoredFavPins.forEach { p ->\n"
-            "                favoriteTimestamps[p.id] = p.dateAddedMillis\n"
-            "                favoriteTimestamps[p.imageUrl] = p.dateAddedMillis\n"
-            "            }\n"
-        )
-        if old_vm in v:
-            v = v.replace(old_vm, new_vm, 1)
-            vm.write_text(v, encoding="utf-8")
-            log("  ✓ PinBoardViewModel.kt updated (albums + favorites reload)")
-        else:
-            log("  ⚠ ViewModel anchor not found — custom albums may need manual rescan")
+    injection = (
+        '                        Text(\n'
+        '                            "Select a backup from /Download/PinterestViewerDownloads/Backup to restore:",\n'
+        '                            fontSize = 12.sp,\n'
+        '                            color = PinterestTextSecondary\n'
+        '                        )\n'
+        '                        Spacer(modifier = Modifier.height(10.dp))\n'
+        '\n'
+        '                        // Android 11+ needs All Files Access so backups written by\n'
+        '                        // previous installs in Download/… become visible here.\n'
+        '                        if (!com.example.util.BackupManager.hasAllFilesAccess()) {\n'
+        '                            androidx.compose.material3.Surface(\n'
+        '                                shape = RoundedCornerShape(12.dp),\n'
+        '                                color = PinterestPillGray,\n'
+        '                                modifier = Modifier.fillMaxWidth()\n'
+        '                            ) {\n'
+        '                                Column(modifier = Modifier.padding(10.dp)) {\n'
+        '                                    Text(\n'
+        '                                        text = "All Files Access is needed to see every .json in the backup folder, including backups from previous app installs.",\n'
+        '                                        fontSize = 11.sp,\n'
+        '                                        color = PinterestBlack,\n'
+        '                                        fontWeight = FontWeight.SemiBold\n'
+        '                                    )\n'
+        '                                    Spacer(modifier = Modifier.height(6.dp))\n'
+        '                                    androidx.compose.material3.Button(\n'
+        '                                        onClick = {\n'
+        '                                            com.example.util.BackupManager.requestAllFilesAccess(context)\n'
+        '                                        },\n'
+        '                                        colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),\n'
+        '                                        shape = RoundedCornerShape(14.dp),\n'
+        '                                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 12.dp, vertical = 4.dp),\n'
+        '                                        modifier = Modifier.testTag("backup_all_files_access_btn")\n'
+        '                                    ) {\n'
+        '                                        Text("Grant All Files Access", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)\n'
+        '                                    }\n'
+        '                                }\n'
+        '                            }\n'
+        '                            Spacer(modifier = Modifier.height(10.dp))\n'
+        '                        }\n'
+        '\n'
+        '                        // Refresh the list when the app resumes (i.e. after the\n'
+        '                        // user toggles All Files Access in system Settings).\n'
+        '                        val backupLifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current\n'
+        '                        DisposableEffect(backupLifecycleOwner, showRestoreDialog) {\n'
+        '                            val obs = androidx.lifecycle.LifecycleEventObserver { _, event ->\n'
+        '                                if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME && showRestoreDialog) {\n'
+        '                                    val refreshed = com.example.util.BackupManager.getAvailableBackups(context)\n'
+        '                                    if (refreshed.isNotEmpty()) {\n'
+        '                                        availableBackups = refreshed\n'
+        '                                        if (selectedBackupFile == null ||\n'
+        '                                            refreshed.none { it.absolutePath == selectedBackupFile?.absolutePath }\n'
+        '                                        ) {\n'
+        '                                            selectedBackupFile = refreshed.firstOrNull()\n'
+        '                                        }\n'
+        '                                    }\n'
+        '                                }\n'
+        '                            }\n'
+        '                            backupLifecycleOwner.lifecycle.addObserver(obs)\n'
+        '                            onDispose { backupLifecycleOwner.lifecycle.removeObserver(obs) }\n'
+        '                        }\n'
+    )
+    s = s.replace(anchor, injection, 1)
+    sd.write_text(s, encoding="utf-8")
+    log("  ✓ SettingsDialog: banner + auto-refresh on resume")
+    log("  ✓ Patch complete")
 
 
 # ============================================================
@@ -519,8 +320,7 @@ def patch_backup_completeness():
 # ============================================================
 def read_app_version():
     build_path = PROJECT_ROOT / "app/build.gradle.kts"
-    if not build_path.exists():
-        return ("unknown", "0")
+    if not build_path.exists(): return ("unknown", "0")
     text = build_path.read_text(encoding="utf-8")
     vn = re.search(r'versionName\s*=\s*"([^"]+)"', text)
     vc = re.search(r"versionCode\s*=\s*(\d+)", text)
@@ -665,9 +465,6 @@ def write_workflow():
     log("  ✓ Written.")
 
 
-# ============================================================
-# Git + GitHub
-# ============================================================
 def setup_git():
     log("\n=== Setting up git repo ===")
     if not (PROJECT_ROOT / ".git").exists():
@@ -700,7 +497,7 @@ def setup_git():
     if subprocess.run(["git", "status", "--porcelain"],
                       capture_output=True, text=True).stdout.strip():
         run(["git", "commit", "-m",
-             "Backup completeness: all pins/albums/prefs + viewmodel reload"])
+             "Restore: All Files Access so previous-install backups appear"])
         log("  ✓ Committed.")
 
 
@@ -890,7 +687,7 @@ def device_install(apk_path):
 # ============================================================
 def main():
     log("=" * 70)
-    log("PinBoard Gallery - Backup completeness + full build pipeline")
+    log("PinBoard Gallery - Restore sees previous-install backups")
     log("=" * 70)
 
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists():
@@ -900,7 +697,7 @@ def main():
             log(f"ERROR: {t} not in PATH"); sys.exit(1)
 
     # 1. This change
-    patch_backup_completeness()
+    patch_restore_all_files_access()
 
     # 2. Build infrastructure
     ensure_release_keystore()
