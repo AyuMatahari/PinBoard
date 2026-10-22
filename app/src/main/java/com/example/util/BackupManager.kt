@@ -168,6 +168,32 @@ object BackupManager {
             }
             rootJson.put("settings", settingsObj)
 
+            // Board layout prefs (per-board columns and sort)
+            try {
+                val blPrefs = context.getSharedPreferences("board_layout_prefs", Context.MODE_PRIVATE)
+                val blObj = JSONObject()
+                blPrefs.all.forEach { (k, v) -> blObj.put(k, v ?: JSONObject.NULL) }
+                rootJson.put("board_layout_prefs", blObj)
+            } catch (_: Exception) {}
+
+            // Image cache prefs
+            try {
+                val icPrefs = context.getSharedPreferences("image_cache_prefs", Context.MODE_PRIVATE)
+                val icObj = JSONObject()
+                icPrefs.all.forEach { (k, v) -> icObj.put(k, v ?: JSONObject.NULL) }
+                rootJson.put("image_cache_prefs", icObj)
+            } catch (_: Exception) {}
+
+            // Backup prefs (excluding last_backup_time)
+            try {
+                val bPrefs = context.getSharedPreferences("pinboard_backup_prefs", Context.MODE_PRIVATE)
+                val bObj = JSONObject()
+                bPrefs.all.forEach { (k, v) ->
+                    if (k != "last_backup_time") bObj.put(k, v ?: JSONObject.NULL)
+                }
+                rootJson.put("backup_prefs", bObj)
+            } catch (_: Exception) {}
+
             // Export board history
             val historyPrefs = context.getSharedPreferences("pinterest_board_history", Context.MODE_PRIVATE)
             val historyJsonStr = historyPrefs.getString("history_json", null)
@@ -209,6 +235,7 @@ object BackupManager {
             // Export pins metadata and info (excluding raw image binary data)
             // Requirement 1: Make sure to not delete data even if image itself is deleted from the app
             val archivedPinsMap = linkedMapOf<String, JSONObject>()
+            val fullPinsList = mutableListOf<JSONObject>()
 
             // Load from existing master archive if available
             val archiveFile = File(chosenBackupDir, "master_pins_archive.json")
@@ -253,17 +280,44 @@ object BackupManager {
                     put("mimeType", p.mimeType)
                     put("sourceDomain", p.sourceDomain)
                     put("isBrokenOrUnreachable", p.isBrokenOrUnreachable)
+                    put("albumId", p.albumId ?: "")
                 }
                 val key = p.id.ifBlank { p.imageUrl }
                 archivedPinsMap[key] = pObj
+                fullPinsList.add(pObj)
             }
 
+            // Archive: deduped by pin id (metadata preservation after deletion)
+            val archivePinsArray = JSONArray()
+            archivedPinsMap.values.forEach { archivePinsArray.put(it) }
+            try {
+                archiveFile.writeText(archivePinsArray.toString())
+            } catch (_: Exception) {}
+
+            // Backup pins: ALL (id, boardId) pairs, NO dedup — preserves pins
+            // that live on multiple boards (Dump / My Save / Favorites / custom).
             val pinsArray = JSONArray()
-            archivedPinsMap.values.forEach { pinsArray.put(it) }
+            fullPinsList.forEach { pinsArray.put(it) }
             rootJson.put("pins", pinsArray)
 
+            // Custom albums (non-sort albums created from multi-image links)
             try {
-                archiveFile.writeText(pinsArray.toString())
+                val customAlbums = dao.getAllAlbums()
+                val albumsArray = JSONArray()
+                customAlbums.forEach { a ->
+                    val aObj = JSONObject().apply {
+                        put("id", a.id)
+                        put("boardId", a.boardId)
+                        put("parentAlbumId", a.parentAlbumId ?: "")
+                        put("title", a.title)
+                        put("sourceUrl", a.sourceUrl)
+                        put("dateAddedMillis", a.dateAddedMillis)
+                        put("orderIndex", a.orderIndex)
+                        put("isFavorite", a.isFavorite)
+                    }
+                    albumsArray.put(aObj)
+                }
+                rootJson.put("custom_albums", albumsArray)
             } catch (_: Exception) {}
 
             val timestampStr = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
@@ -349,6 +403,26 @@ object BackupManager {
         val pinsCount: Int,
         val settingsRestored: Boolean
     )
+
+    private fun restorePrefsObject(context: Context, prefsObj: JSONObject?, prefsName: String) {
+        if (prefsObj == null) return
+        try {
+            val editor = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE).edit()
+            val keys = prefsObj.keys()
+            while (keys.hasNext()) {
+                val key = keys.next()
+                when (val value = prefsObj.get(key)) {
+                    is Boolean -> editor.putBoolean(key, value)
+                    is Int -> editor.putInt(key, value)
+                    is Long -> editor.putLong(key, value)
+                    is Float -> editor.putFloat(key, value)
+                    is Double -> editor.putFloat(key, value.toFloat())
+                    is String -> editor.putString(key, value)
+                }
+            }
+            editor.apply()
+        } catch (_: Exception) {}
+    }
 
     suspend fun restoreBackup(context: Context, backupFile: File): Result<RestoreSummary> = withContext(Dispatchers.IO) {
         try {
@@ -457,7 +531,8 @@ object BackupManager {
                                 pinterestCreatedAt = pObj.optString("pinterestCreatedAt", "").ifBlank { null },
                                 mimeType = pObj.optString("mimeType", "image/jpeg"),
                                 sourceDomain = pObj.optString("sourceDomain", ""),
-                                isBrokenOrUnreachable = pObj.optBoolean("isBrokenOrUnreachable", false)
+                                isBrokenOrUnreachable = pObj.optBoolean("isBrokenOrUnreachable", false),
+                                albumId = pObj.optString("albumId", "").ifBlank { null }
                             )
                         )
                     }
@@ -493,6 +568,33 @@ object BackupManager {
                 }
                 editor.apply()
                 settingsRestored = true
+            }
+
+            // 3b. Restore board_layout_prefs
+            restorePrefsObject(context, rootJson.optJSONObject("board_layout_prefs"), "board_layout_prefs")
+
+            // 3c. Restore image_cache_prefs
+            restorePrefsObject(context, rootJson.optJSONObject("image_cache_prefs"), "image_cache_prefs")
+
+            // 3d. Restore backup_prefs (skip last_backup_time)
+            run {
+                val bPrefs = rootJson.optJSONObject("backup_prefs")
+                if (bPrefs != null) {
+                    val ed = context.getSharedPreferences("pinboard_backup_prefs", Context.MODE_PRIVATE).edit()
+                    val ks = bPrefs.keys()
+                    while (ks.hasNext()) {
+                        val k = ks.next()
+                        if (k == "last_backup_time") continue
+                        when (val v = bPrefs.get(k)) {
+                            is Boolean -> ed.putBoolean(k, v)
+                            is Int -> ed.putInt(k, v)
+                            is Long -> ed.putLong(k, v)
+                            is Float -> ed.putFloat(k, v)
+                            is String -> ed.putString(k, v)
+                        }
+                    }
+                    ed.apply()
+                }
             }
 
             // 4. Restore Board History
