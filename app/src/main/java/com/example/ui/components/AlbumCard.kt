@@ -6,7 +6,6 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -23,13 +22,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
@@ -49,27 +47,13 @@ import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.example.model.DateAlbum
-import com.example.model.PinItem
-import com.example.ui.theme.PinterestBlack
 import com.example.ui.theme.PinterestRed
 import com.example.ui.theme.PinterestTextSecondary
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
-/**
- * Album card displaying a stacked card effect for date-grouped collections.
- *
- * Stacked card effect:
- * - Top layer: First image in album (upright in center foreground)
- * - Second / Left layer: Middle image in album (tilted diagonally left)
- * - Third / Right layer: Last image in album (tilted diagonally right)
- * - Subtle drop shadows separating each layer, no white borders.
- *
- * Gestures:
- * - Tap: opens the collection of images in the album
- * - Hold: adds/toggles album in favorites
- * - Swipe left/right: opens the screen-fitting preview of ~18 images
- */
+
 @Composable
 fun AlbumCard(
     album: DateAlbum,
@@ -89,6 +73,7 @@ fun AlbumCard(
     val currentOnLongClick by rememberUpdatedState(onLongClick)
     val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)
     val currentOnSwipePreview by rememberUpdatedState(onSwipePreview)
+
     val pins = album.pins
     val allAlbumPins = if (pins.isNotEmpty()) pins else album.subAlbums.flatMap { it.pins }
     val topPin = allAlbumPins.firstOrNull()
@@ -115,11 +100,11 @@ fun AlbumCard(
                             val diffX = change.position.x - startPos.x
                             val diffY = change.position.y - startPos.y
 
-                            if (kotlin.math.abs(diffY) > 20f && kotlin.math.abs(diffY) > kotlin.math.abs(diffX)) {
+                            if (abs(diffY) > 20f && abs(diffY) > abs(diffX)) {
                                 isVerticalScroll = true
                                 return@withTimeoutOrNull true
                             }
-                            if (kotlin.math.abs(diffX) > 25f && kotlin.math.abs(diffX) > kotlin.math.abs(diffY) * 1.2f) {
+                            if (abs(diffX) > 25f && abs(diffX) > abs(diffY) * 1.2f) {
                                 isHorizontalSwipe = true
                                 totalDragX = diffX
                                 return@withTimeoutOrNull true
@@ -137,6 +122,7 @@ fun AlbumCard(
                     if (timeoutResult == null && !isHorizontalSwipe) {
                         longPressed = true
                         down.consume()
+                        // Select mode: open album. Normal: toggle favorite.
                         if (isSelectionMode) currentOnClick() else currentOnLongClick()
                         do {
                             val event = awaitPointerEvent()
@@ -155,10 +141,11 @@ fun AlbumCard(
                             }
                         } while (event.changes.any { it.pressed })
 
-                        if (kotlin.math.abs(totalDragX) > 30f) {
+                        if (abs(totalDragX) > 30f) {
                             currentOnSwipePreview()
                         }
                     } else if (timeoutResult == false && !longPressed) {
+                        // Select mode: toggle selection. Normal: open album.
                         if (isSelectionMode) currentOnSelectToggle() else currentOnClick()
                     }
                 }
@@ -170,7 +157,6 @@ fun AlbumCard(
                 .padding(horizontal = 8.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Stacked Cards Thumbnail Container (Three square images layered with slight diagonal offset)
             BoxWithConstraints(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -187,7 +173,6 @@ fun AlbumCard(
                         .height(containerHeight),
                     contentAlignment = Alignment.Center
                 ) {
-                    // 1. Left Background Card (middle image, tilted diagonally left)
                     if (leftPin != null) {
                         Box(
                             modifier = Modifier
@@ -197,11 +182,7 @@ fun AlbumCard(
                                     translationX = -cardWidth.toPx() * 0.16f
                                     translationY = 5.dp.toPx()
                                 }
-                                .shadow(
-                                    elevation = 5.dp,
-                                    shape = RoundedCornerShape(14.dp),
-                                    clip = false
-                                )
+                                .shadow(elevation = 5.dp, shape = RoundedCornerShape(14.dp), clip = false)
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color(0xFF222222))
                         ) {
@@ -217,7 +198,6 @@ fun AlbumCard(
                         }
                     }
 
-                    // 2. Right Background Card (last image, tilted diagonally right)
                     if (rightPin != null) {
                         Box(
                             modifier = Modifier
@@ -227,11 +207,7 @@ fun AlbumCard(
                                     translationX = cardWidth.toPx() * 0.16f
                                     translationY = 5.dp.toPx()
                                 }
-                                .shadow(
-                                    elevation = 5.dp,
-                                    shape = RoundedCornerShape(14.dp),
-                                    clip = false
-                                )
+                                .shadow(elevation = 5.dp, shape = RoundedCornerShape(14.dp), clip = false)
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color(0xFF222222))
                         ) {
@@ -247,16 +223,11 @@ fun AlbumCard(
                         }
                     }
 
-                    // 3. Top Foreground Card (first image, upright with rounded corners and drop shadow)
                     if (topPin != null) {
                         Box(
                             modifier = Modifier
                                 .size(width = cardWidth, height = cardHeight)
-                                .shadow(
-                                    elevation = 8.dp,
-                                    shape = RoundedCornerShape(14.dp),
-                                    clip = false
-                                )
+                                .shadow(elevation = 8.dp, shape = RoundedCornerShape(14.dp), clip = false)
                                 .clip(RoundedCornerShape(14.dp))
                                 .background(Color(0xFF1E1E1E))
                         ) {
@@ -270,11 +241,10 @@ fun AlbumCard(
                                 modifier = Modifier.fillMaxSize()
                             )
 
-                            // Selection overlay
                             if (isSelectionMode) {
                                 Box(
                                     modifier = Modifier
-                                        .matchParentSize()
+                                        .fillMaxSize()
                                         .background(
                                             if (isSelected) PinterestRed.copy(alpha = 0.28f)
                                             else Color.Black.copy(alpha = 0.10f)
@@ -301,7 +271,6 @@ fun AlbumCard(
                                 }
                             }
 
-                            // Heart Badge if favorited
                             if (isFavorite && !isSelectionMode) {
                                 Surface(
                                     shape = CircleShape,
@@ -328,7 +297,6 @@ fun AlbumCard(
 
             Spacer(modifier = Modifier.height(6.dp))
 
-            // Album Metadata: Center aligned date and image count (no swipe icon)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -366,15 +334,7 @@ fun AlbumCard(
     }
 }
 
-/**
- * Fullscreen Quick Preview Overlay.
- *
- * User requirement:
- * - Shows by swiping left/right on an Album
- * - Displays preview of overall album showing ~18 images fitting on screen without wasting space
- * - Does not show only top/latest images; samples evenly from top to bottom
- * - Shows no interface other than images (press back or tap to exit)
- */
+
 @Composable
 fun AlbumPreviewOverlay(
     album: DateAlbum,
@@ -386,7 +346,6 @@ fun AlbumPreviewOverlay(
         onDismiss()
     }
 
-    // Sample ~18 images distributed evenly from top to bottom
     val sampledPins = remember(album) {
         val all = album.pins
         if (all.size <= 18) {

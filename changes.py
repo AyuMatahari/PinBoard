@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — Select-mode fixes (round 2)
+PinBoard Gallery — Rewrite AlbumCard.kt cleanly
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -22,6 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       JAVA_TOOL_OPTIONS: "-Djava.awt.headless=true"
+      GRADLE_OPTS: "-Djava.awt.headless=true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -71,530 +72,22 @@ def tool_available(name):
 
 
 # ============================================================
-# PATCH 1 — MultiSelectBottomBar
+# NEW ALBUMCARD.KT (full replacement)
 # ============================================================
-def patch_multiselect_bar():
-    log("\n=== PATCH: MultiSelectBottomBar (label + save icon) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/MultiSelectBottomBar.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
+NEW_ALBUM_CARD = r'''package com.example.ui.components
 
-    # (a) Label format
-    if 'if (selectedPinCount > 0 && selectedAlbumCount > 0)' not in t:
-        old_label = (
-            '                    Text(\n'
-            '                        text = buildString {\n'
-            '                            append(selectedPinCount)\n'
-            '                            append(" img")\n'
-            '                            if (selectedAlbumCount > 0) {\n'
-            '                                append(" · ")\n'
-            '                                append(selectedAlbumCount)\n'
-            '                                append(" alb")\n'
-            '                            }\n'
-            '                        },\n'
-        )
-        new_label = (
-            '                    Text(\n'
-            '                        text = if (selectedPinCount > 0 && selectedAlbumCount > 0)\n'
-            '                            "${selectedPinCount + selectedAlbumCount} itm"\n'
-            '                        else if (selectedPinCount > 0) "$selectedPinCount img"\n'
-            '                        else if (selectedAlbumCount > 0) "$selectedAlbumCount alb"\n'
-            '                        else "0",\n'
-        )
-        if old_label in t:
-            t = t.replace(old_label, new_label, 1); changed = True
-            log("  ✓ combined-count label")
-        else:
-            log("  ⚠ label anchor missing")
-
-    # (b) Save button → IconButton
-    if 'testTag("download_selected_button")' in t and 'Button(\n                        onClick = onDownloadSelected,' in t:
-        old_btn = (
-            'Button(\n'
-            '                        onClick = onDownloadSelected,\n'
-            '                        enabled = selectedPinCount > 0,\n'
-            '                        colors = ButtonDefaults.buttonColors(\n'
-            '                            containerColor = PinterestRed,\n'
-            '                            disabledContainerColor = PinterestPillGray\n'
-            '                        ),\n'
-            '                        shape = RoundedCornerShape(16.dp),\n'
-            '                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),\n'
-            '                        modifier = Modifier\n'
-            '                            .height(34.dp)\n'
-            '                            .testTag("download_selected_button")\n'
-            '                    ) {\n'
-            '                        Icon(\n'
-            '                            imageVector = Icons.Default.Download,\n'
-            '                            contentDescription = null,\n'
-            '                            tint = if (selectedPinCount > 0) Color.White else Color.Gray,\n'
-            '                            modifier = Modifier.size(14.dp)\n'
-            '                        )\n'
-            '                        Spacer(modifier = Modifier.width(4.dp))\n'
-            '                        Text(\n'
-            '                            text = "Save",\n'
-            '                            fontSize = 12.sp,\n'
-            '                            fontWeight = FontWeight.Bold,\n'
-            '                            color = if (selectedPinCount > 0) Color.White else Color.Gray\n'
-            '                        )\n'
-            '                    }'
-        )
-        new_btn = (
-            'IconButton(\n'
-            '                        onClick = onDownloadSelected,\n'
-            '                        enabled = selectedPinCount > 0,\n'
-            '                        modifier = Modifier\n'
-            '                            .size(32.dp)\n'
-            '                            .testTag("download_selected_button")\n'
-            '                    ) {\n'
-            '                        Icon(\n'
-            '                            imageVector = Icons.Default.Download,\n'
-            '                            contentDescription = "Save selected",\n'
-            '                            tint = if (selectedPinCount > 0) PinterestRed else Color.Gray,\n'
-            '                            modifier = Modifier.size(18.dp)\n'
-            '                        )\n'
-            '                    }'
-        )
-        if old_btn in t:
-            t = t.replace(old_btn, new_btn, 1); changed = True
-            log("  ✓ save button → icon only")
-        else:
-            log("  ⚠ save button anchor missing (may already be icon-only)")
-
-    if changed: f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PATCH 2 — CopyOrMoveImagesDialog: include current board
-# ============================================================
-def patch_copy_move_dialog():
-    log("\n=== PATCH: CopyOrMoveImagesDialog (include current) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    old_filter = (
-        '    val selectableBoards = remember(availableBoards, currentBoardId, mode) {\n'
-        '        if (mode == BoardTransferMode.MOVE && !currentBoardId.isNullOrBlank()) {\n'
-        '            availableBoards.filter { it.id != currentBoardId }\n'
-        '        } else {\n'
-        '            availableBoards\n'
-        '        }\n'
-        '    }\n'
-    )
-    new_filter = (
-        '    // MOVE now includes the current board (moving to current board = reorder to top)\n'
-        '    val selectableBoards = remember(availableBoards) { availableBoards }\n'
-    )
-    if old_filter in t:
-        t = t.replace(old_filter, new_filter, 1); changed = True
-        log("  ✓ include current board in MOVE list")
-
-    # Add "(Current)" tag next to the board title when it matches currentBoardId
-    if '(Current)' not in t:
-        old_row = (
-            '                                    Text(\n'
-            '                                        text = board.title,\n'
-            '                                        fontWeight = if (isChecked) FontWeight.Bold else FontWeight.Medium,\n'
-            '                                        fontSize = 13.sp,\n'
-            '                                        color = if (isChecked) PinterestRed else PinterestBlack\n'
-            '                                    )\n'
-        )
-        new_row = (
-            '                                    Text(\n'
-            '                                        text = board.title,\n'
-            '                                        fontWeight = if (isChecked) FontWeight.Bold else FontWeight.Medium,\n'
-            '                                        fontSize = 13.sp,\n'
-            '                                        color = if (isChecked) PinterestRed else PinterestBlack\n'
-            '                                    )\n'
-            '                                    if (board.id == currentBoardId) {\n'
-            '                                        Spacer(modifier = Modifier.width(6.dp))\n'
-            '                                        Text("(Current)", fontSize = 10.sp, color = PinterestTextSecondary)\n'
-            '                                    }\n'
-        )
-        if old_row in t:
-            t = t.replace(old_row, new_row, 1); changed = True
-            log("  ✓ (Current) tag")
-
-    if changed: f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PATCH 3 — AlbumCard: staleness + tap/hold inversion
-# ============================================================
-def patch_album_card():
-    log("\n=== PATCH: AlbumCard gestures ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/AlbumCard.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    # Import rememberUpdatedState
-    if "import androidx.compose.runtime.rememberUpdatedState" not in t:
-        t = t.replace(
-            'import androidx.compose.runtime.remember\n',
-            'import androidx.compose.runtime.remember\nimport androidx.compose.runtime.rememberUpdatedState\n',
-            1,
-        )
-        changed = True
-
-    # Wrap callbacks in rememberUpdatedState — insert just before the Box with pointerInput
-    if "val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)" not in t:
-        anchor = (
-            '    val context = LocalContext.current\n'
-            '    val pins = album.pins\n'
-        )
-        add = (
-            '    val context = LocalContext.current\n'
-            '    val currentOnClick by rememberUpdatedState(onClick)\n'
-            '    val currentOnLongClick by rememberUpdatedState(onLongClick)\n'
-            '    val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)\n'
-            '    val currentOnSwipePreview by rememberUpdatedState(onSwipePreview)\n'
-            '    val pins = album.pins\n'
-        )
-        if anchor in t:
-            t = t.replace(anchor, add, 1); changed = True
-            log("  ✓ rememberUpdatedState wrappers")
-
-    # Change pointerInput key
-    if "pointerInput(album.id, isSelectionMode)" not in t:
-        t = t.replace(
-            '.pointerInput(album.id) {',
-            '.pointerInput(album.id, isSelectionMode) {',
-            1,
-        )
-        changed = True
-        log("  ✓ pointerInput key includes isSelectionMode")
-
-    # Invert long-press branch: select mode → open album (onClick)
-    old_long = (
-        '                        down.consume()\n'
-        '                        if (isSelectionMode) onSelectToggle() else onLongClick()\n'
-    )
-    new_long = (
-        '                        down.consume()\n'
-        '                        if (isSelectionMode) currentOnClick() else currentOnLongClick()\n'
-    )
-    if old_long in t:
-        t = t.replace(old_long, new_long, 1); changed = True
-        log("  ✓ long-press: select mode → open album")
-
-    # Tap branch: select mode → toggle selection
-    old_tap = (
-        '                        if (isSelectionMode) onSelectToggle() else onClick()\n'
-    )
-    new_tap = (
-        '                        if (isSelectionMode) currentOnSelectToggle() else currentOnClick()\n'
-    )
-    if old_tap in t:
-        t = t.replace(old_tap, new_tap, 1); changed = True
-        log("  ✓ tap: select mode → toggle selection")
-
-    # Also update swipe → rememberUpdatedState lambda
-    old_swipe = '                            onSwipePreview()\n'
-    new_swipe = '                            currentOnSwipePreview()\n'
-    if old_swipe in t and new_swipe not in t:
-        t = t.replace(old_swipe, new_swipe, 1); changed = True
-
-    if changed: f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PATCH 4 — ViewModel: delete-selection, move-to-top, banner
-# ============================================================
-def patch_viewmodel():
-    log("\n=== PATCH: ViewModel (select-mode) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    # (a) Extend enum + data class
-    if "DeleteSelectionMode" not in t:
-        anchor = "enum class AlbumTransferMode { COPY, MOVE }\n"
-        add = (
-            "enum class AlbumTransferMode { COPY, MOVE }\n"
-            "\n"
-            "enum class DeleteSelectionMode { DISSOLVE, DELETE_WITH_CONTENTS, PINS_ONLY }\n"
-        )
-        if anchor in t:
-            t = t.replace(anchor, add, 1); changed = True
-            log("  ✓ DeleteSelectionMode enum")
-
-    if "dissolvedLinks" not in t and "data class DeletedPinsUndoState" in t:
-        old_dc = (
-            'data class DeletedPinsUndoState(\n'
-            '    val boardId: String,\n'
-            '    val pins: List<PinItem>,\n'
-            '    val imageUrls: List<String> = pins.map { it.imageUrl }\n'
-            ')\n'
-        )
-        new_dc = (
-            'data class DeletedPinsUndoState(\n'
-            '    val boardId: String,\n'
-            '    val pins: List<PinItem>,\n'
-            '    val imageUrls: List<String> = pins.map { it.imageUrl },\n'
-            '    val albums: List<com.example.data.local.CustomAlbumEntity> = emptyList(),\n'
-            '    val dissolvedLinks: Map<String, String> = emptyMap(),\n'
-            '    val mode: DeleteSelectionMode = DeleteSelectionMode.PINS_ONLY\n'
-            ')\n'
-        )
-        if old_dc in t:
-            t = t.replace(old_dc, new_dc, 1); changed = True
-            log("  ✓ DeletedPinsUndoState extended")
-
-    # (b) New deleteSelectionAndAlbums method — insert before onCleared
-    if "fun deleteSelectionAndAlbums(" not in t:
-        anchor = '    override fun onCleared() {\n'
-        new_methods = (
-            '    fun deleteSelectionAndAlbums(pinIds: Set<String>, albumIds: Set<String>, mode: DeleteSelectionMode) {\n'
-            '        val board = _currentBoard.value ?: return\n'
-            '        if (pinIds.isEmpty() && albumIds.isEmpty()) return\n'
-            '        viewModelScope.launch {\n'
-            '            val ctx = appContext ?: return@launch\n'
-            '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
-            '            val allPins = _rawPins.value\n'
-            '            val albums = _customAlbums.value.filter { albumIds.contains(it.id) }\n'
-            '            val albumPins = allPins.filter { it.albumId != null && albumIds.contains(it.albumId!!) }\n'
-            '            val explicitPins = allPins.filter { pinIds.contains(it.id) }\n'
-            '\n'
-            '            val pinsToDelete: List<PinItem>\n'
-            '            val dissolvedLinks = mutableMapOf<String, String>()\n'
-            '\n'
-            '            when (mode) {\n'
-            '                DeleteSelectionMode.DELETE_WITH_CONTENTS -> {\n'
-            '                    pinsToDelete = (explicitPins + albumPins).distinctBy { it.id }\n'
-            '                }\n'
-            '                DeleteSelectionMode.DISSOLVE -> {\n'
-            '                    pinsToDelete = explicitPins\n'
-            '                    albumPins.forEach { p -> p.albumId?.let { dissolvedLinks[p.id] = it } }\n'
-            '                }\n'
-            '                DeleteSelectionMode.PINS_ONLY -> {\n'
-            '                    pinsToDelete = explicitPins\n'
-            '                }\n'
-            '            }\n'
-            '\n'
-            '            withContext(Dispatchers.IO) {\n'
-            '                if (pinsToDelete.isNotEmpty()) {\n'
-            '                    dao.deletePinsFromBoard(board.id, pinsToDelete.map { it.id })\n'
-            '                }\n'
-            '                albums.forEach { dao.deleteAlbum(it.id) }\n'
-            '            }\n'
-            '\n'
-            '            val remaining = allPins\n'
-            '                .filterNot { p -> pinsToDelete.any { pd -> pd.id == p.id } }\n'
-            '                .map { p ->\n'
-            '                    if (mode == DeleteSelectionMode.DISSOLVE &&\n'
-            '                        p.albumId != null && albumIds.contains(p.albumId!!)) {\n'
-            '                        p.copy(albumId = null)\n'
-            '                    } else p\n'
-            '                }\n'
-            '            val remainingAlbums = _customAlbums.value.filterNot { albumIds.contains(it.id) }\n'
-            '\n'
-            '            _deletedPinsUndo.value = DeletedPinsUndoState(\n'
-            '                boardId = board.id,\n'
-            '                pins = pinsToDelete,\n'
-            '                imageUrls = pinsToDelete.map { it.imageUrl },\n'
-            '                albums = albums,\n'
-            '                dissolvedLinks = dissolvedLinks,\n'
-            '                mode = mode\n'
-            '            )\n'
-            '\n'
-            '            withContext(Dispatchers.Main) {\n'
-            '                _rawPins.value = remaining\n'
-            '                _customAlbums.value = remainingAlbums\n'
-            '                _currentBoard.value = board.copy(pins = remaining, pinCount = remaining.size)\n'
-            '                updateDisplayedPins()\n'
-            '                clearSelection()\n'
-            '            }\n'
-            '        }\n'
-            '    }\n'
-            '\n'
-            '    // Move pins/albums to top of the board (also dissolves empty albums)\n'
-            '    private suspend fun moveToTopInternal(pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {\n'
-            '        val board = _currentBoard.value ?: return\n'
-            '        val allPins = _rawPins.value\n'
-            '        val maxPinDate = allPins.maxOfOrNull { it.dateAddedMillis } ?: 0L\n'
-            '        val maxAlbumDate = _customAlbums.value.maxOfOrNull { it.dateAddedMillis } ?: 0L\n'
-            '        var nextDate = maxOf(maxPinDate, maxAlbumDate) + 60_000L\n'
-            '\n'
-            '        val affectedAlbumIds = mutableSetOf<String>()\n'
-            '        val updatedPins = allPins.map { p ->\n'
-            '            if (pinIds.contains(p.id)) {\n'
-            '                p.albumId?.let { affectedAlbumIds.add(it) }\n'
-            '                p.copy(albumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }\n'
-            '            } else p\n'
-            '        }\n'
-            '\n'
-            '        val updatedAlbums = _customAlbums.value.map { a ->\n'
-            '            if (albumIds.contains(a.id)) {\n'
-            '                a.copy(dateAddedMillis = nextDate).also { nextDate += 1000L }\n'
-            '            } else a\n'
-            '        }\n'
-            '\n'
-            '        val nonEmptyAlbumIds = updatedPins.mapNotNull { it.albumId }.toSet()\n'
-            '        val dissolvedAlbumIds = affectedAlbumIds - nonEmptyAlbumIds\n'
-            '        val finalAlbums = updatedAlbums.filterNot { it.id in dissolvedAlbumIds }\n'
-            '\n'
-            '        withContext(Dispatchers.IO) {\n'
-            '            dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, board.id, i) })\n'
-            '            updatedAlbums.filter { it.id in albumIds }.forEach { dao.insertAlbum(it) }\n'
-            '            dissolvedAlbumIds.forEach { dao.deleteAlbum(it) }\n'
-            '        }\n'
-            '\n'
-            '        withContext(Dispatchers.Main) {\n'
-            '            _rawPins.value = updatedPins\n'
-            '            _customAlbums.value = finalAlbums\n'
-            '            _currentBoard.value = board.copy(pins = updatedPins, pinCount = updatedPins.size)\n'
-            '            updateDisplayedPins(resetLimit = true)\n'
-            '        }\n'
-            '    }\n'
-            '\n'
-            '    fun executeAlbumTransferToCurrentBoard() {\n'
-            '        val transfer = _pendingAlbumTransfer.value ?: return\n'
-            '        val currentBoard = _currentBoard.value ?: return\n'
-            '        val sourceBoardId = transfer.sourceBoardId\n'
-            '        viewModelScope.launch {\n'
-            '            val ctx = appContext ?: return@launch\n'
-            '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
-            '            if (currentBoard.id == sourceBoardId) {\n'
-            '                if (transfer.mode == AlbumTransferMode.MOVE) {\n'
-            '                    moveToTopInternal(transfer.pinIds, emptySet(), dao)\n'
-            '                    _snackbarMessage.value = "Moved ${transfer.pinIds.size} to top of board"\n'
-            '                } else {\n'
-            '                    _snackbarMessage.value = "Already on this board"\n'
-            '                }\n'
-            '            } else {\n'
-            '                val pins = _rawPins.value.filter { transfer.pinIds.contains(it.id) }\n'
-            '                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(currentBoard.id).toSet() }\n'
-            '                val baseDate = System.currentTimeMillis()\n'
-            '                val toAdd = pins.filter { !existingUrls.contains(it.imageUrl) }\n'
-            '                    .mapIndexed { i, p -> p.copy(albumId = null, dateAddedMillis = baseDate + i * 1000L) }\n'
-            '                withContext(Dispatchers.IO) {\n'
-            '                    dao.insertPins(toAdd.mapIndexed { i, p -> PinEntity.fromPinItem(p, currentBoard.id, i) })\n'
-            '                    if (transfer.mode == AlbumTransferMode.MOVE) {\n'
-            '                        dao.deletePinsFromBoard(sourceBoardId, transfer.pinIds.toList())\n'
-            '                    }\n'
-            '                }\n'
-            '                if (transfer.mode == AlbumTransferMode.MOVE) {\n'
-            '                    val remaining = _rawPins.value.filterNot { transfer.pinIds.contains(it.id) }\n'
-            '                    withContext(Dispatchers.Main) {\n'
-            '                        _rawPins.value = remaining\n'
-            '                        _currentBoard.value = currentBoard.copy(pins = remaining, pinCount = remaining.size)\n'
-            '                        updateDisplayedPins()\n'
-            '                    }\n'
-            '                }\n'
-            '                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${toAdd.size} to ${currentBoard.title}"\n'
-            '            }\n'
-            '            _pendingAlbumTransfer.value = null\n'
-            '            withContext(Dispatchers.Main) { clearSelection() }\n'
-            '        }\n'
-            '    }\n'
-            '\n'
-        )
-        if anchor in t:
-            t = t.replace(anchor, new_methods + anchor, 1); changed = True
-            log("  ✓ deleteSelectionAndAlbums + moveToTopInternal + executeAlbumTransferToCurrentBoard")
-
-    # (c) beginAlbumTransfer exits select mode
-    old_begin = (
-        '        _pendingAlbumTransfer.value = PendingAlbumTransfer(\n'
-        '            pinIds = pinIds, mode = mode, sourceBoardId = board.id,\n'
-        '            savedSelectionPinIds = _selectedPinIds.value,\n'
-        '            savedSelectionAlbumIds = _selectedAlbumIds.value\n'
-        '        )\n'
-        '    }\n'
-    )
-    new_begin = (
-        '        _pendingAlbumTransfer.value = PendingAlbumTransfer(\n'
-        '            pinIds = pinIds, mode = mode, sourceBoardId = board.id,\n'
-        '            savedSelectionPinIds = _selectedPinIds.value,\n'
-        '            savedSelectionAlbumIds = _selectedAlbumIds.value\n'
-        '        )\n'
-        '        _isSelectionMode.value = false\n'
-        '    }\n'
-    )
-    if old_begin in t:
-        t = t.replace(old_begin, new_begin, 1); changed = True
-        log("  ✓ beginAlbumTransfer exits select mode")
-
-    # (d) Update undoDeletePins to restore albums + dissolved links
-    old_undo = (
-        '    fun undoDeletePins() {\n'
-        '        val undo = _deletedPinsUndo.value ?: return\n'
-        '        val board = _currentBoard.value ?: return\n'
-        '        _deletedPinsUndo.value = null\n'
-        '\n'
-        '        val restored = (undo.pins + _rawPins.value).distinctBy { it.id }\n'
-        '        _rawPins.value = restored\n'
-        '        _currentBoard.value = board.copy(pins = restored, pinCount = restored.size)\n'
-        '        updateDisplayedPins()\n'
-        '\n'
-        '        viewModelScope.launch(Dispatchers.IO) {\n'
-        '            val ctx = appContext ?: return@launch\n'
-        '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
-        '            val entities = undo.pins.mapIndexed { idx, p -> PinEntity.fromPinItem(p, undo.boardId, idx) }\n'
-        '            dao.insertPins(entities)\n'
-        '            refreshAvailableBoardsFromDatabaseInternal(dao)\n'
-        '        }\n'
-        '\n'
-        '        _snackbarMessage.value = "Restored ${undo.pins.size} image${if (undo.pins.size > 1) "s" else ""}"\n'
-        '    }\n'
-    )
-    new_undo = (
-        '    fun undoDeletePins() {\n'
-        '        val undo = _deletedPinsUndo.value ?: return\n'
-        '        val board = _currentBoard.value ?: return\n'
-        '        _deletedPinsUndo.value = null\n'
-        '\n'
-        '        val restored = (undo.pins + _rawPins.value).distinctBy { it.id }\n'
-        '        _rawPins.value = restored\n'
-        '        _currentBoard.value = board.copy(pins = restored, pinCount = restored.size)\n'
-        '        updateDisplayedPins()\n'
-        '\n'
-        '        viewModelScope.launch(Dispatchers.IO) {\n'
-        '            val ctx = appContext ?: return@launch\n'
-        '            val dao = AppDatabase.getDatabase(ctx).boardDao()\n'
-        '            if (undo.albums.isNotEmpty()) {\n'
-        '                dao.insertAlbums(undo.albums)\n'
-        '            }\n'
-        '            val entities = undo.pins.mapIndexed { idx, p -> PinEntity.fromPinItem(p, undo.boardId, idx) }\n'
-        '            if (entities.isNotEmpty()) dao.insertPins(entities)\n'
-        '            undo.dissolvedLinks.forEach { (pinId, albumId) ->\n'
-        '                try { dao.movePinsToAlbum(listOf(pinId), albumId) } catch (_: Throwable) {}\n'
-        '            }\n'
-        '            refreshAvailableBoardsFromDatabaseInternal(dao)\n'
-        '        }\n'
-        '\n'
-        '        val albumMsg = if (undo.albums.isNotEmpty()) " + ${undo.albums.size} album${if (undo.albums.size > 1) "s" else ""}" else ""\n'
-        '        _snackbarMessage.value = "Restored ${undo.pins.size} image${if (undo.pins.size > 1) "s" else ""}$albumMsg"\n'
-        '    }\n'
-    )
-    if old_undo in t:
-        t = t.replace(old_undo, new_undo, 1); changed = True
-        log("  ✓ undoDeletePins restores albums + dissolved links")
-
-    if changed: f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PATCH 5 — New DeleteSelectionDialog.kt
-# ============================================================
-def patch_new_delete_dialog():
-    log("\n=== PATCH: DeleteSelectionDialog.kt (new file) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/DeleteSelectionDialog.kt"
-    if f.exists(): log("  ✓ already exists"); return
-
-    content = r'''package com.example.ui.dialogs
-
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
@@ -603,353 +96,455 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.DeleteOutline
-import androidx.compose.material.icons.filled.FolderOff
-import androidx.compose.material3.AlertDialog
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.ui.theme.PinterestBlack
-import com.example.ui.theme.PinterestPillGray
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.example.model.DateAlbum
 import com.example.ui.theme.PinterestRed
 import com.example.ui.theme.PinterestTextSecondary
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 
 @Composable
-fun DeleteSelectionDialog(
-    isOpen: Boolean,
-    pinCount: Int,
-    albumCount: Int,
-    onDismiss: () -> Unit,
-    onDissolve: () -> Unit,
-    onDeleteAll: () -> Unit
+fun AlbumCard(
+    album: DateAlbum,
+    columnCount: Int,
+    isFavorite: Boolean,
+    isPortrait: Boolean = false,
+    isSelected: Boolean = false,
+    isSelectionMode: Boolean = false,
+    onClick: () -> Unit,
+    onLongClick: () -> Unit,
+    onSelectToggle: () -> Unit = {},
+    onSwipePreview: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    if (!isOpen) return
+    val context = LocalContext.current
+    val currentOnClick by rememberUpdatedState(onClick)
+    val currentOnLongClick by rememberUpdatedState(onLongClick)
+    val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)
+    val currentOnSwipePreview by rememberUpdatedState(onSwipePreview)
 
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Text(
-                text = "Choose how to delete selected albums:",
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp
-            )
-        },
-        text = {
-            Column(Modifier.fillMaxWidth()) {
+    val pins = album.pins
+    val allAlbumPins = if (pins.isNotEmpty()) pins else album.subAlbums.flatMap { it.pins }
+    val topPin = allAlbumPins.firstOrNull()
+    val leftPin = if (allAlbumPins.size >= 2) allAlbumPins[allAlbumPins.size / 2] else null
+    val rightPin = if (allAlbumPins.size >= 3) allAlbumPins.last() else null
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .testTag("album_card_${album.id}")
+            .pointerInput(album.id, isSelectionMode) {
+                awaitEachGesture {
+                    val down = awaitFirstDown(requireUnconsumed = false)
+                    val startPos = down.position
+                    var isHorizontalSwipe = false
+                    var isVerticalScroll = false
+                    var longPressed = false
+                    var totalDragX = 0f
+
+                    val timeoutResult = withTimeoutOrNull(420L) {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull() ?: break
+                            val diffX = change.position.x - startPos.x
+                            val diffY = change.position.y - startPos.y
+
+                            if (abs(diffY) > 20f && abs(diffY) > abs(diffX)) {
+                                isVerticalScroll = true
+                                return@withTimeoutOrNull true
+                            }
+                            if (abs(diffX) > 25f && abs(diffX) > abs(diffY) * 1.2f) {
+                                isHorizontalSwipe = true
+                                totalDragX = diffX
+                                return@withTimeoutOrNull true
+                            }
+                            if (!change.pressed) {
+                                return@withTimeoutOrNull false
+                            }
+                        }
+                    }
+
+                    if (isVerticalScroll) {
+                        return@awaitEachGesture
+                    }
+
+                    if (timeoutResult == null && !isHorizontalSwipe) {
+                        longPressed = true
+                        down.consume()
+                        // Select mode: open album. Normal: toggle favorite.
+                        if (isSelectionMode) currentOnClick() else currentOnLongClick()
+                        do {
+                            val event = awaitPointerEvent()
+                            event.changes.forEach { it.consume() }
+                        } while (event.changes.any { it.pressed })
+                        return@awaitEachGesture
+                    }
+
+                    if (isHorizontalSwipe) {
+                        do {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull()
+                            if (change != null) {
+                                totalDragX = change.position.x - startPos.x
+                                change.consume()
+                            }
+                        } while (event.changes.any { it.pressed })
+
+                        if (abs(totalDragX) > 30f) {
+                            currentOnSwipePreview()
+                        }
+                    } else if (timeoutResult == false && !longPressed) {
+                        // Select mode: toggle selection. Normal: open album.
+                        if (isSelectionMode) currentOnSelectToggle() else currentOnClick()
+                    }
+                }
+            }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            BoxWithConstraints(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp, vertical = 4.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                val cardWidth = maxWidth * 0.74f
+                val cardHeight = if (isPortrait) cardWidth * 1.38f else cardWidth
+                val containerHeight = cardHeight + 16.dp
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(containerHeight),
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (leftPin != null) {
+                        Box(
+                            modifier = Modifier
+                                .size(width = cardWidth, height = cardHeight)
+                                .graphicsLayer {
+                                    rotationZ = -10f
+                                    translationX = -cardWidth.toPx() * 0.16f
+                                    translationY = 5.dp.toPx()
+                                }
+                                .shadow(elevation = 5.dp, shape = RoundedCornerShape(14.dp), clip = false)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF222222))
+                        ) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(leftPin.imageUrl)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+
+                    if (rightPin != null) {
+                        Box(
+                            modifier = Modifier
+                                .size(width = cardWidth, height = cardHeight)
+                                .graphicsLayer {
+                                    rotationZ = 10f
+                                    translationX = cardWidth.toPx() * 0.16f
+                                    translationY = 5.dp.toPx()
+                                }
+                                .shadow(elevation = 5.dp, shape = RoundedCornerShape(14.dp), clip = false)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF222222))
+                        ) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(rightPin.imageUrl)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+
+                    if (topPin != null) {
+                        Box(
+                            modifier = Modifier
+                                .size(width = cardWidth, height = cardHeight)
+                                .shadow(elevation = 8.dp, shape = RoundedCornerShape(14.dp), clip = false)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(Color(0xFF1E1E1E))
+                        ) {
+                            AsyncImage(
+                                model = ImageRequest.Builder(context)
+                                    .data(topPin.imageUrl)
+                                    .crossfade(true)
+                                    .build(),
+                                contentDescription = album.title,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.fillMaxSize()
+                            )
+
+                            if (isSelectionMode) {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .background(
+                                            if (isSelected) PinterestRed.copy(alpha = 0.28f)
+                                            else Color.Black.copy(alpha = 0.10f)
+                                        )
+                                )
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(8.dp)
+                                        .size(28.dp)
+                                        .clip(CircleShape)
+                                        .background(if (isSelected) PinterestRed else Color.Black.copy(alpha = 0.45f))
+                                        .border(2.dp, Color.White, CircleShape),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    if (isSelected) {
+                                        Icon(
+                                            imageVector = Icons.Default.Check,
+                                            contentDescription = "Album Selected",
+                                            tint = Color.White,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            if (isFavorite && !isSelectionMode) {
+                                Surface(
+                                    shape = CircleShape,
+                                    color = Color.Black.copy(alpha = 0.65f),
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(6.dp)
+                                        .size(24.dp)
+                                ) {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            imageVector = Icons.Default.Favorite,
+                                            contentDescription = "Favorited Album",
+                                            tint = PinterestRed,
+                                            modifier = Modifier.size(14.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 4.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
                 Text(
-                    text = if (pinCount > 0)
-                        "$albumCount album(s) + $pinCount image(s) selected"
-                    else
-                        "$albumCount album(s) selected",
-                    fontSize = 12.sp,
-                    color = PinterestTextSecondary
+                    text = album.title,
+                    style = MaterialTheme.typography.bodyMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurface
+                    ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
-                Spacer(Modifier.height(12.dp))
 
-                // Option A: Dissolve
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = PinterestPillGray,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onDissolve() }
-                        .testTag("delete_option_dissolve")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(32.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFFE3F2FD)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.FolderOff,
-                                contentDescription = null,
-                                tint = Color(0xFF1976D2),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                "Dissolve album, keep inside images",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 13.sp,
-                                color = PinterestBlack
-                            )
-                            Text(
-                                "Images stay on the board as loose pins.",
-                                fontSize = 11.sp,
-                                color = PinterestTextSecondary
-                            )
-                        }
-                    }
-                }
+                Spacer(modifier = Modifier.height(2.dp))
 
-                Spacer(Modifier.height(8.dp))
-
-                // Option B: Delete album + contents
-                Surface(
-                    shape = RoundedCornerShape(12.dp),
-                    color = PinterestPillGray,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clickable { onDeleteAll() }
-                        .testTag("delete_option_with_contents")
-                ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(32.dp)
-                                .clip(CircleShape)
-                                .background(PinterestRed.copy(alpha = 0.15f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.DeleteOutline,
-                                contentDescription = null,
-                                tint = PinterestRed,
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
-                        Spacer(Modifier.width(10.dp))
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                "Delete album + images inside",
-                                fontWeight = FontWeight.SemiBold,
-                                fontSize = 13.sp,
-                                color = PinterestBlack
-                            )
-                            Text(
-                                "Images are permanently removed. Undo is available.",
-                                fontSize = 11.sp,
-                                color = PinterestTextSecondary
-                            )
-                        }
-                    }
-                }
-
-                if (pinCount > 0) {
-                    Spacer(Modifier.height(10.dp))
-                    Text(
-                        "Explicitly selected images are deleted regardless of choice above.",
+                val totalCount = pins.size + album.subAlbums.sumOf { it.pins.size }
+                Text(
+                    text = if (album.subAlbums.isNotEmpty() && pins.isEmpty())
+                        "${album.subAlbums.size} album${if (album.subAlbums.size > 1) "s" else ""} • $totalCount images"
+                    else
+                        "$totalCount image${if (totalCount > 1) "s" else ""}",
+                    style = MaterialTheme.typography.bodySmall.copy(
                         fontSize = 11.sp,
                         color = PinterestTextSecondary
-                    )
+                    ),
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                )
+            }
+        }
+    }
+}
+
+
+@Composable
+fun AlbumPreviewOverlay(
+    album: DateAlbum,
+    onDismiss: () -> Unit
+) {
+    val context = LocalContext.current
+
+    BackHandler {
+        onDismiss()
+    }
+
+    val sampledPins = remember(album) {
+        val all = album.pins
+        if (all.size <= 18) {
+            all
+        } else {
+            val count = 18
+            val step = (all.size - 1).toDouble() / (count - 1).toDouble()
+            (0 until count).map { i ->
+                val idx = (i * step).roundToInt().coerceIn(0, all.size - 1)
+                all[idx]
+            }
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .clickable { onDismiss() }
+            .testTag("album_preview_overlay")
+    ) {
+        BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+            val isLandscape = maxWidth > maxHeight
+            val cols = if (isLandscape) 6 else 3
+            val rows = if (isLandscape) 3 else 6
+            val cellWidth = maxWidth / cols
+            val cellHeight = maxHeight / rows
+
+            Column(modifier = Modifier.fillMaxSize()) {
+                for (r in 0 until rows) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        for (c in 0 until cols) {
+                            val index = r * cols + c
+                            val pin = sampledPins.getOrNull(index)
+                            Box(
+                                modifier = Modifier
+                                    .width(cellWidth)
+                                    .height(cellHeight)
+                                    .padding(0.75.dp)
+                                    .background(Color(0xFF161616)),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (pin != null) {
+                                    AsyncImage(
+                                        model = ImageRequest.Builder(context)
+                                            .data(pin.imageUrl)
+                                            .crossfade(true)
+                                            .build(),
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
-        },
-        confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text("Cancel", color = PinterestBlack)
-            }
-        },
-        shape = RoundedCornerShape(20.dp)
-    )
+        }
+    }
 }
 '''
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(content, encoding="utf-8")
-    log("  ✓ created")
 
 
-# ============================================================
-# PATCH 6 — Gallery screen
-# ============================================================
-def patch_gallery_screen():
-    log("\n=== PATCH: PinBoardGalleryScreen ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+def verify_album_card_fix():
+    """Confirm the rewrite contains all required elements."""
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/AlbumCard.kt"
+    if not f.exists():
+        log("  ✗ file missing"); return False
     t = f.read_text(encoding="utf-8")
+    required = [
+        "import androidx.compose.runtime.getValue",
+        "import androidx.compose.runtime.rememberUpdatedState",
+        "val currentOnClick by rememberUpdatedState(onClick)",
+        "val currentOnLongClick by rememberUpdatedState(onLongClick)",
+        "val currentOnSelectToggle by rememberUpdatedState(onSelectToggle)",
+        "val currentOnSwipePreview by rememberUpdatedState(onSwipePreview)",
+        "if (isSelectionMode) currentOnClick() else currentOnLongClick()",
+        "if (isSelectionMode) currentOnSelectToggle() else currentOnClick()",
+    ]
+    for r in required:
+        if r not in t:
+            log(f"  ✗ MISSING: {r}")
+            return False
+    log("  ✓ all required elements present")
+    return True
+
+
+def patch_album_card_rewrite():
+    log("\n=== PATCH: Rewrite AlbumCard.kt ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/AlbumCard.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    f.write_text(NEW_ALBUM_CARD, encoding="utf-8")
+    log("  ✓ file rewritten")
+    if not verify_album_card_fix():
+        log("  ✗ VERIFICATION FAILED"); sys.exit(1)
+
+
+def harden_headless():
+    """Add more headless props to gradle.properties (KSP AWT NPE mitigation)."""
+    log("\n=== gradle.properties hardening ===")
+    gp = PROJECT_ROOT / "gradle.properties"
+    if not gp.exists(): log("  skip (no file)"); return
+    g = gp.read_text(encoding="utf-8")
     changed = False
-
-    # (a) Album pins sort by dateAddedMillis (both board-level and opened-album)
-    old_sort1 = (
-        '            val albumPins = allPinsForAlbums.filter { it.albumId == entity.id }\n'
-        '                .sortedBy { it.boardPosition }\n'
-    )
-    new_sort1 = (
-        '            val albumPins = allPinsForAlbums.filter { it.albumId == entity.id }\n'
-        '                .sortedByDescending { it.dateAddedMillis }\n'
-    )
-    if old_sort1 in t:
-        t = t.replace(old_sort1, new_sort1, 1); changed = True
-        log("  ✓ album pins sorted by dateAddedMillis")
-
-    # Also the opened-album pins get re-sorted at render
-    old_open = '                    val albumPins = activeAlbum!!.pins\n'
-    new_open = '                    val albumPins = activeAlbum!!.pins.sortedByDescending { it.dateAddedMillis }\n'
-    if old_open in t:
-        t = t.replace(old_open, new_open, 1); changed = True
-        log("  ✓ opened album pins sorted")
-
-    # (b) Collect new state
-    if "val deletedSelectionUndo" not in t and "val deletedPinsUndo by viewModel.deletedPinsUndo" in t:
-        anchor = '    val deletedPinsUndo by viewModel.deletedPinsUndo.collectAsStateWithLifecycle()\n'
-        add = (
-            anchor +
-            '    // (deletedPinsUndo now includes album info for mixed deletes)\n'
-        )
-        # No new state needed — we extended DeletedPinsUndoState
-        pass  # existing collection covers it
-
-    # (c) Delete button routing + dialog state
-    if "showDeleteSelectionDialog" not in t:
-        anchor = '    var showMoveDialog by remember { mutableStateOf(false) }\n'
-        add = (
-            '    var showMoveDialog by remember { mutableStateOf(false) }\n'
-            '    var showDeleteSelectionDialog by remember { mutableStateOf(false) }\n'
-        )
-        if anchor in t:
-            t = t.replace(anchor, add, 1); changed = True
-            log("  ✓ showDeleteSelectionDialog state")
-
-    # (d) Update MultiSelectBottomBar onDeleteSelected
-    old_del = (
-        '                    onDeleteSelected = {\n'
-        '                        if (selectedPinIds.isNotEmpty()) viewModel.deletePinsFromCurrentBoard(selectedPinIds)\n'
-        '                        if (selectedAlbumIds.isNotEmpty()) viewModel.deleteSelectedAlbums()\n'
-        '                    },\n'
-    )
-    new_del = (
-        '                    onDeleteSelected = {\n'
-        '                        if (selectedAlbumIds.isNotEmpty()) {\n'
-        '                            showDeleteSelectionDialog = true\n'
-        '                        } else if (selectedPinIds.isNotEmpty()) {\n'
-        '                            viewModel.deletePinsFromCurrentBoard(selectedPinIds)\n'
-        '                        }\n'
-        '                    },\n'
-    )
-    if old_del in t:
-        t = t.replace(old_del, new_del, 1); changed = True
-        log("  ✓ delete button routes to dialog when albums present")
-
-    # (e) Render DeleteSelectionDialog — insert after the Copy/Move dialogs, before the end of the composable
-    if "DeleteSelectionDialog(" not in t:
-        anchor = '    CopyOrMoveImagesDialog(\n        isOpen = showMoveDialog,\n'
-        # find the closing of Move dialog call; insert after it
-        idx = t.find(anchor)
-        if idx >= 0:
-            # find the closing "    )\n" of Move dialog
-            close_idx = t.find("    )\n", idx)
-            if close_idx >= 0:
-                insert_at = close_idx + len("    )\n")
-                dialog_block = (
-                    '\n'
-                    '    // Delete selection (albums involved) — ask how\n'
-                    '    DeleteSelectionDialog(\n'
-                    '        isOpen = showDeleteSelectionDialog,\n'
-                    '        pinCount = selectedPinIds.size,\n'
-                    '        albumCount = selectedAlbumIds.size,\n'
-                    '        onDismiss = { showDeleteSelectionDialog = false },\n'
-                    '        onDissolve = {\n'
-                    '            viewModel.deleteSelectionAndAlbums(selectedPinIds, selectedAlbumIds, com.example.viewmodel.DeleteSelectionMode.DISSOLVE)\n'
-                    '            showDeleteSelectionDialog = false\n'
-                    '        },\n'
-                    '        onDeleteAll = {\n'
-                    '            viewModel.deleteSelectionAndAlbums(selectedPinIds, selectedAlbumIds, com.example.viewmodel.DeleteSelectionMode.DELETE_WITH_CONTENTS)\n'
-                    '            showDeleteSelectionDialog = false\n'
-                    '        }\n'
-                    '    )\n'
-                )
-                t = t[:insert_at] + dialog_block + t[insert_at:]
-                changed = True
-                log("  ✓ DeleteSelectionDialog rendered")
-
-    # Import DeleteSelectionDialog
-    if "import com.example.ui.dialogs.DeleteSelectionDialog" not in t:
-        t = t.replace(
-            'import com.example.ui.dialogs.DeleteFromAllConfirmationDialog\n',
-            'import com.example.ui.dialogs.DeleteFromAllConfirmationDialog\n'
-            'import com.example.ui.dialogs.DeleteSelectionDialog\n',
-            1,
-        )
-        changed = True
-
-    # (f) Banner button "Move here"/"Copy here"
-    old_banner_row = (
-        '                Text(\n'
-        '                    text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",\n'
-        '                    color = Color.White,\n'
-        '                    fontSize = 13.sp,\n'
-        '                    fontWeight = FontWeight.Medium,\n'
-        '                    modifier = Modifier.weight(1f)\n'
-        '                )\n'
-    )
-    new_banner_row = (
-        '                Text(\n'
-        '                    text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",\n'
-        '                    color = Color.White,\n'
-        '                    fontSize = 13.sp,\n'
-        '                    fontWeight = FontWeight.Medium,\n'
-        '                    modifier = Modifier.weight(1f)\n'
-        '                )\n'
-        '                androidx.compose.material3.TextButton(\n'
-        '                    onClick = { viewModel.executeAlbumTransferToCurrentBoard() },\n'
-        '                    modifier = Modifier.testTag("album_transfer_here_btn")\n'
-        '                ) {\n'
-        '                    Text(\n'
-        '                        text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",\n'
-        '                        color = Color(0xFF64B5F6),\n'
-        '                        fontWeight = FontWeight.Bold,\n'
-        '                        fontSize = 12.sp\n'
-        '                    )\n'
-        '                }\n'
-    )
-    if old_banner_row in t:
-        t = t.replace(old_banner_row, new_banner_row, 1); changed = True
-        log("  ✓ banner Move here / Copy here button")
-
-    # (g) Unified banner display for DeletedPinsUndoState (albums + pins)
-    old_banner_text = (
-        '                        Text(\n'
-        '                            text = "Deleted ${undoState.pins.size} image${if (undoState.pins.size > 1) "s" else ""}",\n'
-    )
-    new_banner_text = (
-        '                        Text(\n'
-        '                            text = run {\n'
-        '                                val pinCount = undoState.pins.size\n'
-        '                                val albumCount = undoState.albums.size\n'
-        '                                when {\n'
-        '                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DISSOLVE && albumCount > 0 && pinCount > 0 ->\n'
-        '                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""}, dissolved $albumCount album${if (albumCount > 1) "s" else ""}"\n'
-        '                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DISSOLVE && albumCount > 0 ->\n'
-        '                                        "Dissolved $albumCount album${if (albumCount > 1) "s" else ""}"\n'
-        '                                    undoState.mode == com.example.viewmodel.DeleteSelectionMode.DELETE_WITH_CONTENTS && albumCount > 0 ->\n'
-        '                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""} + $albumCount album${if (albumCount > 1) "s" else ""}"\n'
-        '                                    else ->\n'
-        '                                        "Deleted $pinCount image${if (pinCount > 1) "s" else ""}"\n'
-        '                                }\n'
-        '                            },\n'
-    )
-    if old_banner_text in t:
-        t = t.replace(old_banner_text, new_banner_text, 1); changed = True
-        log("  ✓ undo banner label (albums + pins)")
-
-    if changed: f.write_text(t, encoding="utf-8")
+    for line in [
+        "systemProp.java.awt.headless=true",
+        "kotlin.daemon.jvmargs=-Xmx2g -Djava.awt.headless=true -Dfile.encoding=UTF-8",
+        "kapt.use.worker.api=true",
+    ]:
+        key = line.split("=")[0]
+        if key not in g:
+            g += "\n" + line + "\n"
+            changed = True
+    if changed:
+        gp.write_text(g, encoding="utf-8")
+        log("  ✓ props added")
+    else:
+        log("  ✓ already present")
 
 
 # ============================================================
-# Standard pipeline (unchanged from prior turns)
+# Standard pipeline
 # ============================================================
 def read_app_version():
     p = PROJECT_ROOT / "app/build.gradle.kts"
@@ -1074,7 +669,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Select-mode round 2: label, save icon, album delete dialog, gestures, banner"])
+        run(["git", "commit", "-m", "Rewrite AlbumCard.kt with correct delegate imports"])
 
 
 def verify_keystore_tracked():
@@ -1223,18 +818,14 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — select-mode fixes round 2")
+    log("PinBoard — AlbumCard rewrite + headless hardening")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_multiselect_bar()
-    patch_copy_move_dialog()
-    patch_album_card()
-    patch_new_delete_dialog()
-    patch_viewmodel()
-    patch_gallery_screen()
+    patch_album_card_rewrite()
+    harden_headless()
 
     ensure_release_keystore()
     patch_build_gradle()
