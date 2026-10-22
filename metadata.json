@@ -1,0 +1,6 @@
+{
+  "name": "PinBoard Gallery",
+  "description": "Pinterest board gallery viewer with masonry layout, board URL importer, infinite scrolling, 2/3/4 column toggles, sorting, multi-select download to PinterestViewerDownloads, and fullscreen gallery viewer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
