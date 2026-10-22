@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery - Fix + Build + Deploy Script
-----------------------------------------------
+PinBoard Gallery - Fix + Build + Deploy Script (self-contained)
+---------------------------------------------------------------
 1. Fixes Disable Arrow Navigation toggle wiring in SettingsDialog call
 2. Ensures gradlew / gradlew.bat / gradle-wrapper.jar exist
 3. Ensures debug.keystore exists (generates if missing)
-4. Writes GitHub Actions workflow
+4. Writes GitHub Actions workflow (with tools-package fix)
 5. Pushes to GitHub (repo: PinBoard)
 6. Triggers CI build, downloads APK
 7. Moves APK into directory from 'Apk Directory.txt'
@@ -26,6 +26,7 @@ PROJECT_ROOT = Path(__file__).parent.resolve()
 REPO_NAME    = "PinBoard"
 ARTIFACT     = "app-debug"
 
+# FIX: pass packages: '' so sdkmanager does not try to install the removed 'tools' package.
 WORKFLOW_YAML = """\
 name: Build APK
 
@@ -47,6 +48,8 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: ''
 
       - name: Accept Android licenses
         run: |
@@ -76,7 +79,8 @@ jobs:
 """
 
 
-def log(msg): print(msg, flush=True)
+def log(msg):
+    print(msg, flush=True)
 
 
 def run(cmd, cwd=None, check=True, capture=False):
@@ -105,7 +109,7 @@ def tool_available(name):
 # ---------- 1. Fix the toggle wiring ----------
 def fix_disable_arrow_navigation():
     log("\n=== [1/8] Fixing Disable Arrow Navigation toggle ===")
-    path = (PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt")
+    path = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not path.exists():
         log(f"ERROR: {path} not found"); sys.exit(1)
 
@@ -130,7 +134,6 @@ def fix_disable_arrow_navigation():
     if old in text:
         text = text.replace(old, new, 1)
     else:
-        # tolerant regex fallback
         m = re.search(
             r"(onTogglePortraitAlbumCards\s*=\s*\{[^}]+\}\s*,\s*\n)(\s*isBrowserTestingVisible\s*=)",
             text,
@@ -299,7 +302,7 @@ def ensure_github_repo():
                               capture_output=True).returncode != 0:
                 sys.exit(1)
         else:
-            log(f"  Created and pushed.")
+            log("  Created and pushed.")
 
     if subprocess.run(["git", "remote", "get-url", "origin"],
                       capture_output=True).returncode != 0:
