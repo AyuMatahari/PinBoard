@@ -7,7 +7,6 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -31,7 +30,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Checklist
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -51,7 +49,6 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,29 +59,32 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
 import com.example.data.local.AppDatabase
 import com.example.data.local.BoardEntity
-import com.example.data.local.CustomAlbumEntity
 import com.example.data.local.PinEntity
 import com.example.model.PinItem
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.PinterestBlack
-import com.example.ui.theme.PinterestPillDarkGray
 import com.example.ui.theme.PinterestPillGray
 import com.example.ui.theme.PinterestRed
 import com.example.ui.theme.PinterestTextSecondary
 import com.example.util.ImageLinkResolver
 import com.example.util.LinkExtractor
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
+
 class ShareTargetActivity : ComponentActivity() {
+
+    @Volatile
+    private var autoSaveJob: Job? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Parse shared payload
         val sharedLinks = mutableListOf<String>()
         val sharedImageUris = mutableListOf<Uri>()
 
@@ -93,46 +93,38 @@ class ShareTargetActivity : ComponentActivity() {
                 if ("text/plain" == intent.type) {
                     val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
                     sharedLinks.addAll(LinkExtractor.extractLinks(sharedText))
-                    if (sharedLinks.isEmpty() && sharedText.isNotBlank()) {
-                        if (sharedText.startsWith("http://") || sharedText.startsWith("https://")) {
-                            sharedLinks.add(sharedText.trim())
-                        }
+                    if (sharedLinks.isEmpty() && sharedText.isNotBlank() &&
+                        (sharedText.startsWith("http://") || sharedText.startsWith("https://"))) {
+                        sharedLinks.add(sharedText.trim())
                     }
                 } else if (intent.type?.startsWith("image/") == true) {
-                    androidx.core.content.IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let { uri ->
-                        sharedImageUris.add(uri)
-                    }
+                    androidx.core.content.IntentCompat
+                        .getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                        ?.let { sharedImageUris.add(it) }
                 }
             }
             Intent.ACTION_SEND_MULTIPLE -> {
                 if (intent.type?.startsWith("image/") == true) {
-                    androidx.core.content.IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)?.let { list ->
-                        sharedImageUris.addAll(list)
-                    }
+                    androidx.core.content.IntentCompat
+                        .getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                        ?.let { sharedImageUris.addAll(it) }
                 }
             }
         }
 
-        // Auto-save to default board immediately
-        autoSaveToDefaultBoard(sharedLinks, sharedImageUris)
+        // Auto-save to default board immediately (async).
+        autoSaveJob = lifecycleScope.launch(Dispatchers.IO) {
+            autoSaveToDefaultBoardSync(sharedLinks, sharedImageUris)
+        }
 
         setContent {
             MyApplicationTheme {
                 FloatingShareDialog(
                     sharedLinks = sharedLinks,
                     sharedImageUris = sharedImageUris,
-                    onClose = {
-                        saveAndFinish(
-                            targetBoardIds = emptyList(),
-                            links = sharedLinks,
-                            imageUris = sharedImageUris,
-                            extractMultipleImages = false,
-                            putIntoAlbum = false,
-                            targetAlbumId = null
-                        )
-                    },
+                    onClose = { finish() },
                     onSaveToBoards = { targetBoardIds, extractMultiple ->
-                        saveAndFinish(
+                        saveToBoards(
                             targetBoardIds = targetBoardIds,
                             links = sharedLinks,
                             imageUris = sharedImageUris,
@@ -144,257 +136,160 @@ class ShareTargetActivity : ComponentActivity() {
         }
     }
 
-    private fun autoSaveToDefaultBoard(links: List<String>, imageUris: List<Uri>) {
-        val appCtx = applicationContext
-        kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
-            try {
-                val dao = AppDatabase.getDatabase(appCtx).boardDao()
-                ensureDefaultBoardsExist(dao)
-                val allBoards = dao.getAllBoards()
-                val defaultBoard = allBoards.firstOrNull { it.isDefault }
-                    ?: allBoards.firstOrNull { it.id == "board_dump" }
-                    ?: allBoards.firstOrNull() ?: return@launch
-                val resolvedPins = mutableListOf<PinItem>()
-                for (link in links) {
-                    resolvedPins.add(ImageLinkResolver.resolveLink(link, defaultBoard.title))
-                }
-                for (uri in imageUris) {
-                    val uriStr = uri.toString()
-                    resolvedPins.add(PinItem(
-                        id = ImageLinkResolver.generateDeterministicPinId(uriStr),
-                        title = "Shared Photo",
-                        imageUrl = uriStr,
-                        thumbnailUrl = uriStr,
-                        author = "Shared from device",
-                        sourceUrl = uriStr,
-                        dateAddedMillis = System.currentTimeMillis()
-                    ))
-                }
-                val existingIds = dao.getPinIdsForBoard(defaultBoard.id).toSet()
-                val existingUrls = dao.getImageUrlsForBoard(defaultBoard.id).toSet()
-                val toInsert = resolvedPins.filter { !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl) }
-                if (toInsert.isNotEmpty()) {
-                    dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })
-                }
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(
-                        this@ShareTargetActivity,
-                        "Saved to ${defaultBoard.title}",
-                        Toast.LENGTH_SHORT
-                    ).show()
-                }
-            } catch (t: Throwable) {
-                t.printStackTrace()
+    private suspend fun autoSaveToDefaultBoardSync(links: List<String>, imageUris: List<Uri>) {
+        try {
+            val dao = AppDatabase.getDatabase(applicationContext).boardDao()
+            ensureDefaultBoardsExist(dao)
+            val allBoards = dao.getAllBoards()
+            val defaultBoard = allBoards.firstOrNull { it.isDefault }
+                ?: allBoards.firstOrNull { it.id == "board_dump" }
+                ?: allBoards.firstOrNull() ?: return
+
+            val resolvedPins = mutableListOf<PinItem>()
+            for (link in links) resolvedPins.add(ImageLinkResolver.resolveLink(link, defaultBoard.title))
+            for (uri in imageUris) {
+                val s = uri.toString()
+                resolvedPins.add(PinItem(
+                    id = ImageLinkResolver.generateDeterministicPinId(s),
+                    title = "Shared Photo", imageUrl = s, thumbnailUrl = s,
+                    author = "Shared from device", sourceUrl = s,
+                    dateAddedMillis = System.currentTimeMillis()
+                ))
             }
+            val existingIds = dao.getPinIdsForBoard(defaultBoard.id).toSet()
+            val existingUrls = dao.getImageUrlsForBoard(defaultBoard.id).toSet()
+            val toInsert = resolvedPins.filter {
+                !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
+            }
+            if (toInsert.isNotEmpty()) {
+                dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })
+            }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    this@ShareTargetActivity,
+                    "Saved to ${defaultBoard.title}",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        } catch (t: Throwable) {
+            t.printStackTrace()
         }
     }
 
-    private fun saveAndFinish(
+    private fun saveToBoards(
         targetBoardIds: List<String>,
         links: List<String>,
         imageUris: List<Uri>,
-        extractMultipleImages: Boolean = false
+        extractMultipleImages: Boolean
     ) {
-        val appCtx = applicationContext
-        lifecycleScopeLaunch {
-            val dao = AppDatabase.getDatabase(appCtx).boardDao()
+        lifecycleScope.launch {
+            try {
+                autoSaveJob?.join()
+                withContext(Dispatchers.IO) {
+                    val appCtx = applicationContext
+                    val dao = AppDatabase.getDatabase(appCtx).boardDao()
+                    ensureDefaultBoardsExist(dao)
+                    val allBoards = dao.getAllBoards()
+                    val defaultBoard = allBoards.firstOrNull { it.isDefault }
+                        ?: allBoards.firstOrNull { it.id == "board_dump" }
+                        ?: allBoards.firstOrNull()
 
-            // Ensure baseline boards exist
-            ensureDefaultBoardsExist(dao)
-
-            val allBoards = withContext(Dispatchers.IO) { dao.getAllBoards() }
-            val defaultBoard = allBoards.firstOrNull { it.isDefault }
-                ?: allBoards.firstOrNull { it.id == "board_dump" }
-                ?: allBoards.firstOrNull { it.id == "board_my_save" }
-                ?: allBoards.firstOrNull()
-
-            val chosenBoards = if (targetBoardIds.isEmpty() && targetAlbumId == null) {
-                listOfNotNull(defaultBoard)
-            } else if (targetBoardIds.isNotEmpty()) {
-                allBoards.filter { targetBoardIds.contains(it.id) }
-            } else {
-                // If targetAlbumId is selected without board, look up board of the album
-                val album = withContext(Dispatchers.IO) { dao.getAlbumById(targetAlbumId!!) }
-                if (album != null) {
-                    allBoards.filter { it.id == album.boardId }
-                } else {
-                    listOfNotNull(defaultBoard)
-                }
-            }
-
-            // Resolve items to PinItems
-            val resolvedPins = mutableListOf<PinItem>()
-            withContext(Dispatchers.IO) {
-                for (link in links) {
-                    if (extractMultipleImages) {
-                        val multiple = ImageLinkResolver.resolveMultipleLinks(link)
-                        resolvedPins.addAll(multiple)
+                    val chosenBoards = if (targetBoardIds.isEmpty()) {
+                        listOfNotNull(defaultBoard)
                     } else {
-                        val resolved = ImageLinkResolver.resolveLink(link)
-                        resolvedPins.add(resolved)
+                        allBoards.filter { targetBoardIds.contains(it.id) }
                     }
-                }
-                for (uri in imageUris) {
-                    val uriStr = uri.toString()
-                    val pin = PinItem(
-                        id = ImageLinkResolver.generateDeterministicPinId(uriStr),
-                        title = "Shared Photo",
-                        imageUrl = uriStr,
-                        thumbnailUrl = uriStr,
-                        author = "Shared from device",
-                        sourceUrl = uriStr,
-                        dateAddedMillis = System.currentTimeMillis()
-                    )
-                    resolvedPins.add(pin)
-                }
-            }
 
-            // Save to chosen boards, and domain-matched custom boards
-            withContext(Dispatchers.IO) {
-                val matchedDomainBoards = if (targetAlbumId == null) {
-                    allBoards.filter { b ->
-                        b.isCustom && resolvedPins.any { pin ->
-                            LinkExtractor.matchesAnyDomain(pin.sourceUrl.ifBlank { pin.imageUrl }, b.customDomains.split(","))
+                    val resolvedPins = mutableListOf<PinItem>()
+                    for (link in links) {
+                        if (extractMultipleImages) {
+                            resolvedPins.addAll(ImageLinkResolver.resolveMultipleLinks(link))
+                        } else {
+                            resolvedPins.add(ImageLinkResolver.resolveLink(link))
                         }
                     }
-                } else emptyList()
-
-                val allTargetBoards = (chosenBoards + matchedDomainBoards).distinctBy { it.id }
-
-                for (targetBoard in allTargetBoards) {
-                    var currentAlbumId = targetAlbumId
-
-                    // If user checked putIntoAlbum, create a CustomAlbumEntity
-                    if (putIntoAlbum && resolvedPins.isNotEmpty()) {
-                        val albumId = "album_${System.currentTimeMillis()}_${(1000..9999).random()}"
-                        val albumTitle = resolvedPins.firstOrNull()?.title?.substringBefore(" (") ?: "Album"
-                        val albumEntity = CustomAlbumEntity(
-                            id = albumId,
-                            boardId = targetBoard.id,
-                            parentAlbumId = targetAlbumId,
-                            title = albumTitle,
-                            sourceUrl = links.firstOrNull() ?: "",
+                    for (uri in imageUris) {
+                        val s = uri.toString()
+                        resolvedPins.add(PinItem(
+                            id = ImageLinkResolver.generateDeterministicPinId(s),
+                            title = "Shared Photo", imageUrl = s, thumbnailUrl = s,
+                            author = "Shared from device", sourceUrl = s,
                             dateAddedMillis = System.currentTimeMillis()
-                        )
-                        dao.insertAlbum(albumEntity)
-                        currentAlbumId = albumId
+                        ))
                     }
 
-                    val existingIds = dao.getPinIdsForBoard(targetBoard.id).toSet()
-                    val existingUrls = dao.getImageUrlsForBoard(targetBoard.id).toSet()
-
-                    val pinsToInsert = mutableListOf<PinEntity>()
-                    resolvedPins.forEachIndexed { index, pin ->
-                        if (!existingIds.contains(pin.id) && !existingUrls.contains(pin.imageUrl)) {
-                            pinsToInsert.add(
-                                PinEntity.fromPinItem(
-                                    pin.copy(albumId = currentAlbumId),
-                                    targetBoard.id,
-                                    index
-                                )
+                    val matchedDomainBoards = allBoards.filter { b ->
+                        b.isCustom && resolvedPins.any { pin ->
+                            LinkExtractor.matchesAnyDomain(
+                                pin.sourceUrl.ifBlank { pin.imageUrl },
+                                b.customDomains.split(",")
                             )
                         }
                     }
+                    val allTargets = (chosenBoards + matchedDomainBoards).distinctBy { it.id }
+                    val defaultId = defaultBoard?.id
 
-                    if (pinsToInsert.isNotEmpty()) {
-                        dao.insertPins(pinsToInsert)
+                    // If user explicitly picked boards that don't include default, remove from default
+                    if (defaultId != null && targetBoardIds.isNotEmpty() && !targetBoardIds.contains(defaultId)) {
+                        dao.deletePinsFromBoard(defaultId, resolvedPins.map { it.id })
+                    }
+
+                    for (target in allTargets) {
+                        val existingIds = dao.getPinIdsForBoard(target.id).toSet()
+                        val existingUrls = dao.getImageUrlsForBoard(target.id).toSet()
+                        val toInsert = mutableListOf<PinEntity>()
+                        resolvedPins.forEachIndexed { i, p ->
+                            if (!existingIds.contains(p.id) && !existingUrls.contains(p.imageUrl)) {
+                                toInsert.add(PinEntity.fromPinItem(p, target.id, i))
+                            }
+                        }
+                        if (toInsert.isNotEmpty()) dao.insertPins(toInsert)
                     }
                 }
-            }
-
-            val savedNames = chosenBoards.joinToString(", ") { it.title }
-            withContext(Dispatchers.Main) {
-                val msg = if (putIntoAlbum) "Saved as Album to $savedNames!" else "Saved to $savedNames!"
-                Toast.makeText(appCtx, msg, Toast.LENGTH_SHORT).show()
-                finish()
-            }
-        }
-    }
-
-    private fun lifecycleScopeLaunch(block: suspend () -> Unit) {
-        kotlinx.coroutines.CoroutineScope(Dispatchers.Main).launch {
-            try {
-                block()
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(applicationContext, "Saved", Toast.LENGTH_SHORT).show()
+                    finish()
+                }
             } catch (t: Throwable) {
                 t.printStackTrace()
-                Toast.makeText(applicationContext, "Saved to board", Toast.LENGTH_SHORT).show()
-                finish()
+                withContext(Dispatchers.Main) { finish() }
             }
         }
     }
 
     private suspend fun ensureDefaultBoardsExist(dao: com.example.data.local.BoardDao) {
         withContext(Dispatchers.IO) {
-            val dump = dao.getBoardById("board_dump")
-            if (dump == null) {
-                dao.insertBoard(
-                    BoardEntity(
-                        id = "board_dump",
-                        title = "Dump board",
-                        slug = "dump",
-                        ownerUsername = "you",
-                        ownerDisplayName = "Dump board",
-                        ownerAvatarUrl = "",
-                        pinCount = 0,
-                        followerCount = 0,
-                        boardUrl = "custom://dump",
-                        description = "Default dump board for quick saves and fallback",
-                        isCustom = true,
-                        customDomains = "",
-                        isDefault = true,
-                        isSpecialNonDeletable = true
-                    )
-                )
-                val mySaveExisting = dao.getBoardById("board_my_save")
-                if (mySaveExisting != null && mySaveExisting.isDefault) {
-                    dao.insertBoard(mySaveExisting.copy(isDefault = false))
-                }
+            if (dao.getBoardById("board_dump") == null) {
+                dao.insertBoard(BoardEntity(
+                    id = "board_dump", title = "Dump board", slug = "dump",
+                    ownerUsername = "you", ownerDisplayName = "Dump board", ownerAvatarUrl = "",
+                    pinCount = 0, followerCount = 0, boardUrl = "custom://dump",
+                    description = "Default dump board", isCustom = true, customDomains = "",
+                    isDefault = true, isSpecialNonDeletable = true
+                ))
             }
-            val mySave = dao.getBoardById("board_my_save")
-            if (mySave == null) {
-                dao.insertBoard(
-                    BoardEntity(
-                        id = "board_my_save",
-                        title = "My Save",
-                        slug = "my-save",
-                        ownerUsername = "you",
-                        ownerDisplayName = "My Save",
-                        ownerAvatarUrl = "",
-                        pinCount = 0,
-                        followerCount = 0,
-                        boardUrl = "custom://my_save",
-                        description = "Custom board for saved items",
-                        isCustom = true,
-                        customDomains = "",
-                        isDefault = false,
-                        isSpecialNonDeletable = true
-                    )
-                )
+            if (dao.getBoardById("board_my_save") == null) {
+                dao.insertBoard(BoardEntity(
+                    id = "board_my_save", title = "My Save", slug = "my-save",
+                    ownerUsername = "you", ownerDisplayName = "My Save", ownerAvatarUrl = "",
+                    pinCount = 0, followerCount = 0, boardUrl = "custom://my_save",
+                    description = "Custom board for saved items", isCustom = true, customDomains = "",
+                    isDefault = false, isSpecialNonDeletable = true
+                ))
             }
-            val favorites = dao.getBoardById("board_favorites")
-            if (favorites == null) {
-                dao.insertBoard(
-                    BoardEntity(
-                        id = "board_favorites",
-                        title = "Favorites",
-                        slug = "favorites",
-                        ownerUsername = "you",
-                        ownerDisplayName = "Favorites",
-                        ownerAvatarUrl = "",
-                        pinCount = 0,
-                        followerCount = 0,
-                        boardUrl = "custom://favorites",
-                        description = "Your favorite images",
-                        isCustom = true,
-                        customDomains = "",
-                        isDefault = false,
-                        isSpecialNonDeletable = true
-                    )
-                )
+            if (dao.getBoardById("board_favorites") == null) {
+                dao.insertBoard(BoardEntity(
+                    id = "board_favorites", title = "Favorites", slug = "favorites",
+                    ownerUsername = "you", ownerDisplayName = "Favorites", ownerAvatarUrl = "",
+                    pinCount = 0, followerCount = 0, boardUrl = "custom://favorites",
+                    description = "Your favorite images", isCustom = true, customDomains = "",
+                    isDefault = false, isSpecialNonDeletable = true
+                ))
             }
         }
     }
 }
+
 
 @OptIn(ExperimentalLayoutApi::class, androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
@@ -409,7 +304,6 @@ private fun FloatingShareDialog(
     var isLoadingBoards by remember { mutableStateOf(true) }
     var isSelectMode by remember { mutableStateOf(false) }
     val selectedBoardIds = remember { mutableStateListOf<String>() }
-
     var extractMultipleImages by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
@@ -417,8 +311,11 @@ private fun FloatingShareDialog(
             val dao = AppDatabase.getDatabase(context).boardDao()
             val list = dao.getAllBoards()
             boards = list
-            val defaultB = list.firstOrNull { it.isDefault } ?: list.firstOrNull { it.id == "board_dump" } ?: list.firstOrNull { it.id == "board_my_save" } ?: list.firstOrNull()
-            defaultB?.let { selectedBoardIds.add(it.id) }
+            val def = list.firstOrNull { it.isDefault }
+                ?: list.firstOrNull { it.id == "board_dump" }
+                ?: list.firstOrNull { it.id == "board_my_save" }
+                ?: list.firstOrNull()
+            def?.let { selectedBoardIds.add(it.id) }
             isLoadingBoards = false
         }
     }
@@ -426,27 +323,17 @@ private fun FloatingShareDialog(
     val itemCount = sharedLinks.size + sharedImageUris.size
 
     Box(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.55f)),
+        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)),
         contentAlignment = Alignment.Center
     ) {
         Card(
-            modifier = Modifier
-                .fillMaxWidth(0.92f)
-                .wrapContentHeight()
-                .clickable(enabled = false) {}
+            modifier = Modifier.fillMaxWidth(0.92f).wrapContentHeight()
                 .testTag("floating_share_dialog_card"),
             shape = RoundedCornerShape(24.dp),
             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
         ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(20.dp)
-            ) {
-                // Header
+            Column(modifier = Modifier.fillMaxWidth().padding(20.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
@@ -454,183 +341,98 @@ private fun FloatingShareDialog(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Box(
-                            modifier = Modifier
-                                .size(36.dp)
-                                .clip(CircleShape)
+                            modifier = Modifier.size(36.dp).clip(CircleShape)
                                 .background(PinterestRed.copy(alpha = 0.12f)),
                             contentAlignment = Alignment.Center
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Share,
-                                contentDescription = null,
-                                tint = PinterestRed,
-                                modifier = Modifier.size(20.dp)
-                            )
+                            Icon(Icons.Default.Share, null, tint = PinterestRed, modifier = Modifier.size(20.dp))
                         }
-                        Spacer(modifier = Modifier.width(10.dp))
+                        Spacer(Modifier.width(10.dp))
                         Column {
+                            Text("Save to PinBoard", fontWeight = FontWeight.Bold, fontSize = 17.sp)
                             Text(
-                                text = "Save to PinBoard",
-                                fontWeight = FontWeight.Bold,
-                                fontSize = 17.sp,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = if (itemCount > 1) "$itemCount items detected" else "1 item detected",
-                                fontSize = 12.sp,
-                                color = PinterestTextSecondary
+                                if (itemCount > 1) "$itemCount items detected" else "1 item detected",
+                                fontSize = 12.sp, color = PinterestTextSecondary
                             )
                         }
                     }
-
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        IconButton(
-                            onClick = { isSelectMode = !isSelectMode },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Checklist,
-                                contentDescription = "Toggle multi-select mode",
+                        IconButton(onClick = { isSelectMode = !isSelectMode }, modifier = Modifier.size(32.dp)) {
+                            Icon(Icons.Default.Checklist, "Toggle multi-select",
                                 tint = if (isSelectMode) PinterestRed else PinterestTextSecondary,
-                                modifier = Modifier.size(20.dp)
-                            )
+                                modifier = Modifier.size(20.dp))
                         }
-                        Spacer(modifier = Modifier.width(4.dp))
-                        IconButton(
-                            onClick = onClose,
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Close and Save to Default",
-                                tint = PinterestTextSecondary,
-                                modifier = Modifier.size(18.dp)
-                            )
+                        IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
+                            Icon(Icons.Default.Close, "Close",
+                                tint = PinterestTextSecondary, modifier = Modifier.size(18.dp))
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(Modifier.height(10.dp))
 
-                // Checklist 1: Add multiple main images from webpage (unchecked by default)
                 if (sharedLinks.isNotEmpty()) {
                     Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clickable {
-                                extractMultipleImages = !extractMultipleImages
-                                if (!extractMultipleImages) putIntoAlbum = false
-                            }
+                        modifier = Modifier.fillMaxWidth()
+                            .combinedClickable(
+                                onClick = { extractMultipleImages = !extractMultipleImages },
+                                onLongClick = { extractMultipleImages = !extractMultipleImages }
+                            )
                             .padding(vertical = 4.dp)
-                            .testTag("share_extract_multiple_checkbox")
+                            .testTag("share_extract_multiple_checkbox"),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
                         Checkbox(
                             checked = extractMultipleImages,
-                            onCheckedChange = {
-                                extractMultipleImages = it
-                            },
+                            onCheckedChange = { extractMultipleImages = it },
                             colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
                         )
-                        Spacer(modifier = Modifier.width(4.dp))
+                        Spacer(Modifier.width(4.dp))
                         Column {
-                            Text(
-                                text = "Add multiple main images from webpage",
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                            Text(
-                                text = "Extract content images in order (first to last)",
-                                fontSize = 10.sp,
-                                color = PinterestTextSecondary
-                            )
-                        }
-                    }
-
-                    // Checklist 2: Shown when extractMultipleImages is checked
-                    if (extractMultipleImages) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(start = 24.dp)
-                                .clickable { putIntoAlbum = !putIntoAlbum }
-                                .padding(vertical = 4.dp)
-                                .testTag("share_put_into_album_checkbox")
-                        ) {
-                            Checkbox(
-                                checked = putIntoAlbum,
-                                onCheckedChange = { putIntoAlbum = it },
-                                colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Column {
-                                Text(
-                                    text = "Put into album",
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onSurface
-                                )
-                                Text(
-                                    text = "Save as an album inside the chosen board",
-                                    fontSize = 10.sp,
-                                    color = PinterestTextSecondary
-                                )
-                            }
+                            Text("Add multiple main images from webpage",
+                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Extract content images in order",
+                                fontSize = 10.sp, color = PinterestTextSecondary)
                         }
                     }
                 }
 
-                Spacer(modifier = Modifier.height(10.dp))
-
+                Spacer(Modifier.height(10.dp))
                 Text(
-                    text = if (isSelectMode) "Select multiple destination boards:" else "Choose destination board (press & hold for multi-select):",
-                    style = MaterialTheme.typography.bodySmall.copy(
-                        fontSize = 12.sp,
-                        color = PinterestTextSecondary
-                    )
+                    if (isSelectMode) "Select multiple destination boards:"
+                    else "Choose destination board (already saved to default):",
+                    fontSize = 12.sp, color = PinterestTextSecondary
                 )
-
-                Spacer(modifier = Modifier.height(10.dp))
+                Spacer(Modifier.height(10.dp))
 
                 if (isLoadingBoards) {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(100.dp),
-                        contentAlignment = Alignment.Center
-                    ) {
+                    Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
                         CircularProgressIndicator(color = PinterestRed, strokeWidth = 2.dp)
                     }
                 } else {
                     FlowRow(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .verticalScroll(rememberScrollState()),
+                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         boards.forEach { board ->
-                            val isSelected = selectedBoardIds.contains(board.id) && selectedAlbumId == null
+                            val isSelected = selectedBoardIds.contains(board.id)
                             Surface(
                                 shape = RoundedCornerShape(16.dp),
                                 color = if (isSelected) PinterestBlack else PinterestPillGray,
                                 modifier = Modifier
                                     .combinedClickable(
                                         onClick = {
-                                            selectedAlbumId = null
                                             if (isSelectMode) {
                                                 if (isSelected) selectedBoardIds.remove(board.id)
                                                 else selectedBoardIds.add(board.id)
                                             } else {
                                                 selectedBoardIds.clear()
                                                 selectedBoardIds.add(board.id)
-                                                onSaveToBoards(listOf(board.id), extractMultipleImages, putIntoAlbum, null)
+                                                onSaveToBoards(listOf(board.id), extractMultipleImages)
                                             }
                                         },
                                         onLongClick = {
-                                            selectedAlbumId = null
                                             isSelectMode = true
                                             if (isSelected) selectedBoardIds.remove(board.id)
                                             else selectedBoardIds.add(board.id)
@@ -643,51 +445,34 @@ private fun FloatingShareDialog(
                                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
                                 ) {
                                     if (isSelected) {
-                                        Icon(
-                                            imageVector = Icons.Default.Check,
-                                            contentDescription = null,
-                                            tint = Color.White,
-                                            modifier = Modifier.size(14.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(14.dp))
+                                        Spacer(Modifier.width(6.dp))
                                     }
                                     Text(
-                                        text = board.title,
+                                        board.title,
                                         fontSize = 13.sp,
                                         fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
                                         color = if (isSelected) Color.White else PinterestBlack,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
+                                        maxLines = 1, overflow = TextOverflow.Ellipsis
                                     )
                                     if (board.isDefault) {
-                                        Spacer(modifier = Modifier.width(4.dp))
-                                        Text(
-                                            text = "(Default)",
-                                            fontSize = 10.sp,
-                                            color = if (isSelected) Color.LightGray else PinterestTextSecondary
-                                        )
+                                        Spacer(Modifier.width(4.dp))
+                                        Text("(Default)", fontSize = 10.sp,
+                                            color = if (isSelected) Color.LightGray else PinterestTextSecondary)
                                     }
                                 }
                             }
                         }
-
                     }
                 }
 
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Bottom actions
+                Spacer(Modifier.height(16.dp))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = "Exiting will save to default board",
-                        fontSize = 11.sp,
-                        color = PinterestTextSecondary
-                    )
-
+                    Text("X exits · already in default", fontSize = 11.sp, color = PinterestTextSecondary)
                     Button(
                         onClick = {
                             if (selectedBoardIds.isNotEmpty()) {
@@ -701,10 +486,8 @@ private fun FloatingShareDialog(
                         modifier = Modifier.testTag("share_dialog_save_btn")
                     ) {
                         Text(
-                            text = if (selectedBoardIds.size > 1) "Save to ${selectedBoardIds.size} Boards"
-                            else "Save",
-                            color = Color.White,
-                            fontWeight = FontWeight.Bold
+                            if (selectedBoardIds.size > 1) "Save to ${selectedBoardIds.size} Boards" else "Save",
+                            color = Color.White, fontWeight = FontWeight.Bold
                         )
                     }
                 }

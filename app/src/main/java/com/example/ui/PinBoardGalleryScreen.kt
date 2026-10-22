@@ -58,6 +58,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -213,19 +214,6 @@ fun PinBoardGalleryScreen(
         }
     }
 
-    // Scroll to album when requested (after combine/creation)
-    LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {
-        val targetId = scrollToAlbumId ?: return@LaunchedEffect
-        val idx = galleryItemsPlaceholder.indexOfFirst { it.album?.id == targetId }
-        if (idx >= 0) {
-            val hc = (if (browserWorker != null && isBrowserTestingVisible) 1 else 0) +
-                     (if (currentBoard != null) 1 else 0) +
-                     (if (isLoading) 1 else 0)
-            boardGridState.animateScrollToItem(hc + idx)
-            viewModel.consumeScrollRequest()
-        }
-    }
-
     // Handle back button navigation from opened Album
     BackHandler(enabled = activeAlbum != null) {
         viewModel.closeAlbum()
@@ -287,6 +275,19 @@ fun PinBoardGalleryScreen(
         items
     }
     val galleryItemsPlaceholder = galleryItems
+
+    // Scroll to album when requested (after combine/creation)
+    LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {
+        val targetId = scrollToAlbumId ?: return@LaunchedEffect
+        val idx = galleryItemsPlaceholder.indexOfFirst { it.album?.id == targetId }
+        if (idx >= 0) {
+            val hc = (if (browserWorker != null && isBrowserTestingVisible) 1 else 0) +
+                     (if (currentBoard != null) 1 else 0) +
+                     (if (isLoading) 1 else 0)
+            boardGridState.animateScrollToItem(hc + idx)
+            viewModel.consumeScrollRequest()
+        }
+    }
 
     // Date groups for "separate images by date" gallery layout
     val dateGroups = remember(displayedPins, separateByDate, topLevelCustomAlbums) {
@@ -1405,8 +1406,9 @@ fun PinBoardGalleryScreen(
         }
     }
 
-    // Pending album transfer banner (bottom, hides select bar)
-    pendingAlbumTransfer?.let { transfer ->
+    // Pending album transfer banner (wrapped in full-screen Box for .align)
+    androidx.compose.foundation.layout.Box(modifier = Modifier.fillMaxSize()) {
+        pendingAlbumTransfer?.let { transfer ->
         androidx.compose.material3.Surface(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -1439,6 +1441,7 @@ fun PinBoardGalleryScreen(
                     modifier = Modifier.weight(1f)
                 )
             }
+        }
         }
     }
 

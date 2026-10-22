@@ -1,8 +1,6 @@
 name: Build APK
-
 on:
   workflow_dispatch:
-
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11,31 +9,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '17'
+        with: { distribution: temurin, java-version: '17' }
       - uses: android-actions/setup-android@v3
-        with:
-          packages: ''
+        with: { packages: '' }
       - run: yes | sdkmanager --licenses >/dev/null 2>&1 || true
       - run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
       - name: Verify keystore
         run: |
-          [ -f release.keystore ] || { echo "release.keystore missing"; exit 1; }
-          keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload || { echo "alias 'upload' not found"; exit 1; }
+          [ -f release.keystore ] || { echo "no keystore"; exit 1; }
+          keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload
       - uses: gradle/actions/setup-gradle@v3
-        with:
-          gradle-version: wrapper
+        with: { gradle-version: wrapper }
       - run: chmod +x ./gradlew
       - run: ./gradlew :app:assembleRelease --stacktrace --no-daemon
-      - name: Verify signature
+      - name: Verify APK
         run: |
           APK=$(find app/build/outputs/apk/release -name "*.apk" | head -1)
-          [ -n "$APK" ] || { echo "no APK"; exit 1; }
+          [ -n "$APK" ] || exit 1
           BT=$(ls -d $ANDROID_HOME/build-tools/* | sort -V | tail -1)
           "$BT/apksigner" verify --verbose --print-certs "$APK"
       - uses: actions/upload-artifact@v4
-        with:
-          name: app-release
-          path: app/build/outputs/apk/release/*.apk
-          if-no-files-found: error
+        with: { name: app-release, path: app/build/outputs/apk/release/*.apk, if-no-files-found: error }
