@@ -266,7 +266,7 @@ object ImageLinkResolver {
                         width = cand.width ?: 1080,
                         height = cand.height ?: 1440,
                         dominantColor = 0xFF2D2D2DL,
-                        dateAddedMillis = baseTime + (index * 10L), // Strictly increasing for stable sorting
+                        dateAddedMillis = baseTime + ((candidateList.size - index) * 10L), // First image gets highest date
                         boardPosition = index,
                         fileSizeKb = 250L,
                         mimeType = guessMimeType(cand.url),
