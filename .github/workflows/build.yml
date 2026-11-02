@@ -17,7 +17,7 @@ jobs:
       - run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
       - name: Verify keystore
         run: |
-          [ -f release.keystore ] || { echo "no keystore"; exit 1; }
+          [ -f release.keystore ] || exit 1
           keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload
       - uses: gradle/actions/setup-gradle@v3
         with: { gradle-version: wrapper }

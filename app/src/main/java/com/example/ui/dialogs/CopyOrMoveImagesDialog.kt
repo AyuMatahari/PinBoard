@@ -85,8 +85,13 @@ fun CopyOrMoveImagesDialog(
     val context = LocalContext.current
     val coroutineScope = rememberCoroutineScope()
 
-    // MOVE now includes the current board (moving to current board = reorder to top)
-    val selectableBoards = remember(availableBoards) { availableBoards }
+    val selectableBoards = remember(availableBoards, currentBoardId, mode) {
+        if (mode == BoardTransferMode.MOVE && !currentBoardId.isNullOrBlank()) {
+            availableBoards.filter { it.id != currentBoardId }
+        } else {
+            availableBoards
+        }
+    }
 
     val selectedBoardIds = remember { mutableStateListOf<String>() }
 
@@ -357,7 +362,7 @@ fun CopyOrMoveImagesDialog(
                             )
                             Spacer(modifier = Modifier.width(10.dp))
                             Text(
-                                text = "${if (isMove) "Move" else "Copy"} to Album",
+                                text = "${if (isMove) "Move" else "Copy"} to Album/Board",
                                 fontWeight = FontWeight.Bold,
                                 fontSize = 13.sp,
                                 color = PinterestBlack

@@ -146,7 +146,9 @@ class ShareTargetActivity : ComponentActivity() {
                     !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
                 }
                 if (toInsert.isNotEmpty()) {
-                    dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })
+                    dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->
+                        PinEntity.fromPinItem(p.copy(albumId = null), defaultBoard.id, i)
+                    })
                 }
                 withContext(Dispatchers.Main) {
                     Toast.makeText(appCtx, "Saved to ${defaultBoard.title}", Toast.LENGTH_SHORT).show()
@@ -163,12 +165,12 @@ class ShareTargetActivity : ComponentActivity() {
                     sharedImageUris = sharedImageUris,
                     onClose = { finish() },
                     onSaveToSelected = { boards, extractMultiple ->
+                        finish()
                         performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)
-                        finish()
                     },
-                    onHoldBoard = { boardId ->
-                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), false)
+                    onHoldBoard = { boardId, extractMultiple ->
                         finish()
+                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple)
                     }
                 )
             }
@@ -209,7 +211,7 @@ class ShareTargetActivity : ComponentActivity() {
                         !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
                     }
                     if (toInsert.isNotEmpty()) {
-                        dao.insertPins(toInsert.mapIndexed { i, p ->
+                        dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->
                             PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)
                         })
                     }
@@ -295,7 +297,7 @@ private fun FloatingShareDialog(
     sharedImageUris: List<Uri>,
     onClose: () -> Unit,
     onSaveToSelected: (List<String>, Boolean) -> Unit,
-    onHoldBoard: (String) -> Unit
+    onHoldBoard: (String, Boolean) -> Unit
 ) {
     val context = LocalContext.current
     var boards by remember { mutableStateOf<List<BoardEntity>>(emptyList()) }
@@ -416,7 +418,7 @@ private fun FloatingShareDialog(
                                             if (isSelected) selectedBoardIds.remove(board.id)
                                             else selectedBoardIds.add(board.id)
                                         },
-                                        onLongClick = { onHoldBoard(board.id) }
+                                        onLongClick = { onHoldBoard(board.id, extractMultipleImages) }
                                     )
                                     .testTag("share_target_board_${board.id}")
                             ) {

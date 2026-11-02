@@ -1717,7 +1717,7 @@ class PinBoardViewModel(
                     }
 
                     if (pinsToInsert.isNotEmpty()) {
-                        dao.insertPins(pinsToInsert)
+                        dao.upsertPinsSafely(pinsToInsert)
                         totalAdded += pinsToInsert.size
                     }
                 }
@@ -2098,20 +2098,11 @@ class PinBoardViewModel(
                         !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
                     }
                     if (newForTarget.isNotEmpty()) {
-                        val targetEntity = dao.getBoardById(targetId)
-                        if (targetEntity != null) {
-                            val existingPins = dao.getPinsForBoard(targetId).map { it.toPinItem() }
-                            val combined = (newForTarget + existingPins).distinctBy { it.id }
-                            val entities = combined.mapIndexed { idx, pin ->
-                                PinEntity.fromPinItem(pin, targetId, idx)
-                            }
-                            dao.saveFullBoard(targetEntity, entities)
-                        } else {
-                            val entities = newForTarget.mapIndexed { idx, pin ->
-                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)
-                            }
-                            dao.insertPins(entities)
+                        // Cross-board copy: null albumId (album stays on source board)
+                        val entities = newForTarget.mapIndexed { idx, pin ->
+                            PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)
                         }
+                        dao.upsertPinsSafely(entities)
                         totalCopied += newForTarget.size
                     }
                 }
@@ -2131,33 +2122,27 @@ class PinBoardViewModel(
             if (pinsToMove.isEmpty()) return@launch
 
             val dao = AppDatabase.getDatabase(ctx).boardDao()
+            // Guard: exclude self board (prevents data loss)
+            val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }
+            if (nonSelfTargets.isEmpty()) {
+                clearSelection()
+                _snackbarMessage.value = "Cannot move to the same board"
+                return@launch
+            }
             withContext(Dispatchers.IO) {
-                // 1. Copy to target boards
-                for (targetId in targetBoardIds) {
-                    if (targetId == sourceBoard.id) continue
+                for (targetId in nonSelfTargets) {
                     val existingIds = dao.getPinIdsForBoard(targetId).toSet()
                     val existingUrls = dao.getImageUrlsForBoard(targetId).toSet()
                     val newForTarget = pinsToMove.filter {
                         !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
                     }
                     if (newForTarget.isNotEmpty()) {
-                        val targetEntity = dao.getBoardById(targetId)
-                        if (targetEntity != null) {
-                            val existingPins = dao.getPinsForBoard(targetId).map { it.toPinItem() }
-                            val combined = (newForTarget + existingPins).distinctBy { it.id }
-                            val entities = combined.mapIndexed { idx, pin ->
-                                PinEntity.fromPinItem(pin, targetId, idx)
-                            }
-                            dao.saveFullBoard(targetEntity, entities)
-                        } else {
-                            val entities = newForTarget.mapIndexed { idx, pin ->
-                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)
-                            }
-                            dao.insertPins(entities)
+                        val entities = newForTarget.mapIndexed { idx, pin ->
+                            PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)
                         }
+                        dao.upsertPinsSafely(entities)
                     }
                 }
-                // 2. Delete from source board in Room
                 dao.deletePinsFromBoard(sourceBoard.id, pinIds.toList())
                 refreshAvailableBoardsFromDatabaseInternal(dao)
             }

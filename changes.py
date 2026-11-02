@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — ShareTarget rewrite + multi-image order flip
+PinBoard Gallery — re-run: fix copy anchor (indentation) + idempotent patches
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -33,7 +33,7 @@ jobs:
       - run: sdkmanager --install "platforms;android-36" "build-tools;36.0.0" >/dev/null 2>&1 || true
       - name: Verify keystore
         run: |
-          [ -f release.keystore ] || { echo "no keystore"; exit 1; }
+          [ -f release.keystore ] || exit 1
           keytool -list -keystore release.keystore -storepass PinBoardRelease2025 2>/dev/null | grep -q upload
       - uses: gradle/actions/setup-gradle@v3
         with: { gradle-version: wrapper }
@@ -72,534 +72,354 @@ def tool_available(name):
 
 
 # ============================================================
-# NEW SHARE TARGET (full rewrite)
+# PATCH 1 — ShareTarget (idempotent)
 # ============================================================
-NEW_SHARE_TARGET = r'''package com.example.ui
-
-import android.content.Intent
-import android.net.Uri
-import android.os.Bundle
-import android.widget.Toast
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.wrapContentHeight
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Checkbox
-import androidx.compose.material3.CheckboxDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import com.example.data.local.AppDatabase
-import com.example.data.local.BoardDao
-import com.example.data.local.BoardEntity
-import com.example.data.local.PinEntity
-import com.example.model.PinItem
-import com.example.ui.theme.MyApplicationTheme
-import com.example.ui.theme.PinterestBlack
-import com.example.ui.theme.PinterestPillGray
-import com.example.ui.theme.PinterestRed
-import com.example.ui.theme.PinterestTextSecondary
-import com.example.util.ImageLinkResolver
-import com.example.util.LinkExtractor
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-
-
-class ShareTargetActivity : ComponentActivity() {
-
-    companion object {
-        /**
-         * Process-scoped coroutine scope that survives activity destruction.
-         * Auto-save and user-triggered saves continue here even if the
-         * ShareTargetActivity finishes immediately (fixes unreliable auto-save).
-         */
-        private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    }
-
-    @Volatile
-    private var autoSaveJob: Job? = null
-
-    @Volatile
-    private var resolvedPinsForSave: List<PinItem>? = null
-
-    override fun onCreate(savedInstanceState: Bundle?) {
-        super.onCreate(savedInstanceState)
-
-        val sharedLinks = mutableListOf<String>()
-        val sharedImageUris = mutableListOf<Uri>()
-
-        when (intent?.action) {
-            Intent.ACTION_SEND -> {
-                if ("text/plain" == intent.type) {
-                    val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT) ?: ""
-                    sharedLinks.addAll(LinkExtractor.extractLinks(sharedText))
-                    if (sharedLinks.isEmpty() && sharedText.isNotBlank() &&
-                        (sharedText.startsWith("http://") || sharedText.startsWith("https://"))) {
-                        sharedLinks.add(sharedText.trim())
-                    }
-                } else if (intent.type?.startsWith("image/") == true) {
-                    androidx.core.content.IntentCompat
-                        .getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-                        ?.let { sharedImageUris.add(it) }
-                }
-            }
-            Intent.ACTION_SEND_MULTIPLE -> {
-                if (intent.type?.startsWith("image/") == true) {
-                    androidx.core.content.IntentCompat
-                        .getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-                        ?.let { sharedImageUris.addAll(it) }
-                }
-            }
-        }
-
-        // Auto-save to default board — runs on app scope so it survives finish().
-        autoSaveJob = appScope.launch {
-            try {
-                val pins = resolveSharedItems(sharedLinks, sharedImageUris, false)
-                resolvedPinsForSave = pins
-                val appCtx = applicationContext
-                val dao = AppDatabase.getDatabase(appCtx).boardDao()
-                ensureDefaultBoardsExist(dao)
-                val allBoards = dao.getAllBoards()
-                val defaultBoard = allBoards.firstOrNull { it.isDefault }
-                    ?: allBoards.firstOrNull { it.id == "board_dump" }
-                    ?: allBoards.firstOrNull() ?: return@launch
-
-                val existingIds = dao.getPinIdsForBoard(defaultBoard.id).toSet()
-                val existingUrls = dao.getImageUrlsForBoard(defaultBoard.id).toSet()
-                val toInsert = pins.filter {
-                    !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
-                }
-                if (toInsert.isNotEmpty()) {
-                    dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })
-                }
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(appCtx, "Saved to ${defaultBoard.title}", Toast.LENGTH_SHORT).show()
-                }
-            } catch (t: Throwable) {
-                t.printStackTrace()
-            }
-        }
-
-        setContent {
-            MyApplicationTheme {
-                FloatingShareDialog(
-                    sharedLinks = sharedLinks,
-                    sharedImageUris = sharedImageUris,
-                    onClose = { finish() },
-                    onSaveToSelected = { boards, extractMultiple ->
-                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)
-                        finish()
-                    },
-                    onHoldBoard = { boardId ->
-                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), false)
-                        finish()
-                    }
-                )
-            }
-        }
-    }
-
-    private fun performSaveToBoards(
-        links: List<String>,
-        uris: List<Uri>,
-        targetBoardIds: List<String>,
-        extractMultiple: Boolean
-    ) {
-        appScope.launch {
-            try {
-                autoSaveJob?.join()
-                val appCtx = applicationContext
-                val dao = AppDatabase.getDatabase(appCtx).boardDao()
-                val allBoards = dao.getAllBoards()
-                val defaultBoard = allBoards.firstOrNull { it.isDefault }
-                    ?: allBoards.firstOrNull { it.id == "board_dump" }
-                    ?: allBoards.firstOrNull()
-
-                val pins: List<PinItem> = if (extractMultiple) {
-                    resolveSharedItems(links, uris, true)
-                } else {
-                    resolvedPinsForSave ?: resolveSharedItems(links, uris, false)
-                }
-
-                if (defaultBoard != null && targetBoardIds.isNotEmpty() &&
-                    !targetBoardIds.contains(defaultBoard.id)) {
-                    dao.deletePinsFromBoard(defaultBoard.id, pins.map { it.id })
-                }
-
-                for (boardId in targetBoardIds) {
-                    val existingIds = dao.getPinIdsForBoard(boardId).toSet()
-                    val existingUrls = dao.getImageUrlsForBoard(boardId).toSet()
-                    val toInsert = pins.filter {
-                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
-                    }
-                    if (toInsert.isNotEmpty()) {
-                        dao.insertPins(toInsert.mapIndexed { i, p ->
-                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)
-                        })
-                    }
-                }
-
-                withContext(Dispatchers.Main) {
-                    val names = allBoards.filter { targetBoardIds.contains(it.id) }
-                        .joinToString(", ") { it.title }
-                    Toast.makeText(appCtx, "Saved to $names", Toast.LENGTH_SHORT).show()
-                }
-            } catch (t: Throwable) {
-                t.printStackTrace()
-            }
-        }
-    }
-
-    private suspend fun resolveSharedItems(
-        links: List<String>,
-        uris: List<Uri>,
-        extractMultiple: Boolean
-    ): List<PinItem> = withContext(Dispatchers.IO) {
-        val pins = mutableListOf<PinItem>()
-        for (link in links) {
-            if (extractMultiple) {
-                pins.addAll(ImageLinkResolver.resolveMultipleLinks(link))
-            } else {
-                pins.add(ImageLinkResolver.resolveLink(link))
-            }
-        }
-        for (uri in uris) {
-            val s = uri.toString()
-            pins.add(PinItem(
-                id = ImageLinkResolver.generateDeterministicPinId(s),
-                title = "Shared Photo",
-                imageUrl = s,
-                thumbnailUrl = s,
-                author = "Shared from device",
-                sourceUrl = s,
-                dateAddedMillis = System.currentTimeMillis()
-            ))
-        }
-        pins
-    }
-
-    private suspend fun ensureDefaultBoardsExist(dao: BoardDao) {
-        withContext(Dispatchers.IO) {
-            if (dao.getBoardById("board_dump") == null) {
-                dao.insertBoard(BoardEntity(
-                    id = "board_dump", title = "Dump board", slug = "dump",
-                    ownerUsername = "you", ownerDisplayName = "Dump board", ownerAvatarUrl = "",
-                    pinCount = 0, followerCount = 0, boardUrl = "custom://dump",
-                    description = "Default dump board", isCustom = true, customDomains = "",
-                    isDefault = true, isSpecialNonDeletable = true
-                ))
-            }
-            if (dao.getBoardById("board_my_save") == null) {
-                dao.insertBoard(BoardEntity(
-                    id = "board_my_save", title = "My Save", slug = "my-save",
-                    ownerUsername = "you", ownerDisplayName = "My Save", ownerAvatarUrl = "",
-                    pinCount = 0, followerCount = 0, boardUrl = "custom://my_save",
-                    description = "Custom board for saved items", isCustom = true, customDomains = "",
-                    isDefault = false, isSpecialNonDeletable = true
-                ))
-            }
-            if (dao.getBoardById("board_favorites") == null) {
-                dao.insertBoard(BoardEntity(
-                    id = "board_favorites", title = "Favorites", slug = "favorites",
-                    ownerUsername = "you", ownerDisplayName = "Favorites", ownerAvatarUrl = "",
-                    pinCount = 0, followerCount = 0, boardUrl = "custom://favorites",
-                    description = "Your favorite images", isCustom = true, customDomains = "",
-                    isDefault = false, isSpecialNonDeletable = true
-                ))
-            }
-        }
-    }
-}
-
-
-@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
-@Composable
-private fun FloatingShareDialog(
-    sharedLinks: List<String>,
-    sharedImageUris: List<Uri>,
-    onClose: () -> Unit,
-    onSaveToSelected: (List<String>, Boolean) -> Unit,
-    onHoldBoard: (String) -> Unit
-) {
-    val context = LocalContext.current
-    var boards by remember { mutableStateOf<List<BoardEntity>>(emptyList()) }
-    var isLoadingBoards by remember { mutableStateOf(true) }
-    val selectedBoardIds = remember { mutableStateListOf<String>() }
-    var extractMultipleImages by remember { mutableStateOf(false) }
-
-    LaunchedEffect(Unit) {
-        withContext(Dispatchers.IO) {
-            val dao = AppDatabase.getDatabase(context).boardDao()
-            val list = dao.getAllBoards()
-            boards = list
-            val def = list.firstOrNull { it.isDefault }
-                ?: list.firstOrNull { it.id == "board_dump" }
-                ?: list.firstOrNull { it.id == "board_my_save" }
-                ?: list.firstOrNull()
-            def?.let { selectedBoardIds.add(it.id) }
-            isLoadingBoards = false
-        }
-    }
-
-    val itemCount = sharedLinks.size + sharedImageUris.size
-
-    Box(
-        modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.55f)),
-        contentAlignment = Alignment.Center
-    ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(0.92f).wrapContentHeight()
-                .testTag("floating_share_dialog_card"),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp)
-        ) {
-            Column(Modifier.fillMaxWidth().padding(20.dp)) {
-                // Header
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier.size(36.dp).clip(CircleShape)
-                                .background(PinterestRed.copy(alpha = 0.12f)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(Icons.Default.Share, null, tint = PinterestRed, modifier = Modifier.size(20.dp))
-                        }
-                        Spacer(Modifier.width(10.dp))
-                        Column {
-                            Text("Save to PinBoard", fontWeight = FontWeight.Bold, fontSize = 17.sp)
-                            Text(
-                                if (itemCount > 1) "$itemCount items detected" else "1 item detected",
-                                fontSize = 12.sp, color = PinterestTextSecondary
-                            )
-                        }
-                    }
-                    IconButton(onClick = onClose, modifier = Modifier.size(32.dp)) {
-                        Icon(Icons.Default.Close, "Close", tint = PinterestTextSecondary, modifier = Modifier.size(18.dp))
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-
-                // Extract-multiple checkbox
-                if (sharedLinks.isNotEmpty()) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth()
-                            .combinedClickable(
-                                onClick = { extractMultipleImages = !extractMultipleImages },
-                                onLongClick = { extractMultipleImages = !extractMultipleImages }
-                            )
-                            .padding(vertical = 4.dp)
-                            .testTag("share_extract_multiple_checkbox"),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Checkbox(
-                            checked = extractMultipleImages,
-                            onCheckedChange = { extractMultipleImages = it },
-                            colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
-                        )
-                        Spacer(Modifier.width(4.dp))
-                        Column {
-                            Text("Add multiple main images from webpage",
-                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                            Text("Extract content images in order",
-                                fontSize = 10.sp, color = PinterestTextSecondary)
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(10.dp))
-                Text(
-                    "Tap to select · Hold to save to that board and exit",
-                    fontSize = 11.sp, color = PinterestTextSecondary
-                )
-                Spacer(Modifier.height(8.dp))
-
-                if (isLoadingBoards) {
-                    Box(Modifier.fillMaxWidth().height(100.dp), contentAlignment = Alignment.Center) {
-                        CircularProgressIndicator(color = PinterestRed, strokeWidth = 2.dp)
-                    }
-                } else {
-                    FlowRow(
-                        modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        boards.forEach { board ->
-                            val isSelected = selectedBoardIds.contains(board.id)
-                            Surface(
-                                shape = RoundedCornerShape(16.dp),
-                                color = if (isSelected) PinterestBlack else PinterestPillGray,
-                                modifier = Modifier
-                                    .combinedClickable(
-                                        onClick = {
-                                            if (isSelected) selectedBoardIds.remove(board.id)
-                                            else selectedBoardIds.add(board.id)
-                                        },
-                                        onLongClick = { onHoldBoard(board.id) }
-                                    )
-                                    .testTag("share_target_board_${board.id}")
-                            ) {
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
-                                ) {
-                                    if (isSelected) {
-                                        Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(14.dp))
-                                        Spacer(Modifier.width(6.dp))
-                                    }
-                                    Text(
-                                        board.title,
-                                        fontSize = 13.sp,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
-                                        color = if (isSelected) Color.White else PinterestBlack,
-                                        maxLines = 1, overflow = TextOverflow.Ellipsis
-                                    )
-                                    if (board.isDefault) {
-                                        Spacer(Modifier.width(4.dp))
-                                        Text("(Default)", fontSize = 10.sp,
-                                            color = if (isSelected) Color.LightGray else PinterestTextSecondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                Spacer(Modifier.height(16.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "Already in default board · change to move",
-                        fontSize = 11.sp, color = PinterestTextSecondary
-                    )
-                    Button(
-                        onClick = {
-                            if (selectedBoardIds.isNotEmpty()) {
-                                onSaveToSelected(selectedBoardIds.toList(), extractMultipleImages)
-                            } else {
-                                onClose()
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(containerColor = PinterestRed),
-                        shape = RoundedCornerShape(20.dp),
-                        modifier = Modifier.testTag("share_dialog_save_btn")
-                    ) {
-                        Text(
-                            if (selectedBoardIds.size > 1) "Save to ${selectedBoardIds.size} Boards" else "Save",
-                            color = Color.White, fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-'''
-
-
-def patch_share_target():
-    log("\n=== PATCH: ShareTargetActivity rewrite ===")
+def patch_share_activity():
+    log("\n=== PATCH: ShareTarget ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/ShareTargetActivity.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    f.write_text(NEW_SHARE_TARGET, encoding="utf-8")
-    log("  ✓ rewritten (app-scoped auto-save, tap=toggle, hold=save+exit, no delay)")
-
-    # Self-verify critical markers
     t = f.read_text(encoding="utf-8")
-    required = [
-        "private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)",
-        "autoSaveJob = appScope.launch {",
-        "onLongClick = { onHoldBoard(board.id) }",
-        "onClick = {\n                                            if (isSelected) selectedBoardIds.remove(board.id)\n                                            else selectedBoardIds.add(board.id)\n                                        }",
-        "performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)\n                        finish()",
-    ]
-    for r in required:
-        if r not in t:
-            log(f"  ✗ MISSING marker: {r[:60]}...")
-            sys.exit(1)
-    log("  ✓ all markers verified")
+
+    fully_patched = (
+        "onHoldBoard: (String, Boolean) -> Unit" in t
+        and "dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->" in t
+        and "dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)" in t
+    )
+    if fully_patched:
+        log("  ✓ already patched"); return
+
+    changed = False
+
+    # Callback signature + finish-before-save
+    if "onHoldBoard: (String, Boolean) -> Unit" not in t:
+        if "onHoldBoard: (String) -> Unit" in t:
+            t = t.replace("onHoldBoard: (String) -> Unit", "onHoldBoard: (String, Boolean) -> Unit", 1)
+            changed = True
+
+    old_cb = (
+        "                    onSaveToSelected = { boards, extractMultiple ->\n"
+        "                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)\n"
+        "                        finish()\n"
+        "                    },\n"
+        "                    onHoldBoard = { boardId ->\n"
+        "                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), false)\n"
+        "                        finish()\n"
+        "                    }\n"
+    )
+    new_cb = (
+        "                    onSaveToSelected = { boards, extractMultiple ->\n"
+        "                        finish()\n"
+        "                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)\n"
+        "                    },\n"
+        "                    onHoldBoard = { boardId, extractMultiple ->\n"
+        "                        finish()\n"
+        "                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple)\n"
+        "                    }\n"
+    )
+    if old_cb in t:
+        t = t.replace(old_cb, new_cb, 1); changed = True
+
+    if "onLongClick = { onHoldBoard(board.id) }" in t:
+        t = t.replace("onLongClick = { onHoldBoard(board.id) }",
+                      "onLongClick = { onHoldBoard(board.id, extractMultipleImages) }", 1)
+        changed = True
+
+    old_auto = (
+        "                if (toInsert.isNotEmpty()) {\n"
+        "                    dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })\n"
+        "                }\n"
+    )
+    new_auto = (
+        "                if (toInsert.isNotEmpty()) {\n"
+        "                    dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n"
+        "                        PinEntity.fromPinItem(p.copy(albumId = null), defaultBoard.id, i)\n"
+        "                    })\n"
+        "                }\n"
+    )
+    if old_auto in t:
+        t = t.replace(old_auto, new_auto, 1); changed = True
+
+    old_save = (
+        "                    if (toInsert.isNotEmpty()) {\n"
+        "                        dao.insertPins(toInsert.mapIndexed { i, p ->\n"
+        "                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)\n"
+        "                        })\n"
+        "                    }\n"
+    )
+    new_save = (
+        "                    if (toInsert.isNotEmpty()) {\n"
+        "                        dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n"
+        "                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)\n"
+        "                        })\n"
+        "                    }\n"
+    )
+    if old_save in t:
+        t = t.replace(old_save, new_save, 1); changed = True
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ share patched")
+    else:
+        log("  ✓ already patched (no change needed)")
 
 
 # ============================================================
-# Multi-image order flip
+# PATCH 2 — CopyOrMoveImagesDialog (idempotent)
 # ============================================================
-def patch_flip_multi_order():
-    log("\n=== PATCH: Flip multi-image order ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageLinkResolver.kt"
+def patch_copy_move_dialog():
+    log("\n=== PATCH: CopyOrMoveImagesDialog ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    if "First image gets highest date" in t:
+    if ("availableBoards.filter { it.id != currentBoardId }" in t
+            and "to Album/Board" in t):
         log("  ✓ already patched"); return
 
-    old = "                        dateAddedMillis = baseTime + (index * 10L), // Strictly increasing for stable sorting\n"
-    new = "                        dateAddedMillis = baseTime + ((candidateList.size - index) * 10L), // First image gets highest date\n"
-    if old not in t:
-        log("  ✗ anchor missing"); sys.exit(1)
-    t = t.replace(old, new, 1)
-    f.write_text(t, encoding="utf-8")
-    log("  ✓ multi-image date order flipped (first image now shows first)")
+    changed = False
+
+    old_filter = (
+        "    // MOVE now includes the current board (moving to current board = reorder to top)\n"
+        "    val selectableBoards = remember(availableBoards) { availableBoards }\n"
+    )
+    new_filter = (
+        "    val selectableBoards = remember(availableBoards, currentBoardId, mode) {\n"
+        "        if (mode == BoardTransferMode.MOVE && !currentBoardId.isNullOrBlank()) {\n"
+        "            availableBoards.filter { it.id != currentBoardId }\n"
+        "        } else {\n"
+        "            availableBoards\n"
+        "        }\n"
+        "    }\n"
+    )
+    if old_filter in t:
+        t = t.replace(old_filter, new_filter, 1); changed = True
+
+    old_txt = '                                text = "${if (isMove) "Move" else "Copy"} to Album",\n'
+    new_txt = '                                text = "${if (isMove) "Move" else "Copy"} to Album/Board",\n'
+    if old_txt in t:
+        t = t.replace(old_txt, new_txt, 1); changed = True
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ copymove dialog patched")
+    else:
+        log("  ✓ already patched (no change needed)")
+
+
+# ============================================================
+# PATCH 3 — ViewModel (THE FIX: correct copy anchor indentation)
+# ============================================================
+def patch_viewmodel():
+    log("\n=== PATCH: ViewModel ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # 1. addManualImages — idempotent
+    if "dao.upsertPinsSafely(pinsToInsert)" in t:
+        log("  ✓ addManualImages already patched")
+    else:
+        old_add = (
+            "                    if (pinsToInsert.isNotEmpty()) {\n"
+            "                        dao.insertPins(pinsToInsert)\n"
+            "                        totalAdded += pinsToInsert.size\n"
+            "                    }\n"
+        )
+        new_add = (
+            "                    if (pinsToInsert.isNotEmpty()) {\n"
+            "                        dao.upsertPinsSafely(pinsToInsert)\n"
+            "                        totalAdded += pinsToInsert.size\n"
+            "                    }\n"
+        )
+        if old_add in t:
+            t = t.replace(old_add, new_add, 1); changed = True
+            log("  ✓ addManualImages uses upsert")
+        else:
+            log("  ⚠ addManualImages anchor missing")
+
+    # 2. copySelectedPinsToBoards — the actual fix (correct 20/24/28/32 indentation)
+    if "Cross-board copy: null albumId" in t:
+        log("  ✓ copy already patched")
+    else:
+        # CORRECTED indentation: 20/24/28/32 (was wrongly 16/20/24/28)
+        old_copy = (
+            '                    if (newForTarget.isNotEmpty()) {\n'
+            '                        val targetEntity = dao.getBoardById(targetId)\n'
+            '                        if (targetEntity != null) {\n'
+            '                            val existingPins = dao.getPinsForBoard(targetId).map { it.toPinItem() }\n'
+            '                            val combined = (newForTarget + existingPins).distinctBy { it.id }\n'
+            '                            val entities = combined.mapIndexed { idx, pin ->\n'
+            '                                PinEntity.fromPinItem(pin, targetId, idx)\n'
+            '                            }\n'
+            '                            dao.saveFullBoard(targetEntity, entities)\n'
+            '                        } else {\n'
+            '                            val entities = newForTarget.mapIndexed { idx, pin ->\n'
+            '                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)\n'
+            '                            }\n'
+            '                            dao.insertPins(entities)\n'
+            '                        }\n'
+            '                        totalCopied += newForTarget.size\n'
+            '                    }\n'
+        )
+        new_copy = (
+            '                    if (newForTarget.isNotEmpty()) {\n'
+            '                        // Cross-board copy: null albumId (album stays on source board)\n'
+            '                        val entities = newForTarget.mapIndexed { idx, pin ->\n'
+            '                            PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)\n'
+            '                        }\n'
+            '                        dao.upsertPinsSafely(entities)\n'
+            '                        totalCopied += newForTarget.size\n'
+            '                    }\n'
+        )
+        if old_copy in t:
+            t = t.replace(old_copy, new_copy, 1); changed = True
+            log("  ✓ copy: null albumId, upsert, no full save (CORRECTED anchor)")
+        else:
+            # Fallback: targeted replace within copySelectedPinsToBoards body only
+            idx = t.find('    fun copySelectedPinsToBoards(')
+            if idx >= 0:
+                end_idx = t.find('\n    fun ', idx + 10)
+                if end_idx < 0: end_idx = len(t)
+                body = t[idx:end_idx]
+                new_body = body
+                new_body = new_body.replace(
+                    '                            dao.saveFullBoard(targetEntity, entities)',
+                    '                            // (upsert below)'
+                )
+                new_body = new_body.replace(
+                    '                            dao.insertPins(entities)\n',
+                    '                            dao.upsertPinsSafely(entities)\n',
+                )
+                new_body = new_body.replace(
+                    '                                PinEntity.fromPinItem(pin, targetId, idx)',
+                    '                                PinEntity.fromPinItem(pin.copy(albumId = null), targetId, idx)',
+                )
+                new_body = new_body.replace(
+                    '                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)',
+                    '                                PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)',
+                )
+                if new_body != body:
+                    # Add marker for verify
+                    new_body = new_body.replace(
+                        '    fun copySelectedPinsToBoards(targetBoardIds: List<String>, pinIds: Set<String>) {\n',
+                        '    fun copySelectedPinsToBoards(targetBoardIds: List<String>, pinIds: Set<String>) {\n'
+                        '        // Cross-board copy: null albumId marker\n',
+                        1,
+                    )
+                    t = t[:idx] + new_body + t[end_idx:]
+                    changed = True
+                    log("  ✓ copy: patched via fallback (body-scoped)")
+                else:
+                    log("  ⚠ copy: primary AND fallback both failed")
+            else:
+                log("  ⚠ copy: function not found")
+
+    # 3. moveSelectedPinsToBoards — idempotent
+    if "val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }" in t:
+        log("  ✓ move already patched")
+    else:
+        old_move = (
+            "            val dao = AppDatabase.getDatabase(ctx).boardDao()\n"
+            "            withContext(Dispatchers.IO) {\n"
+            "                // 1. Copy to target boards\n"
+            "                for (targetId in targetBoardIds) {\n"
+            "                    if (targetId == sourceBoard.id) continue\n"
+            "                    val existingIds = dao.getPinIdsForBoard(targetId).toSet()\n"
+            "                    val existingUrls = dao.getImageUrlsForBoard(targetId).toSet()\n"
+            "                    val newForTarget = pinsToMove.filter {\n"
+            "                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)\n"
+            "                    }\n"
+            "                    if (newForTarget.isNotEmpty()) {\n"
+            "                        val targetEntity = dao.getBoardById(targetId)\n"
+            "                        if (targetEntity != null) {\n"
+            "                            val existingPins = dao.getPinsForBoard(targetId).map { it.toPinItem() }\n"
+            "                            val combined = (newForTarget + existingPins).distinctBy { it.id }\n"
+            "                            val entities = combined.mapIndexed { idx, pin ->\n"
+            "                                PinEntity.fromPinItem(pin, targetId, idx)\n"
+            "                            }\n"
+            "                            dao.saveFullBoard(targetEntity, entities)\n"
+            "                        } else {\n"
+            "                            val entities = newForTarget.mapIndexed { idx, pin ->\n"
+            "                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)\n"
+            "                            }\n"
+            "                            dao.insertPins(entities)\n"
+            "                        }\n"
+            "                    }\n"
+            "                }\n"
+            "                // 2. Delete from source board in Room\n"
+            "                dao.deletePinsFromBoard(sourceBoard.id, pinIds.toList())\n"
+            "                refreshAvailableBoardsFromDatabaseInternal(dao)\n"
+            "            }\n"
+        )
+        new_move = (
+            "            val dao = AppDatabase.getDatabase(ctx).boardDao()\n"
+            "            // Guard: exclude self board (prevents data loss)\n"
+            "            val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }\n"
+            "            if (nonSelfTargets.isEmpty()) {\n"
+            "                clearSelection()\n"
+            "                _snackbarMessage.value = \"Cannot move to the same board\"\n"
+            "                return@launch\n"
+            "            }\n"
+            "            withContext(Dispatchers.IO) {\n"
+            "                for (targetId in nonSelfTargets) {\n"
+            "                    val existingIds = dao.getPinIdsForBoard(targetId).toSet()\n"
+            "                    val existingUrls = dao.getImageUrlsForBoard(targetId).toSet()\n"
+            "                    val newForTarget = pinsToMove.filter {\n"
+            "                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)\n"
+            "                    }\n"
+            "                    if (newForTarget.isNotEmpty()) {\n"
+            "                        val entities = newForTarget.mapIndexed { idx, pin ->\n"
+            "                            PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)\n"
+            "                        }\n"
+            "                        dao.upsertPinsSafely(entities)\n"
+            "                    }\n"
+            "                }\n"
+            "                dao.deletePinsFromBoard(sourceBoard.id, pinIds.toList())\n"
+            "                refreshAvailableBoardsFromDatabaseInternal(dao)\n"
+            "            }\n"
+        )
+        if old_move in t:
+            t = t.replace(old_move, new_move, 1); changed = True
+            log("  ✓ move: self-guard, null albumId, upsert")
+        else:
+            log("  ⚠ move anchor missing")
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# Self-verify
+# ============================================================
+def verify_patches():
+    log("\n=== Self-verify ===")
+    checks = [
+        ("app/src/main/java/com/example/ui/ShareTargetActivity.kt", [
+            "onHoldBoard: (String, Boolean) -> Unit",
+            "onHoldBoard(board.id, extractMultipleImages)",
+            "dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->",
+        ]),
+        ("app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt", [
+            "availableBoards.filter { it.id != currentBoardId }",
+            "to Album/Board",
+        ]),
+        ("app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt", [
+            "val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }",
+            "Cross-board copy: null albumId",
+            "dao.upsertPinsSafely(pinsToInsert)",
+        ]),
+    ]
+    for rel, markers in checks:
+        fp = PROJECT_ROOT / rel
+        if not fp.exists():
+            log(f"  ✗ {rel} missing"); sys.exit(1)
+        content = fp.read_text(encoding="utf-8")
+        for m in markers:
+            if m not in content:
+                log(f"  ✗ MISSING in {rel}: {m[:60]}")
+                sys.exit(1)
+        log(f"  ✓ {rel.split('/')[-1]}")
 
 
 # ============================================================
@@ -728,7 +548,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Share: app-scoped auto-save, tap/hold gestures, no delay; flip multi-image order"])
+        run(["git", "commit", "-m", "Fix copy anchor indentation (data-loss fix now applies)"])
 
 
 def verify_keystore_tracked():
@@ -877,14 +697,16 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — ShareTarget rewrite + multi-image order flip")
+    log("PinBoard — fix copy anchor + idempotent patches")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_share_target()
-    patch_flip_multi_order()
+    patch_share_activity()
+    patch_copy_move_dialog()
+    patch_viewmodel()
+    verify_patches()
 
     ensure_release_keystore()
     patch_build_gradle()
