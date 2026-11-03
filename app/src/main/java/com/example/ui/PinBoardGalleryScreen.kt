@@ -1424,64 +1424,53 @@ fun PinBoardGalleryScreen(
         }
     }
 
-    // Pending album transfer banner (wrapped in full-screen Box for .align)
+    // Pending album transfer banner (single, canonical)
     androidx.compose.foundation.layout.Box(modifier = Modifier.fillMaxSize()) {
         pendingAlbumTransfer?.let { transfer ->
-        androidx.compose.material3.Surface(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
-                .fillMaxWidth()
-                .testTag("pending_album_transfer_banner"),
-            shape = RoundedCornerShape(16.dp),
-            color = PinterestBlack,
-            shadowElevation = 8.dp
-        ) {
-            androidx.compose.foundation.layout.Row(
-                modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
-                verticalAlignment = Alignment.CenterVertically
+            androidx.compose.material3.Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
+                    .fillMaxWidth()
+                    .testTag("pending_album_transfer_banner"),
+                shape = RoundedCornerShape(16.dp),
+                color = PinterestBlack,
+                shadowElevation = 8.dp
             ) {
-                androidx.compose.material3.IconButton(
-                    onClick = { viewModel.cancelAlbumTransferAndRestore() },
-                    modifier = Modifier.testTag("album_transfer_back_btn")
+                androidx.compose.foundation.layout.Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    androidx.compose.material3.Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = "Back to selection",
-                        tint = Color.White
-                    )
-                }
-                Text(
-                    text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    modifier = Modifier.weight(1f)
-                )
-                androidx.compose.material3.TextButton(
-                    onClick = { viewModel.executeAlbumTransferToCurrentBoard() },
-                    modifier = Modifier.testTag("album_transfer_here_btn")
-                ) {
+                    androidx.compose.material3.IconButton(
+                        onClick = { viewModel.cancelAlbumTransferAndRestore() },
+                        modifier = Modifier.testTag("album_transfer_back_btn")
+                    ) {
+                        androidx.compose.material3.Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back to selection",
+                            tint = Color.White
+                        )
+                    }
                     Text(
-                        text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",
-                        color = Color(0xFF64B5F6),
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 12.sp
+                        text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.weight(1f)
                     )
-                }
-                androidx.compose.material3.TextButton(
-                    onClick = { viewModel.executeAlbumTransferToCurrentBoard() },
-                    modifier = Modifier.testTag("album_transfer_here_btn")
-                ) {
-                    Text(
-                        text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",
-                        color = Color(0xFF64B5F6),
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 12.sp
-                    )
+                    androidx.compose.material3.TextButton(
+                        onClick = { viewModel.executeAlbumTransferToCurrentBoard() },
+                        modifier = Modifier.testTag("album_transfer_here_btn")
+                    ) {
+                        Text(
+                            text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",
+                            color = Color(0xFF64B5F6),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
                 }
             }
-        }
         }
     }
 

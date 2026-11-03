@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — re-run: fix copy anchor (indentation) + idempotent patches
+PinBoard Gallery — fix transfer (DB source) + banner dedupe
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -71,355 +71,334 @@ def tool_available(name):
     except Exception: return False
 
 
+def find_function_end(t, start_marker):
+    idx = t.find(start_marker)
+    if idx < 0: return -1
+    open_brace = t.find("{", idx + len(start_marker) - 1)
+    if open_brace < 0: return -1
+    depth = 1
+    i = open_brace + 1
+    while i < len(t) and depth > 0:
+        c = t[i]
+        if c == '"':
+            i += 1
+            while i < len(t):
+                if t[i] == "\\": i += 2; continue
+                if t[i] == '"': break
+                i += 1
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0: return i + 1
+        i += 1
+    return -1
+
+
 # ============================================================
-# PATCH 1 — ShareTarget (idempotent)
+# THE FIX
 # ============================================================
-def patch_share_activity():
-    log("\n=== PATCH: ShareTarget ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/ShareTargetActivity.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
+def patch_transfer_bugs():
+    log("\n=== PATCH: transfer (DB source) + banner dedupe ===")
+    vm_f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
+    ps_f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not vm_f.exists(): log("  ✗ VM missing"); sys.exit(1)
+    if not ps_f.exists(): log("  ✗ Screen missing"); sys.exit(1)
 
-    fully_patched = (
-        "onHoldBoard: (String, Boolean) -> Unit" in t
-        and "dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->" in t
-        and "dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)" in t
-    )
-    if fully_patched:
-        log("  ✓ already patched"); return
+    # ---------- ViewModel ----------
+    t = vm_f.read_text(encoding="utf-8")
+    vm_changed = False
 
-    changed = False
-
-    # Callback signature + finish-before-save
-    if "onHoldBoard: (String, Boolean) -> Unit" not in t:
-        if "onHoldBoard: (String) -> Unit" in t:
-            t = t.replace("onHoldBoard: (String) -> Unit", "onHoldBoard: (String, Boolean) -> Unit", 1)
-            changed = True
-
-    old_cb = (
-        "                    onSaveToSelected = { boards, extractMultiple ->\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)\n"
-        "                        finish()\n"
-        "                    },\n"
-        "                    onHoldBoard = { boardId ->\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), false)\n"
-        "                        finish()\n"
-        "                    }\n"
-    )
-    new_cb = (
-        "                    onSaveToSelected = { boards, extractMultiple ->\n"
-        "                        finish()\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)\n"
-        "                    },\n"
-        "                    onHoldBoard = { boardId, extractMultiple ->\n"
-        "                        finish()\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple)\n"
-        "                    }\n"
-    )
-    if old_cb in t:
-        t = t.replace(old_cb, new_cb, 1); changed = True
-
-    if "onLongClick = { onHoldBoard(board.id) }" in t:
-        t = t.replace("onLongClick = { onHoldBoard(board.id) }",
-                      "onLongClick = { onHoldBoard(board.id, extractMultipleImages) }", 1)
-        changed = True
-
-    old_auto = (
-        "                if (toInsert.isNotEmpty()) {\n"
-        "                    dao.insertPins(toInsert.mapIndexed { i, p -> PinEntity.fromPinItem(p, defaultBoard.id, i) })\n"
-        "                }\n"
-    )
-    new_auto = (
-        "                if (toInsert.isNotEmpty()) {\n"
-        "                    dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n"
-        "                        PinEntity.fromPinItem(p.copy(albumId = null), defaultBoard.id, i)\n"
-        "                    })\n"
-        "                }\n"
-    )
-    if old_auto in t:
-        t = t.replace(old_auto, new_auto, 1); changed = True
-
-    old_save = (
-        "                    if (toInsert.isNotEmpty()) {\n"
-        "                        dao.insertPins(toInsert.mapIndexed { i, p ->\n"
-        "                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)\n"
-        "                        })\n"
-        "                    }\n"
-    )
-    new_save = (
-        "                    if (toInsert.isNotEmpty()) {\n"
-        "                        dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n"
-        "                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)\n"
-        "                        })\n"
-        "                    }\n"
-    )
-    if old_save in t:
-        t = t.replace(old_save, new_save, 1); changed = True
-
-    if changed:
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ share patched")
+    # 1) executeAlbumTransfer — fetch from DB
+    if "// DB-source pins" in t and "fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String)" in t:
+        log("  ✓ executeAlbumTransfer already patched")
     else:
-        log("  ✓ already patched (no change needed)")
-
-
-# ============================================================
-# PATCH 2 — CopyOrMoveImagesDialog (idempotent)
-# ============================================================
-def patch_copy_move_dialog():
-    log("\n=== PATCH: CopyOrMoveImagesDialog ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if ("availableBoards.filter { it.id != currentBoardId }" in t
-            and "to Album/Board" in t):
-        log("  ✓ already patched"); return
-
-    changed = False
-
-    old_filter = (
-        "    // MOVE now includes the current board (moving to current board = reorder to top)\n"
-        "    val selectableBoards = remember(availableBoards) { availableBoards }\n"
-    )
-    new_filter = (
-        "    val selectableBoards = remember(availableBoards, currentBoardId, mode) {\n"
-        "        if (mode == BoardTransferMode.MOVE && !currentBoardId.isNullOrBlank()) {\n"
-        "            availableBoards.filter { it.id != currentBoardId }\n"
-        "        } else {\n"
-        "            availableBoards\n"
-        "        }\n"
-        "    }\n"
-    )
-    if old_filter in t:
-        t = t.replace(old_filter, new_filter, 1); changed = True
-
-    old_txt = '                                text = "${if (isMove) "Move" else "Copy"} to Album",\n'
-    new_txt = '                                text = "${if (isMove) "Move" else "Copy"} to Album/Board",\n'
-    if old_txt in t:
-        t = t.replace(old_txt, new_txt, 1); changed = True
-
-    if changed:
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ copymove dialog patched")
-    else:
-        log("  ✓ already patched (no change needed)")
-
-
-# ============================================================
-# PATCH 3 — ViewModel (THE FIX: correct copy anchor indentation)
-# ============================================================
-def patch_viewmodel():
-    log("\n=== PATCH: ViewModel ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    # 1. addManualImages — idempotent
-    if "dao.upsertPinsSafely(pinsToInsert)" in t:
-        log("  ✓ addManualImages already patched")
-    else:
-        old_add = (
-            "                    if (pinsToInsert.isNotEmpty()) {\n"
-            "                        dao.insertPins(pinsToInsert)\n"
-            "                        totalAdded += pinsToInsert.size\n"
-            "                    }\n"
-        )
-        new_add = (
-            "                    if (pinsToInsert.isNotEmpty()) {\n"
-            "                        dao.upsertPinsSafely(pinsToInsert)\n"
-            "                        totalAdded += pinsToInsert.size\n"
-            "                    }\n"
-        )
-        if old_add in t:
-            t = t.replace(old_add, new_add, 1); changed = True
-            log("  ✓ addManualImages uses upsert")
+        marker = "    fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {"
+        idx = t.find(marker)
+        if idx < 0:
+            log("  ⚠ executeAlbumTransfer marker not found")
         else:
-            log("  ⚠ addManualImages anchor missing")
-
-    # 2. copySelectedPinsToBoards — the actual fix (correct 20/24/28/32 indentation)
-    if "Cross-board copy: null albumId" in t:
-        log("  ✓ copy already patched")
-    else:
-        # CORRECTED indentation: 20/24/28/32 (was wrongly 16/20/24/28)
-        old_copy = (
-            '                    if (newForTarget.isNotEmpty()) {\n'
-            '                        val targetEntity = dao.getBoardById(targetId)\n'
-            '                        if (targetEntity != null) {\n'
-            '                            val existingPins = dao.getPinsForBoard(targetId).map { it.toPinItem() }\n'
-            '                            val combined = (newForTarget + existingPins).distinctBy { it.id }\n'
-            '                            val entities = combined.mapIndexed { idx, pin ->\n'
-            '                                PinEntity.fromPinItem(pin, targetId, idx)\n'
-            '                            }\n'
-            '                            dao.saveFullBoard(targetEntity, entities)\n'
-            '                        } else {\n'
-            '                            val entities = newForTarget.mapIndexed { idx, pin ->\n'
-            '                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)\n'
-            '                            }\n'
-            '                            dao.insertPins(entities)\n'
-            '                        }\n'
-            '                        totalCopied += newForTarget.size\n'
-            '                    }\n'
-        )
-        new_copy = (
-            '                    if (newForTarget.isNotEmpty()) {\n'
-            '                        // Cross-board copy: null albumId (album stays on source board)\n'
-            '                        val entities = newForTarget.mapIndexed { idx, pin ->\n'
-            '                            PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)\n'
-            '                        }\n'
-            '                        dao.upsertPinsSafely(entities)\n'
-            '                        totalCopied += newForTarget.size\n'
-            '                    }\n'
-        )
-        if old_copy in t:
-            t = t.replace(old_copy, new_copy, 1); changed = True
-            log("  ✓ copy: null albumId, upsert, no full save (CORRECTED anchor)")
-        else:
-            # Fallback: targeted replace within copySelectedPinsToBoards body only
-            idx = t.find('    fun copySelectedPinsToBoards(')
-            if idx >= 0:
-                end_idx = t.find('\n    fun ', idx + 10)
-                if end_idx < 0: end_idx = len(t)
-                body = t[idx:end_idx]
-                new_body = body
-                new_body = new_body.replace(
-                    '                            dao.saveFullBoard(targetEntity, entities)',
-                    '                            // (upsert below)'
-                )
-                new_body = new_body.replace(
-                    '                            dao.insertPins(entities)\n',
-                    '                            dao.upsertPinsSafely(entities)\n',
-                )
-                new_body = new_body.replace(
-                    '                                PinEntity.fromPinItem(pin, targetId, idx)',
-                    '                                PinEntity.fromPinItem(pin.copy(albumId = null), targetId, idx)',
-                )
-                new_body = new_body.replace(
-                    '                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)',
-                    '                                PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)',
-                )
-                if new_body != body:
-                    # Add marker for verify
-                    new_body = new_body.replace(
-                        '    fun copySelectedPinsToBoards(targetBoardIds: List<String>, pinIds: Set<String>) {\n',
-                        '    fun copySelectedPinsToBoards(targetBoardIds: List<String>, pinIds: Set<String>) {\n'
-                        '        // Cross-board copy: null albumId marker\n',
-                        1,
-                    )
-                    t = t[:idx] + new_body + t[end_idx:]
-                    changed = True
-                    log("  ✓ copy: patched via fallback (body-scoped)")
-                else:
-                    log("  ⚠ copy: primary AND fallback both failed")
+            end_idx = find_function_end(t, marker)
+            if end_idx < 0:
+                log("  ⚠ could not find executeAlbumTransfer end")
             else:
-                log("  ⚠ copy: function not found")
+                new_fn = """    fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {
+        val transfer = _pendingAlbumTransfer.value ?: return
+        val ctx = appContext ?: return
+        viewModelScope.launch {
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            // DB-source pins — safe when user navigates away from source board
+            val sourcePins = withContext(Dispatchers.IO) {
+                dao.getPinsForBoard(transfer.sourceBoardId)
+                    .filter { transfer.pinIds.contains(it.id) }
+                    .map { it.toPinItem() }
+            }
+            if (sourcePins.isEmpty()) {
+                _pendingAlbumTransfer.value = null
+                _snackbarMessage.value = "No images to transfer"
+                return@launch
+            }
+            val albumId = targetAlbum.id
+            if (transfer.sourceBoardId == targetBoardId) {
+                withContext(Dispatchers.IO) {
+                    sourcePins.forEach { pin -> dao.movePinsToAlbum(listOf(pin.id), albumId) }
+                }
+            } else {
+                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(targetBoardId).toSet() }
+                val toAdd = sourcePins.filter { !existingUrls.contains(it.imageUrl) }
+                    .map { it.copy(albumId = albumId) }
+                withContext(Dispatchers.IO) {
+                    if (toAdd.isNotEmpty()) {
+                        dao.upsertPinsSafely(toAdd.mapIndexed { i, p ->
+                            PinEntity.fromPinItem(p, targetBoardId, i)
+                        })
+                    }
+                    if (transfer.mode == AlbumTransferMode.MOVE) {
+                        dao.deletePinsFromBoard(transfer.sourceBoardId, transfer.pinIds.toList())
+                    }
+                }
+            }
+            val curr = _currentBoard.value
+            if (curr != null && (curr.id == targetBoardId || curr.id == transfer.sourceBoardId)) {
+                val refreshed = withContext(Dispatchers.IO) {
+                    dao.getPinsForBoard(curr.id).map { it.toPinItem() }
+                }
+                withContext(Dispatchers.Main) {
+                    _rawPins.value = refreshed
+                    _currentBoard.value = curr.copy(pins = refreshed, pinCount = refreshed.size)
+                    updateDisplayedPins()
+                }
+            }
+            _pendingAlbumTransfer.value = null
+            withContext(Dispatchers.Main) {
+                clearSelection()
+                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${sourcePins.size} image(s) to ${targetAlbum.title}"
+            }
+        }
+    }
+"""
+                t = t[:idx] + new_fn + t[end_idx:]
+                vm_changed = True
+                log("  ✓ executeAlbumTransfer rewritten (DB-sourced)")
 
-    # 3. moveSelectedPinsToBoards — idempotent
-    if "val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }" in t:
-        log("  ✓ move already patched")
-    else:
-        old_move = (
-            "            val dao = AppDatabase.getDatabase(ctx).boardDao()\n"
-            "            withContext(Dispatchers.IO) {\n"
-            "                // 1. Copy to target boards\n"
-            "                for (targetId in targetBoardIds) {\n"
-            "                    if (targetId == sourceBoard.id) continue\n"
-            "                    val existingIds = dao.getPinIdsForBoard(targetId).toSet()\n"
-            "                    val existingUrls = dao.getImageUrlsForBoard(targetId).toSet()\n"
-            "                    val newForTarget = pinsToMove.filter {\n"
-            "                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)\n"
-            "                    }\n"
-            "                    if (newForTarget.isNotEmpty()) {\n"
-            "                        val targetEntity = dao.getBoardById(targetId)\n"
-            "                        if (targetEntity != null) {\n"
-            "                            val existingPins = dao.getPinsForBoard(targetId).map { it.toPinItem() }\n"
-            "                            val combined = (newForTarget + existingPins).distinctBy { it.id }\n"
-            "                            val entities = combined.mapIndexed { idx, pin ->\n"
-            "                                PinEntity.fromPinItem(pin, targetId, idx)\n"
-            "                            }\n"
-            "                            dao.saveFullBoard(targetEntity, entities)\n"
-            "                        } else {\n"
-            "                            val entities = newForTarget.mapIndexed { idx, pin ->\n"
-            "                                PinEntity.fromPinItem(pin, targetId, existingIds.size + idx)\n"
-            "                            }\n"
-            "                            dao.insertPins(entities)\n"
-            "                        }\n"
-            "                    }\n"
-            "                }\n"
-            "                // 2. Delete from source board in Room\n"
-            "                dao.deletePinsFromBoard(sourceBoard.id, pinIds.toList())\n"
-            "                refreshAvailableBoardsFromDatabaseInternal(dao)\n"
-            "            }\n"
-        )
-        new_move = (
-            "            val dao = AppDatabase.getDatabase(ctx).boardDao()\n"
-            "            // Guard: exclude self board (prevents data loss)\n"
-            "            val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }\n"
-            "            if (nonSelfTargets.isEmpty()) {\n"
-            "                clearSelection()\n"
-            "                _snackbarMessage.value = \"Cannot move to the same board\"\n"
-            "                return@launch\n"
-            "            }\n"
-            "            withContext(Dispatchers.IO) {\n"
-            "                for (targetId in nonSelfTargets) {\n"
-            "                    val existingIds = dao.getPinIdsForBoard(targetId).toSet()\n"
-            "                    val existingUrls = dao.getImageUrlsForBoard(targetId).toSet()\n"
-            "                    val newForTarget = pinsToMove.filter {\n"
-            "                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)\n"
-            "                    }\n"
-            "                    if (newForTarget.isNotEmpty()) {\n"
-            "                        val entities = newForTarget.mapIndexed { idx, pin ->\n"
-            "                            PinEntity.fromPinItem(pin.copy(albumId = null), targetId, existingIds.size + idx)\n"
-            "                        }\n"
-            "                        dao.upsertPinsSafely(entities)\n"
-            "                    }\n"
-            "                }\n"
-            "                dao.deletePinsFromBoard(sourceBoard.id, pinIds.toList())\n"
-            "                refreshAvailableBoardsFromDatabaseInternal(dao)\n"
-            "            }\n"
-        )
-        if old_move in t:
-            t = t.replace(old_move, new_move, 1); changed = True
-            log("  ✓ move: self-guard, null albumId, upsert")
+    # 2) moveToTopInternal — take sourceBoardId param
+    old_marker = "    private suspend fun moveToTopInternal(pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {"
+    new_marker = "    private suspend fun moveToTopInternal(sourceBoardId: String, pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {"
+    if new_marker in t:
+        log("  ✓ moveToTopInternal already patched")
+    elif old_marker in t:
+        end_idx = find_function_end(t, old_marker)
+        if end_idx > 0:
+            idx = t.find(old_marker)
+            new_fn = """    private suspend fun moveToTopInternal(sourceBoardId: String, pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {
+        val allPins = withContext(Dispatchers.IO) {
+            dao.getPinsForBoard(sourceBoardId).map { it.toPinItem() }
+        }
+        val allAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(sourceBoardId) }
+        val maxPinDate = allPins.maxOfOrNull { it.dateAddedMillis } ?: 0L
+        val maxAlbumDate = allAlbums.maxOfOrNull { it.dateAddedMillis } ?: 0L
+        var nextDate = maxOf(maxPinDate, maxAlbumDate) + 60_000L
+
+        val affectedAlbumIds = mutableSetOf<String>()
+        val updatedPins = allPins.map { p ->
+            if (pinIds.contains(p.id)) {
+                p.albumId?.let { affectedAlbumIds.add(it) }
+                p.copy(albumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }
+            } else p
+        }
+
+        val updatedAlbums = allAlbums.map { a ->
+            if (albumIds.contains(a.id)) {
+                a.copy(dateAddedMillis = nextDate).also { nextDate += 1000L }
+            } else a
+        }
+
+        val nonEmptyAlbumIds = updatedPins.mapNotNull { it.albumId }.toSet()
+        val dissolvedAlbumIds = affectedAlbumIds - nonEmptyAlbumIds
+        val finalAlbums = updatedAlbums.filterNot { it.id in dissolvedAlbumIds }
+
+        withContext(Dispatchers.IO) {
+            dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, sourceBoardId, i) })
+            updatedAlbums.filter { it.id in albumIds }.forEach { dao.insertAlbum(it) }
+            dissolvedAlbumIds.forEach { dao.deleteAlbum(it) }
+        }
+
+        val curr = _currentBoard.value
+        if (curr != null && curr.id == sourceBoardId) {
+            withContext(Dispatchers.Main) {
+                _rawPins.value = updatedPins
+                _customAlbums.value = finalAlbums
+                _currentBoard.value = curr.copy(pins = updatedPins, pinCount = updatedPins.size)
+                updateDisplayedPins(resetLimit = true)
+            }
+        }
+    }
+"""
+            t = t[:idx] + new_fn + t[end_idx:]
+            vm_changed = True
+            log("  ✓ moveToTopInternal rewritten (sourceBoardId param)")
         else:
-            log("  ⚠ move anchor missing")
+            log("  ⚠ could not find moveToTopInternal end")
+    else:
+        log("  ⚠ moveToTopInternal marker not found")
 
-    if changed:
-        f.write_text(t, encoding="utf-8")
+    # 3) executeAlbumTransferToCurrentBoard — fetch from DB, new moveToTopInternal call
+    marker_cb = "    fun executeAlbumTransferToCurrentBoard() {"
+    if "// DB-source pins — safe when navigating to another board" in t:
+        log("  ✓ executeAlbumTransferToCurrentBoard already patched")
+    elif marker_cb in t:
+        end_idx = find_function_end(t, marker_cb)
+        if end_idx > 0:
+            idx = t.find(marker_cb)
+            new_fn = """    fun executeAlbumTransferToCurrentBoard() {
+        val transfer = _pendingAlbumTransfer.value ?: return
+        val currentBoard = _currentBoard.value ?: return
+        viewModelScope.launch {
+            val ctx = appContext ?: return@launch
+            val dao = AppDatabase.getDatabase(ctx).boardDao()
+            // DB-source pins — safe when navigating to another board
+            val sourcePins = withContext(Dispatchers.IO) {
+                dao.getPinsForBoard(transfer.sourceBoardId)
+                    .filter { transfer.pinIds.contains(it.id) }
+                    .map { it.toPinItem() }
+            }
+            if (sourcePins.isEmpty()) {
+                _pendingAlbumTransfer.value = null
+                _snackbarMessage.value = "No images to transfer"
+                return@launch
+            }
+            if (currentBoard.id == transfer.sourceBoardId) {
+                if (transfer.mode == AlbumTransferMode.MOVE) {
+                    moveToTopInternal(transfer.sourceBoardId, sourcePins.map { it.id }.toSet(), emptySet(), dao)
+                    _snackbarMessage.value = "Moved ${sourcePins.size} to top of board"
+                } else {
+                    _snackbarMessage.value = "Already on this board"
+                }
+            } else {
+                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(currentBoard.id).toSet() }
+                val baseDate = System.currentTimeMillis()
+                val toAdd = sourcePins.filter { !existingUrls.contains(it.imageUrl) }
+                    .mapIndexed { i, p -> p.copy(albumId = null, dateAddedMillis = baseDate + i * 1000L) }
+                withContext(Dispatchers.IO) {
+                    if (toAdd.isNotEmpty()) {
+                        dao.upsertPinsSafely(toAdd.mapIndexed { i, p ->
+                            PinEntity.fromPinItem(p, currentBoard.id, i)
+                        })
+                    }
+                    if (transfer.mode == AlbumTransferMode.MOVE) {
+                        dao.deletePinsFromBoard(transfer.sourceBoardId, transfer.pinIds.toList())
+                    }
+                }
+                val refreshed = withContext(Dispatchers.IO) {
+                    dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() }
+                }
+                withContext(Dispatchers.Main) {
+                    _rawPins.value = refreshed
+                    _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
+                    updateDisplayedPins()
+                }
+                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${toAdd.size} to ${currentBoard.title}"
+            }
+            _pendingAlbumTransfer.value = null
+            withContext(Dispatchers.Main) { clearSelection() }
+        }
+    }
+"""
+            t = t[:idx] + new_fn + t[end_idx:]
+            vm_changed = True
+            log("  ✓ executeAlbumTransferToCurrentBoard rewritten (DB-sourced)")
+        else:
+            log("  ⚠ could not find executeAlbumTransferToCurrentBoard end")
+    else:
+        log("  ⚠ executeAlbumTransferToCurrentBoard marker not found")
 
+    if vm_changed:
+        vm_f.write_text(t, encoding="utf-8")
 
-# ============================================================
-# Self-verify
-# ============================================================
-def verify_patches():
+    # ---------- Banner dedupe ----------
+    ps_t = ps_f.read_text(encoding="utf-8")
+    start_marker = "    // Pending album transfer banner"
+    end_marker = "\n    // Album position dialog"
+    start_idx = ps_t.find(start_marker)
+    if start_idx < 0:
+        log("  ⚠ banner start marker not found")
+    else:
+        end_idx = ps_t.find(end_marker, start_idx)
+        if end_idx < 0:
+            log("  ⚠ banner end marker not found")
+        else:
+            clean_banner = """    // Pending album transfer banner (single, canonical)
+    androidx.compose.foundation.layout.Box(modifier = Modifier.fillMaxSize()) {
+        pendingAlbumTransfer?.let { transfer ->
+            androidx.compose.material3.Surface(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 16.dp, start = 12.dp, end = 12.dp)
+                    .fillMaxWidth()
+                    .testTag("pending_album_transfer_banner"),
+                shape = RoundedCornerShape(16.dp),
+                color = PinterestBlack,
+                shadowElevation = 8.dp
+            ) {
+                androidx.compose.foundation.layout.Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    androidx.compose.material3.IconButton(
+                        onClick = { viewModel.cancelAlbumTransferAndRestore() },
+                        modifier = Modifier.testTag("album_transfer_back_btn")
+                    ) {
+                        androidx.compose.material3.Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back to selection",
+                            tint = Color.White
+                        )
+                    }
+                    Text(
+                        text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",
+                        color = Color.White,
+                        fontSize = 13.sp,
+                        fontWeight = FontWeight.Medium,
+                        modifier = Modifier.weight(1f)
+                    )
+                    androidx.compose.material3.TextButton(
+                        onClick = { viewModel.executeAlbumTransferToCurrentBoard() },
+                        modifier = Modifier.testTag("album_transfer_here_btn")
+                    ) {
+                        Text(
+                            text = if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "Move here" else "Copy here",
+                            color = Color(0xFF64B5F6),
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 12.sp
+                        )
+                    }
+                }
+            }
+        }
+    }
+"""
+            ps_t = ps_t[:start_idx] + clean_banner + ps_t[end_idx:]
+            ps_f.write_text(ps_t, encoding="utf-8")
+            log("  ✓ banner replaced (canonical — single button)")
+
+    # ---------- Self-verify ----------
     log("\n=== Self-verify ===")
+    t_v = vm_f.read_text(encoding="utf-8")
+    t_p = ps_f.read_text(encoding="utf-8")
+
     checks = [
-        ("app/src/main/java/com/example/ui/ShareTargetActivity.kt", [
-            "onHoldBoard: (String, Boolean) -> Unit",
-            "onHoldBoard(board.id, extractMultipleImages)",
-            "dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->",
-        ]),
-        ("app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt", [
-            "availableBoards.filter { it.id != currentBoardId }",
-            "to Album/Board",
-        ]),
-        ("app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt", [
-            "val nonSelfTargets = targetBoardIds.filter { it != sourceBoard.id }",
-            "Cross-board copy: null albumId",
-            "dao.upsertPinsSafely(pinsToInsert)",
-        ]),
+        ("executeAlbumTransfer DB-sourced", "// DB-source pins" in t_v),
+        ("executeAlbumTransferToCurrentBoard DB-sourced", "// DB-source pins — safe when navigating to another board" in t_v),
+        ("moveToTopInternal sourceBoardId", "private suspend fun moveToTopInternal(sourceBoardId: String" in t_v),
+        ("Banner single button", t_p.count('testTag("album_transfer_here_btn")') == 1),
+        ("Banner back button", "album_transfer_back_btn" in t_p),
+        ("moveToTopInternal call updated", "moveToTopInternal(transfer.sourceBoardId, sourcePins.map { it.id }.toSet(), emptySet(), dao)" in t_v),
     ]
-    for rel, markers in checks:
-        fp = PROJECT_ROOT / rel
-        if not fp.exists():
-            log(f"  ✗ {rel} missing"); sys.exit(1)
-        content = fp.read_text(encoding="utf-8")
-        for m in markers:
-            if m not in content:
-                log(f"  ✗ MISSING in {rel}: {m[:60]}")
-                sys.exit(1)
-        log(f"  ✓ {rel.split('/')[-1]}")
+    all_ok = True
+    for label, ok in checks:
+        log(f"  {'✓' if ok else '✗'} {label}")
+        if not ok: all_ok = False
+    if not all_ok:
+        log("\n✗ VERIFICATION FAILED"); sys.exit(1)
 
 
 # ============================================================
@@ -548,7 +527,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Fix copy anchor indentation (data-loss fix now applies)"])
+        run(["git", "commit", "-m", "Fix transfer: DB-source pins + single banner button"])
 
 
 def verify_keystore_tracked():
@@ -697,16 +676,13 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — fix copy anchor + idempotent patches")
+    log("PinBoard — transfer DB-source fix + banner dedupe")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_share_activity()
-    patch_copy_move_dialog()
-    patch_viewmodel()
-    verify_patches()
+    patch_transfer_bugs()
 
     ensure_release_keystore()
     patch_build_gradle()
