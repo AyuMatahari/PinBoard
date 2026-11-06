@@ -115,6 +115,14 @@ class PinBoardViewModel(
     private val _pendingAlbumTransfer = MutableStateFlow<PendingAlbumTransfer?>(null)
     val pendingAlbumTransfer: StateFlow<PendingAlbumTransfer?> = _pendingAlbumTransfer.asStateFlow()
 
+    private val _imageRefreshCounters = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val imageRefreshCounters: StateFlow<Map<String, Int>> = _imageRefreshCounters.asStateFlow()
+
+    fun refreshImage(pinId: String) {
+        val current = _imageRefreshCounters.value[pinId] ?: 0
+        _imageRefreshCounters.value = _imageRefreshCounters.value + (pinId to (current + 1))
+    }
+
     private val _repositioningAlbumId = MutableStateFlow<String?>(null)
     val repositioningAlbumId: StateFlow<String?> = _repositioningAlbumId.asStateFlow()
 
@@ -2738,8 +2746,10 @@ class PinBoardViewModel(
             val dao = AppDatabase.getDatabase(ctx).boardDao()
             val albumId = "album_${System.currentTimeMillis()}_${(1000..9999).random()}"
             val albumDate = resolveInsertionMillis(position, selectedPins, _rawPins.value)
+            // If user is inside an album, nest the new one under it
+            val parentAlbumId = _activeAlbum.value?.id
             val entity = CustomAlbumEntity(
-                id = albumId, boardId = board.id, parentAlbumId = null,
+                id = albumId, boardId = board.id, parentAlbumId = parentAlbumId,
                 title = "Album (${selectedPins.size} images)",
                 sourceUrl = "", dateAddedMillis = albumDate,
                 orderIndex = 0, isFavorite = false
@@ -3097,14 +3107,28 @@ class PinBoardViewModel(
 
 
     // Comprehensive executeAlbumTransferToCurrentBoard — handles pins + albums
+    // New: opened-album-aware executeAlbumTransferToCurrentBoard
     fun executeAlbumTransferToCurrentBoard() {
         val transfer = _pendingAlbumTransfer.value ?: return
         val currentBoard = _currentBoard.value ?: return
+        val openedAlbum = _activeAlbum.value
         viewModelScope.launch {
             val ctx = appContext ?: return@launch
             val dao = AppDatabase.getDatabase(ctx).boardDao()
             try {
-                if (currentBoard.id == transfer.sourceBoardId) {
+                if (openedAlbum != null) {
+                    // Transfer directly into opened album
+                    val (pinCount, albumCount) = performTransfer(
+                        dao = dao, sourceBoardId = transfer.sourceBoardId,
+                        pinIds = transfer.pinIds, albumIds = transfer.albumIds,
+                        targetBoardId = currentBoard.id, targetAlbumId = openedAlbum.id,
+                        mode = transfer.mode
+                    )
+                    val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
+                    val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
+                    val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
+                    _snackbarMessage.value = "$verb $pinPart$albumPart into \"${openedAlbum.title}\""
+                } else if (currentBoard.id == transfer.sourceBoardId) {
                     if (transfer.mode == AlbumTransferMode.MOVE) {
                         moveToTopInternal(transfer.sourceBoardId, transfer.pinIds, transfer.albumIds, dao)
                         _snackbarMessage.value = "Moved to top of board"
@@ -3118,18 +3142,19 @@ class PinBoardViewModel(
                         targetBoardId = currentBoard.id, targetAlbumId = null,
                         mode = transfer.mode
                     )
-                    val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() } }
-                    val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(currentBoard.id) }
-                    withContext(Dispatchers.Main) {
-                        _rawPins.value = refreshed
-                        _customAlbums.value = refreshedAlbums
-                        _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
-                        updateDisplayedPins()
-                    }
                     val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
                     val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
                     val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
                     _snackbarMessage.value = "$verb $pinPart$albumPart to ${currentBoard.title}"
+                }
+                // Refresh current board view
+                val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() } }
+                val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(currentBoard.id) }
+                withContext(Dispatchers.Main) {
+                    _rawPins.value = refreshed
+                    _customAlbums.value = refreshedAlbums
+                    _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
+                    updateDisplayedPins()
                 }
             } catch (e: IllegalStateException) {
                 _snackbarMessage.value = e.message ?: "Cannot transfer"
@@ -3139,6 +3164,7 @@ class PinBoardViewModel(
             }
         }
     }
+
 
 
 

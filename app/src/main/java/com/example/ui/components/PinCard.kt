@@ -57,6 +57,7 @@ fun PinCard(
     isFavorite: Boolean = false,
     hideTitleAndAuthor: Boolean = false,
     isNew: Boolean = false,
+    refreshCounter: Int = 0,
     onClick: () -> Unit,
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier
@@ -102,6 +103,12 @@ fun PinCard(
             AsyncImage(
                 model = ImageRequest.Builder(context)
                     .data(pin.thumbnailUrl.ifBlank { pin.imageUrl })
+                    .apply {
+                        if (refreshCounter > 0) {
+                            memoryCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
+                            diskCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
+                        }
+                    }
                     .crossfade(true)
                     .build(),
                 contentDescription = pin.title,

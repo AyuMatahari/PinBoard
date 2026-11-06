@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — Album/Board transfer for pins + albums + mixed
+PinBoard Gallery — Sub-album selection, drill-in transfer, refresh, board picker
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -94,275 +94,93 @@ def find_function_end(t, start_marker):
     return -1
 
 
-def patch_transfer_albums():
-    log("\n=== PATCH: Transfer albums + mixed selection ===")
-    vm_f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
-    ps_f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    if not vm_f.exists(): log("  ✗ VM missing"); sys.exit(1)
-    if not ps_f.exists(): log("  ✗ Screen missing"); sys.exit(1)
-
-    t = vm_f.read_text(encoding="utf-8")
+# ============================================================
+# PATCH 1 — ViewModel: refresh counters, nested combine, opened-album transfer
+# ============================================================
+def patch_viewmodel():
+    log("\n=== PATCH: ViewModel ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
     changed = False
 
-    # ---------- 1. PendingAlbumTransfer: add albumIds ----------
-    old_dc = (
-        'data class PendingAlbumTransfer(\n'
-        '    val pinIds: Set<String>,\n'
-        '    val mode: AlbumTransferMode,\n'
-        '    val sourceBoardId: String,\n'
-        '    val savedSelectionPinIds: Set<String>,\n'
-        '    val savedSelectionAlbumIds: Set<String>\n'
-        ')\n'
-    )
-    new_dc = (
-        'data class PendingAlbumTransfer(\n'
-        '    val pinIds: Set<String>,\n'
-        '    val albumIds: Set<String>,\n'
-        '    val mode: AlbumTransferMode,\n'
-        '    val sourceBoardId: String,\n'
-        '    val savedSelectionPinIds: Set<String>,\n'
-        '    val savedSelectionAlbumIds: Set<String>\n'
-        ')\n'
-    )
-    if old_dc in t:
-        t = t.replace(old_dc, new_dc, 1); changed = True
-        log("  ✓ PendingAlbumTransfer.albumIds added")
-    elif 'val albumIds: Set<String>,\n    val mode: AlbumTransferMode' in t:
-        log("  ✓ PendingAlbumTransfer already has albumIds")
-
-    # ---------- 2. beginAlbumTransfer new signature ----------
-    old_bm = "    fun beginAlbumTransfer(pinIds: Set<String>, mode: AlbumTransferMode) {"
-    new_bm = "    fun beginAlbumTransfer(pinIds: Set<String>, albumIds: Set<String>, mode: AlbumTransferMode) {"
-    if new_bm in t:
-        log("  ✓ beginAlbumTransfer already 3-arg")
-    elif old_bm in t:
-        end_idx = find_function_end(t, old_bm)
-        if end_idx > 0:
-            idx = t.find(old_bm)
-            new_fn = """    fun beginAlbumTransfer(pinIds: Set<String>, albumIds: Set<String>, mode: AlbumTransferMode) {
-        if (pinIds.isEmpty() && albumIds.isEmpty()) return
-        val board = _currentBoard.value ?: return
-        _pendingAlbumTransfer.value = PendingAlbumTransfer(
-            pinIds = pinIds, albumIds = albumIds, mode = mode, sourceBoardId = board.id,
-            savedSelectionPinIds = _selectedPinIds.value,
-            savedSelectionAlbumIds = _selectedAlbumIds.value
+    # 1a. Add imageRefreshCounters state + refreshImage method
+    if "_imageRefreshCounters" not in t:
+        anchor = (
+            "    private val _pendingAlbumTransfer = MutableStateFlow<PendingAlbumTransfer?>(null)\n"
+            "    val pendingAlbumTransfer: StateFlow<PendingAlbumTransfer?> = _pendingAlbumTransfer.asStateFlow()\n"
         )
-        _isSelectionMode.value = false
-    }
-"""
-            t = t[:idx] + new_fn + t[end_idx:]
-            changed = True
-            log("  ✓ beginAlbumTransfer updated")
-
-    # ---------- 3. performTransfer helper ----------
-    if "private suspend fun performTransfer(" not in t:
-        anchor = "    fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {"
-        idx = t.find(anchor)
-        if idx < 0:
-            log("  ✗ executeAlbumTransfer anchor not found (for helper insert)")
+        add = (
+            anchor +
+            "\n"
+            "    private val _imageRefreshCounters = MutableStateFlow<Map<String, Int>>(emptyMap())\n"
+            "    val imageRefreshCounters: StateFlow<Map<String, Int>> = _imageRefreshCounters.asStateFlow()\n"
+            "\n"
+            "    fun refreshImage(pinId: String) {\n"
+            "        val current = _imageRefreshCounters.value[pinId] ?: 0\n"
+            "        _imageRefreshCounters.value = _imageRefreshCounters.value + (pinId to (current + 1))\n"
+            "    }\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ imageRefreshCounters + refreshImage")
         else:
-            helper = '''    private suspend fun performTransfer(
-        dao: BoardDao,
-        sourceBoardId: String,
-        pinIds: Set<String>,
-        albumIds: Set<String>,
-        targetBoardId: String,
-        targetAlbumId: String?,
-        mode: AlbumTransferMode
-    ): Pair<Int, Int> {
-        val sourcePins = dao.getPinsForBoard(sourceBoardId).map { it.toPinItem() }
-        val sourceAlbums = dao.getAlbumsForBoard(sourceBoardId)
-        val selectedAlbums = sourceAlbums.filter { albumIds.contains(it.id) }
-        if (selectedAlbums.isEmpty() && pinIds.isEmpty()) return 0 to 0
-        val selectedAlbumIdSet = selectedAlbums.map { it.id }.toSet()
+            log("  ⚠ pendingAlbumTransfer anchor missing for refreshImage")
 
-        // Full album tree (selected + all descendants)
-        val albumIdsInTransfer = mutableSetOf<String>()
-        val toVisit = selectedAlbums.map { it.id }.toMutableList()
-        while (toVisit.isNotEmpty()) {
-            val id = toVisit.removeAt(0)
-            if (!albumIdsInTransfer.add(id)) continue
-            sourceAlbums.filter { it.parentAlbumId == id }.forEach { toVisit.add(it.id) }
-        }
+    # 1b. combineSelectedPinsToNewAlbum: nest under activeAlbum if inside one
+    if "val parentAlbumId = _activeAlbum.value?.id" not in t:
+        old_combine = (
+            "            val entity = CustomAlbumEntity(\n"
+            "                id = albumId, boardId = board.id, parentAlbumId = null,\n"
+            "                title = \"Album (${selectedPins.size} images)\",\n"
+            "                sourceUrl = \"\", dateAddedMillis = albumDate,\n"
+            "                orderIndex = 0, isFavorite = false\n"
+            "            )\n"
+        )
+        new_combine = (
+            "            // If user is inside an album, nest the new one under it\n"
+            "            val parentAlbumId = _activeAlbum.value?.id\n"
+            "            val entity = CustomAlbumEntity(\n"
+            "                id = albumId, boardId = board.id, parentAlbumId = parentAlbumId,\n"
+            "                title = \"Album (${selectedPins.size} images)\",\n"
+            "                sourceUrl = \"\", dateAddedMillis = albumDate,\n"
+            "                orderIndex = 0, isFavorite = false\n"
+            "            )\n"
+        )
+        if old_combine in t:
+            t = t.replace(old_combine, new_combine, 1); changed = True
+            log("  ✓ combine nests under active album")
+        else:
+            log("  ⚠ combine entity anchor missing")
 
-        // Cycle prevention
-        if (targetAlbumId != null && albumIdsInTransfer.contains(targetAlbumId)) {
-            throw IllegalStateException("Cannot transfer an album into itself or its descendants")
-        }
-
-        // Pins traveling with albums
-        val pinsInAlbums = sourcePins.filter { it.albumId != null && albumIdsInTransfer.contains(it.albumId) }
-        // Standalone pins (explicitly selected, not in transferred albums)
-        val standalonePins = sourcePins.filter { pinIds.contains(it.id) && (it.albumId == null || !albumIdsInTransfer.contains(it.albumId)) }
-
-        val targetPinDates = dao.getPinsForBoard(targetBoardId).map { it.dateAddedMillis }
-        val targetAlbumDates = dao.getAlbumsForBoard(targetBoardId).map { it.dateAddedMillis }
-        var nextDate = maxOf(targetPinDates.maxOrNull() ?: 0L, targetAlbumDates.maxOrNull() ?: 0L) + 60_000L
-        val crossingBoard = sourceBoardId != targetBoardId
-
-        fun isRootOfTransfer(album: com.example.data.local.CustomAlbumEntity): Boolean {
-            var p = album.parentAlbumId
-            while (p != null) {
-                if (selectedAlbumIdSet.contains(p)) return false
-                p = sourceAlbums.firstOrNull { it.id == p }?.parentAlbumId
-            }
-            return true
-        }
-
-        when (mode) {
-            AlbumTransferMode.COPY -> {
-                val albumIdMap = mutableMapOf<String, String>()
-                val albumsToCopy = sourceAlbums.filter { albumIdsInTransfer.contains(it.id) }
-                val roots = selectedAlbums.filter { isRootOfTransfer(it) }
-                val ordered = mutableListOf<com.example.data.local.CustomAlbumEntity>()
-                val visited = mutableSetOf<String>()
-                fun visit(album: com.example.data.local.CustomAlbumEntity) {
-                    if (!visited.add(album.id)) return
-                    ordered.add(album)
-                    albumsToCopy.filter { it.parentAlbumId == album.id }.forEach { visit(it) }
-                }
-                roots.forEach { visit(it) }
-                albumsToCopy.forEach { if (it.id !in visited) visit(it) }
-
-                var pinCounter = 0
-                val newPins = mutableListOf<PinEntity>()
-                ordered.forEach { album ->
-                    val newId = "album_copy_${System.currentTimeMillis()}_${(1000..9999).random()}"
-                    albumIdMap[album.id] = newId
-                    val newParent = if (isRootOfTransfer(album)) targetAlbumId else albumIdMap[album.parentAlbumId]
-                    val thisDate = nextDate; nextDate += 1000L
-                    dao.insertAlbum(album.copy(
-                        id = newId, boardId = targetBoardId,
-                        parentAlbumId = newParent, dateAddedMillis = thisDate
-                    ))
-                    pinsInAlbums.filter { it.albumId == album.id }.forEach { pin ->
-                        val thisPinDate = nextDate; nextDate += 100L
-                        newPins.add(PinEntity.fromPinItem(
-                            pin.copy(
-                                id = "pin_copy_${System.currentTimeMillis()}_${pinCounter}_${(1000..9999).random()}",
-                                albumId = newId, dateAddedMillis = thisPinDate
-                            ),
-                            targetBoardId, pinCounter++
-                        ))
-                    }
-                }
-                standalonePins.forEach { pin ->
-                    val thisPinDate = nextDate; nextDate += 100L
-                    newPins.add(PinEntity.fromPinItem(
-                        pin.copy(
-                            id = "pin_copy_${System.currentTimeMillis()}_${pinCounter}_${(1000..9999).random()}",
-                            albumId = targetAlbumId, dateAddedMillis = thisPinDate
-                        ),
-                        targetBoardId, pinCounter++
-                    ))
-                }
-                if (newPins.isNotEmpty()) dao.upsertPinsSafely(newPins)
-                return newPins.size to ordered.size
-            }
-            AlbumTransferMode.MOVE -> {
-                val albumsToMove = sourceAlbums.filter { albumIdsInTransfer.contains(it.id) }
-                albumsToMove.forEach { album ->
-                    val newParent = if (isRootOfTransfer(album)) targetAlbumId else album.parentAlbumId
-                    val newDate = if (isRootOfTransfer(album)) { val d = nextDate; nextDate += 1000L; d } else album.dateAddedMillis
-                    dao.insertAlbum(album.copy(
-                        boardId = targetBoardId, parentAlbumId = newParent, dateAddedMillis = newDate
-                    ))
-                }
-                if (crossingBoard) {
-                    val movedPins = pinsInAlbums.map { pin ->
-                        PinEntity.fromPinItem(pin, targetBoardId, pin.boardPosition)
-                    }
-                    if (movedPins.isNotEmpty()) {
-                        dao.upsertPinsSafely(movedPins)
-                        dao.deletePinsFromBoard(sourceBoardId, pinsInAlbums.map { it.id })
-                    }
-                }
-                val standaloneEntities = standalonePins.mapIndexed { i, pin ->
-                    PinEntity.fromPinItem(
-                        pin.copy(albumId = targetAlbumId, dateAddedMillis = nextDate + i * 100L),
-                        targetBoardId, i
-                    )
-                }
-                if (standaloneEntities.isNotEmpty()) {
-                    dao.upsertPinsSafely(standaloneEntities)
-                    if (crossingBoard) {
-                        dao.deletePinsFromBoard(sourceBoardId, standalonePins.map { it.id })
-                    }
-                }
-                return standalonePins.size + pinsInAlbums.size to albumsToMove.size
-            }
-        }
-    }
-
-'''
-            t = t[:idx] + helper + t[idx:]
-            changed = True
-            log("  ✓ performTransfer helper added")
-
-    # ---------- 4. executeAlbumTransfer replaced ----------
-    marker = "    fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {"
-    if "// Comprehensive executeAlbumTransfer" not in t and marker in t:
+    # 1c. executeAlbumTransferToCurrentBoard: use opened album as target
+    marker = "    fun executeAlbumTransferToCurrentBoard() {"
+    if "// New: opened-album-aware" not in t and marker in t:
         end_idx = find_function_end(t, marker)
         if end_idx > 0:
             idx = t.find(marker)
-            new_fn = '''    // Comprehensive executeAlbumTransfer — handles pins + albums
-    fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {
-        val transfer = _pendingAlbumTransfer.value ?: return
-        val ctx = appContext ?: return
-        viewModelScope.launch {
-            val dao = AppDatabase.getDatabase(ctx).boardDao()
-            try {
-                val (pinCount, albumCount) = performTransfer(
-                    dao = dao, sourceBoardId = transfer.sourceBoardId,
-                    pinIds = transfer.pinIds, albumIds = transfer.albumIds,
-                    targetBoardId = targetBoardId, targetAlbumId = targetAlbum.id,
-                    mode = transfer.mode
-                )
-                val curr = _currentBoard.value
-                if (curr != null) {
-                    val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(curr.id).map { it.toPinItem() } }
-                    val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(curr.id) }
-                    withContext(Dispatchers.Main) {
-                        _rawPins.value = refreshed
-                        _customAlbums.value = refreshedAlbums
-                        _currentBoard.value = curr.copy(pins = refreshed, pinCount = refreshed.size)
-                        updateDisplayedPins()
-                    }
-                }
-                _pendingAlbumTransfer.value = null
-                withContext(Dispatchers.Main) {
-                    clearSelection()
-                    val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
-                    val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
-                    val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
-                    _snackbarMessage.value = "$verb $pinPart$albumPart to \\"${targetAlbum.title}\\""
-                }
-            } catch (e: IllegalStateException) {
-                _pendingAlbumTransfer.value = null
-                withContext(Dispatchers.Main) { _snackbarMessage.value = e.message ?: "Cannot transfer" }
-            }
-        }
-    }
-'''
-            t = t[:idx] + new_fn + t[end_idx:]
-            changed = True
-            log("  ✓ executeAlbumTransfer replaced (handles albums)")
-
-    # ---------- 5. executeAlbumTransferToCurrentBoard replaced ----------
-    marker2 = "    fun executeAlbumTransferToCurrentBoard() {"
-    if "// Comprehensive executeAlbumTransferToCurrentBoard" not in t and marker2 in t:
-        end_idx = find_function_end(t, marker2)
-        if end_idx > 0:
-            idx = t.find(marker2)
-            new_fn = '''    // Comprehensive executeAlbumTransferToCurrentBoard — handles pins + albums
+            new_fn = '''    // New: opened-album-aware executeAlbumTransferToCurrentBoard
     fun executeAlbumTransferToCurrentBoard() {
         val transfer = _pendingAlbumTransfer.value ?: return
         val currentBoard = _currentBoard.value ?: return
+        val openedAlbum = _activeAlbum.value
         viewModelScope.launch {
             val ctx = appContext ?: return@launch
             val dao = AppDatabase.getDatabase(ctx).boardDao()
             try {
-                if (currentBoard.id == transfer.sourceBoardId) {
+                if (openedAlbum != null) {
+                    // Transfer directly into opened album
+                    val (pinCount, albumCount) = performTransfer(
+                        dao = dao, sourceBoardId = transfer.sourceBoardId,
+                        pinIds = transfer.pinIds, albumIds = transfer.albumIds,
+                        targetBoardId = currentBoard.id, targetAlbumId = openedAlbum.id,
+                        mode = transfer.mode
+                    )
+                    val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
+                    val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
+                    val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
+                    _snackbarMessage.value = "$verb $pinPart$albumPart into \\"${openedAlbum.title}\\""
+                } else if (currentBoard.id == transfer.sourceBoardId) {
                     if (transfer.mode == AlbumTransferMode.MOVE) {
                         moveToTopInternal(transfer.sourceBoardId, transfer.pinIds, transfer.albumIds, dao)
                         _snackbarMessage.value = "Moved to top of board"
@@ -376,18 +194,19 @@ def patch_transfer_albums():
                         targetBoardId = currentBoard.id, targetAlbumId = null,
                         mode = transfer.mode
                     )
-                    val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() } }
-                    val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(currentBoard.id) }
-                    withContext(Dispatchers.Main) {
-                        _rawPins.value = refreshed
-                        _customAlbums.value = refreshedAlbums
-                        _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
-                        updateDisplayedPins()
-                    }
                     val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
                     val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
                     val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
                     _snackbarMessage.value = "$verb $pinPart$albumPart to ${currentBoard.title}"
+                }
+                // Refresh current board view
+                val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() } }
+                val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(currentBoard.id) }
+                withContext(Dispatchers.Main) {
+                    _rawPins.value = refreshed
+                    _customAlbums.value = refreshedAlbums
+                    _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
+                    updateDisplayedPins()
                 }
             } catch (e: IllegalStateException) {
                 _snackbarMessage.value = e.message ?: "Cannot transfer"
@@ -400,121 +219,1030 @@ def patch_transfer_albums():
 '''
             t = t[:idx] + new_fn + t[end_idx:]
             changed = True
-            log("  ✓ executeAlbumTransferToCurrentBoard replaced (handles albums)")
-
-    # ---------- 6. moveToTopInternal extended ----------
-    old_marker = "    private suspend fun moveToTopInternal(sourceBoardId: String, pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {"
-    if "// Extended: dissolve parent albums that become empty" not in t and old_marker in t:
-        end_idx = find_function_end(t, old_marker)
-        if end_idx > 0:
-            idx = t.find(old_marker)
-            new_fn = '''    // Extended: dissolve parent albums that become empty
-    private suspend fun moveToTopInternal(sourceBoardId: String, pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {
-        val allPins = withContext(Dispatchers.IO) { dao.getPinsForBoard(sourceBoardId).map { it.toPinItem() } }
-        val allAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(sourceBoardId) }
-        val maxPinDate = allPins.maxOfOrNull { it.dateAddedMillis } ?: 0L
-        val maxAlbumDate = allAlbums.maxOfOrNull { it.dateAddedMillis } ?: 0L
-        var nextDate = maxOf(maxPinDate, maxAlbumDate) + 60_000L
-
-        val affectedAlbumIds = mutableSetOf<String>()
-        val updatedPins = allPins.map { p ->
-            if (pinIds.contains(p.id)) {
-                p.albumId?.let { affectedAlbumIds.add(it) }
-                p.copy(albumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }
-            } else p
-        }
-        albumIds.forEach { movedId ->
-            val parent = allAlbums.firstOrNull { it.id == movedId }?.parentAlbumId
-            if (parent != null) affectedAlbumIds.add(parent)
-        }
-        val updatedAlbums = allAlbums.map { a ->
-            if (albumIds.contains(a.id)) {
-                a.copy(parentAlbumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }
-            } else a
-        }
-        val pinsByAlbum = updatedPins.filter { it.albumId != null }.groupBy { it.albumId!! }
-        val childrenByAlbum = updatedAlbums.filter { it.parentAlbumId != null }.groupBy { it.parentAlbumId!! }
-        val nonEmptyAlbumIds = pinsByAlbum.keys + childrenByAlbum.keys
-        val dissolvedAlbumIds = affectedAlbumIds - nonEmptyAlbumIds
-        val finalAlbums = updatedAlbums.filterNot { it.id in dissolvedAlbumIds }
-
-        withContext(Dispatchers.IO) {
-            dao.upsertPinsSafely(updatedPins.mapIndexed { i, p -> PinEntity.fromPinItem(p, sourceBoardId, i) })
-            updatedAlbums.filter { it.id in albumIds }.forEach { dao.insertAlbum(it) }
-            dissolvedAlbumIds.forEach { dao.deleteAlbum(it) }
-        }
-
-        val curr = _currentBoard.value
-        if (curr != null && curr.id == sourceBoardId) {
-            withContext(Dispatchers.Main) {
-                _rawPins.value = updatedPins
-                _customAlbums.value = finalAlbums
-                _currentBoard.value = curr.copy(pins = updatedPins, pinCount = updatedPins.size)
-                updateDisplayedPins(resetLimit = true)
-            }
-        }
-    }
-'''
-            t = t[:idx] + new_fn + t[end_idx:]
-            changed = True
-            log("  ✓ moveToTopInternal extended (parent dissolution)")
+            log("  ✓ executeAlbumTransferToCurrentBoard — opened-album aware")
+        else:
+            log("  ⚠ could not find function end")
 
     if changed:
-        vm_f.write_text(t, encoding="utf-8")
+        f.write_text(t, encoding="utf-8")
 
-    # ---------- PinBoardGalleryScreen ----------
-    ps_t = ps_f.read_text(encoding="utf-8")
-    ps_changed = False
 
-    if "viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.COPY)" in ps_t:
-        ps_t = ps_t.replace(
-            "viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.COPY)",
-            "viewModel.beginAlbumTransfer(selectedPinIds, selectedAlbumIds, com.example.viewmodel.AlbumTransferMode.COPY)",
-            1
+# ============================================================
+# PATCH 2 — PinCard: refresh counter support
+# ============================================================
+def patch_pin_card():
+    log("\n=== PATCH: PinCard (refresh counter) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/PinCard.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+
+    if "refreshCounter: Int = 0" in t:
+        log("  ✓ already patched"); return
+
+    old_sig = (
+        "    hideTitleAndAuthor: Boolean = false,\n"
+        "    isNew: Boolean = false,\n"
+        "    onClick: () -> Unit,\n"
+    )
+    new_sig = (
+        "    hideTitleAndAuthor: Boolean = false,\n"
+        "    isNew: Boolean = false,\n"
+        "    refreshCounter: Int = 0,\n"
+        "    onClick: () -> Unit,\n"
+    )
+    if old_sig not in t:
+        log("  ⚠ signature anchor missing"); return
+    t = t.replace(old_sig, new_sig, 1)
+
+    old_model = (
+        "            AsyncImage(\n"
+        "                model = ImageRequest.Builder(context)\n"
+        "                    .data(pin.thumbnailUrl.ifBlank { pin.imageUrl })\n"
+        "                    .crossfade(true)\n"
+        "                    .build(),\n"
+    )
+    new_model = (
+        "            AsyncImage(\n"
+        "                model = ImageRequest.Builder(context)\n"
+        "                    .data(pin.thumbnailUrl.ifBlank { pin.imageUrl })\n"
+        "                    .apply {\n"
+        "                        if (refreshCounter > 0) {\n"
+        "                            memoryCacheKey(\"pin-thumb:${pin.id}:r$refreshCounter\")\n"
+        "                            diskCacheKey(\"pin-thumb:${pin.id}:r$refreshCounter\")\n"
+        "                        }\n"
+        "                    }\n"
+        "                    .crossfade(true)\n"
+        "                    .build(),\n"
+    )
+    if old_model in t:
+        t = t.replace(old_model, new_model, 1)
+    else:
+        log("  ⚠ AsyncImage model anchor missing (may still work if not refreshed)")
+
+    f.write_text(t, encoding="utf-8")
+    log("  ✓ PinCard patched")
+
+
+# ============================================================
+# PATCH 3 — FullscreenGalleryViewer: use ViewModel counter + callback
+# ============================================================
+def patch_fullscreen():
+    log("\n=== PATCH: FullscreenGalleryViewer ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # 3a. Add params
+    old_sig = (
+        "    onDownloadSingle: (PinItem) -> Unit,\n"
+        "    disableArrowNavigation: Boolean = false,\n"
+        "    modifier: Modifier = Modifier\n"
+    )
+    new_sig = (
+        "    onDownloadSingle: (PinItem) -> Unit,\n"
+        "    disableArrowNavigation: Boolean = false,\n"
+        "    refreshCounters: Map<String, Int> = emptyMap(),\n"
+        "    onRefreshImage: (PinItem) -> Unit = {},\n"
+        "    modifier: Modifier = Modifier\n"
+    )
+    if old_sig in t:
+        t = t.replace(old_sig, new_sig, 1); changed = True
+        log("  ✓ new params")
+    else:
+        log("  ⚠ signature anchor missing")
+
+    # 3b. Change button onClick
+    old_btn = (
+        "                        IconButton(\n"
+        "                            onClick = {\n"
+        "                                val key = currentPin.id\n"
+        "                                imageRefreshKeys[key] = (imageRefreshKeys[key] ?: 0) + 1\n"
+        "                                Toast.makeText(context, \"Refreshing image...\", Toast.LENGTH_SHORT).show()\n"
+        "                            },\n"
+    )
+    new_btn = (
+        "                        IconButton(\n"
+        "                            onClick = {\n"
+        "                                onRefreshImage(currentPin)\n"
+        "                                Toast.makeText(context, \"Refreshing image...\", Toast.LENGTH_SHORT).show()\n"
+        "                            },\n"
+    )
+    if old_btn in t:
+        t = t.replace(old_btn, new_btn, 1); changed = True
+        log("  ✓ button uses onRefreshImage")
+    else:
+        log("  ⚠ button anchor missing")
+
+    # 3c. Change AsyncImage model to use passed map
+    old_async = (
+        "                val pageRefreshKey = imageRefreshKeys[pin.id] ?: 0\n"
+        "                AsyncImage(\n"
+        "                    model = ImageRequest.Builder(context)\n"
+        "                        .data(pin.imageUrl)\n"
+        "                        .apply {\n"
+        "                            if (pageRefreshKey > 0) {\n"
+        "                                memoryCacheKey(\"${pin.imageUrl}#refresh=$pageRefreshKey\")\n"
+        "                                diskCacheKey(\"${pin.imageUrl}#refresh=$pageRefreshKey\")\n"
+        "                            }\n"
+        "                        }\n"
+    )
+    new_async = (
+        "                val pageRefreshKey = refreshCounters[pin.id] ?: 0\n"
+        "                AsyncImage(\n"
+        "                    model = ImageRequest.Builder(context)\n"
+        "                        .data(pin.imageUrl)\n"
+        "                        .apply {\n"
+        "                            if (pageRefreshKey > 0) {\n"
+        "                                memoryCacheKey(\"pin-full:${pin.id}:r$pageRefreshKey\")\n"
+        "                                diskCacheKey(\"pin-full:${pin.id}:r$pageRefreshKey\")\n"
+        "                            }\n"
+        "                        }\n"
+    )
+    if old_async in t:
+        t = t.replace(old_async, new_async, 1); changed = True
+        log("  ✓ AsyncImage uses passed map")
+    else:
+        log("  ⚠ AsyncImage anchor missing")
+
+    # 3d. Remove local imageRefreshKeys if still present
+    if "val imageRefreshKeys = remember { mutableStateMapOf<String, Int>() }" in t:
+        t = t.replace(
+            "    // Per-pin refresh counter; increment forces a fresh network fetch\n"
+            "    val imageRefreshKeys = remember { mutableStateMapOf<String, Int>() }\n",
+            "",
+            1,
         )
-        ps_changed = True
-        log("  ✓ COPY call passes albums")
+        changed = True
+        log("  ✓ removed local imageRefreshKeys")
 
-    if "viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.MOVE)" in ps_t:
-        ps_t = ps_t.replace(
-            "viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.MOVE)",
-            "viewModel.beginAlbumTransfer(selectedPinIds, selectedAlbumIds, com.example.viewmodel.AlbumTransferMode.MOVE)",
-            1
+    if changed:
+        f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 4 — New BoardPickerDialog.kt
+# ============================================================
+def patch_board_picker_dialog():
+    log("\n=== PATCH: BoardPickerDialog (new file) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt"
+    if f.exists():
+        log("  ✓ already exists"); return
+
+    content = r'''package com.example.ui.dialogs
+
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.model.BoardHistoryItem
+import com.example.ui.theme.PinterestBlack
+import com.example.ui.theme.PinterestPillGray
+import com.example.ui.theme.PinterestRed
+import com.example.ui.theme.PinterestTextSecondary
+
+
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
+@Composable
+fun BoardPickerDialog(
+    isOpen: Boolean,
+    boards: List<BoardHistoryItem>,
+    currentBoardUrl: String?,
+    onDismiss: () -> Unit,
+    onSelectBoard: (String) -> Unit
+) {
+    if (!isOpen) return
+
+    var filter by remember { mutableStateOf("") }
+
+    val filtered = remember(boards, filter) {
+        if (filter.isBlank()) boards
+        else boards.filter { it.title.contains(filter, ignoreCase = true) || it.ownerName.contains(filter, ignoreCase = true) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Text("Switch board", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+        },
+        text = {
+            androidx.compose.foundation.layout.Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 500.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    filtered.forEach { item ->
+                        val isCurrent = currentBoardUrl?.trimEnd('/')?.equals(item.url.trimEnd('/'), ignoreCase = true) == true
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = if (isCurrent) PinterestRed else PinterestPillGray,
+                            modifier = Modifier
+                                .clickable {
+                                    onSelectBoard(item.url)
+                                    onDismiss()
+                                }
+                                .testTag("board_picker_pill_${item.url.hashCode()}")
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) {
+                                val isFav = item.boardId == "board_favorites" || item.url.contains("favorites")
+                                val isMySave = item.boardId == "board_my_save" || item.url.contains("my_save")
+                                val isDump = item.boardId == "board_dump" || item.url.contains("dump")
+
+                                Icon(
+                                    imageVector = when {
+                                        isFav -> Icons.Default.Favorite
+                                        isMySave -> Icons.Default.Bookmark
+                                        isDump -> Icons.Default.Folder
+                                        item.isCustom -> Icons.Default.Folder
+                                        else -> Icons.Default.Link
+                                    },
+                                    contentDescription = null,
+                                    tint = if (isCurrent) Color.White else PinterestRed,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Spacer(Modifier.width(6.dp))
+                                Text(
+                                    text = item.title.ifBlank { "Board" },
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isCurrent) Color.White else PinterestBlack
+                                )
+                                if (item.isCustom && !isFav && !isMySave && !isDump) {
+                                    Spacer(Modifier.width(4.dp))
+                                    Text(
+                                        text = "· Custom",
+                                        fontSize = 10.sp,
+                                        color = if (isCurrent) Color.White.copy(alpha = 0.7f) else PinterestTextSecondary
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (filtered.isEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text(
+                        "No boards match.",
+                        fontSize = 12.sp,
+                        color = PinterestTextSecondary
+                    )
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close", color = PinterestBlack) }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+'''
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(content, encoding="utf-8")
+    log("  ✓ BoardPickerDialog.kt created")
+
+
+# ============================================================
+# PATCH 5 — BoardHeader: clickable title + "BOARDS" label
+# ============================================================
+def patch_board_header():
+    log("\n=== PATCH: BoardHeader ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/BoardHeader.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # 5a. Add param
+    old_sig = "    onEditCurrentCustomBoard: () -> Unit = {},\n"
+    new_sig = (
+        "    onEditCurrentCustomBoard: () -> Unit = {},\n"
+        "    onOpenBoardPicker: () -> Unit = {},\n"
+    )
+    if old_sig in t and "onOpenBoardPicker" not in t:
+        t = t.replace(old_sig, new_sig, 1); changed = True
+        log("  ✓ onOpenBoardPicker param added")
+
+    # 5b. Make big title clickable
+    old_title = (
+        "                Text(\n"
+        "                    text = board.title,\n"
+        "                    style = MaterialTheme.typography.headlineSmall.copy(\n"
+        "                        fontWeight = FontWeight.ExtraBold,\n"
+        "                        fontSize = 22.sp\n"
+        "                    ),\n"
+        "                    color = MaterialTheme.colorScheme.onSurface,\n"
+        "                    maxLines = 2,\n"
+        "                    overflow = TextOverflow.Ellipsis\n"
+        "                )\n"
+    )
+    new_title = (
+        "                Text(\n"
+        "                    text = board.title,\n"
+        "                    style = MaterialTheme.typography.headlineSmall.copy(\n"
+        "                        fontWeight = FontWeight.ExtraBold,\n"
+        "                        fontSize = 22.sp\n"
+        "                    ),\n"
+        "                    color = MaterialTheme.colorScheme.onSurface,\n"
+        "                    maxLines = 2,\n"
+        "                    overflow = TextOverflow.Ellipsis,\n"
+        "                    modifier = Modifier\n"
+        "                        .clickable { onOpenBoardPicker() }\n"
+        "                        .testTag(\"board_title_open_picker\")\n"
+        "                )\n"
+    )
+    if old_title in t:
+        t = t.replace(old_title, new_title, 1); changed = True
+        log("  ✓ title clickable")
+
+    # 5c. Make "BOARDS (HOLD CUSTOM TO EDIT)" row clickable
+    old_label = (
+        "            Row(\n"
+        "                verticalAlignment = Alignment.CenterVertically,\n"
+        "                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)\n"
+        "            ) {\n"
+        "                Icon(\n"
+        "                    imageVector = Icons.Default.History,\n"
+        "                    contentDescription = null,\n"
+        "                    tint = PinterestTextSecondary,\n"
+        "                    modifier = Modifier.size(14.dp)\n"
+        "                )\n"
+        "                Spacer(modifier = Modifier.width(4.dp))\n"
+        "                Text(\n"
+        "                    text = \"BOARDS (HOLD CUSTOM TO EDIT)\",\n"
+        "                    style = MaterialTheme.typography.labelSmall.copy(\n"
+        "                        fontWeight = FontWeight.Bold,\n"
+        "                        letterSpacing = 0.8.sp,\n"
+        "                        fontSize = 10.sp,\n"
+        "                        color = PinterestTextSecondary\n"
+        "                    )\n"
+        "                )\n"
+        "            }\n"
+    )
+    new_label = (
+        "            Row(\n"
+        "                verticalAlignment = Alignment.CenterVertically,\n"
+        "                modifier = Modifier\n"
+        "                    .padding(horizontal = 16.dp, vertical = 4.dp)\n"
+        "                    .clickable { onOpenBoardPicker() }\n"
+        "                    .testTag(\"boards_label_open_picker\")\n"
+        "            ) {\n"
+        "                Icon(\n"
+        "                    imageVector = Icons.Default.History,\n"
+        "                    contentDescription = null,\n"
+        "                    tint = PinterestTextSecondary,\n"
+        "                    modifier = Modifier.size(14.dp)\n"
+        "                )\n"
+        "                Spacer(modifier = Modifier.width(4.dp))\n"
+        "                Text(\n"
+        "                    text = \"BOARDS (HOLD CUSTOM TO EDIT) — TAP TO SWITCH\",\n"
+        "                    style = MaterialTheme.typography.labelSmall.copy(\n"
+        "                        fontWeight = FontWeight.Bold,\n"
+        "                        letterSpacing = 0.8.sp,\n"
+        "                        fontSize = 10.sp,\n"
+        "                        color = PinterestTextSecondary\n"
+        "                    )\n"
+        "                )\n"
+        "            }\n"
+        "        }\n"
+    )
+    if old_label in t:
+        # Replace with new, but need to fix brace balance
+        # old_label has closing "}\n" that also closes the containing if - too aggressive
+        # Safer: replace just the Row body
+        t = t.replace(
+            "            Row(\n"
+            "                verticalAlignment = Alignment.CenterVertically,\n"
+            "                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)\n"
+            "            ) {\n"
+            "                Icon(\n"
+            "                    imageVector = Icons.Default.History,\n"
+            "                    contentDescription = null,\n"
+            "                    tint = PinterestTextSecondary,\n"
+            "                    modifier = Modifier.size(14.dp)\n"
+            "                )\n"
+            "                Spacer(modifier = Modifier.width(4.dp))\n"
+            "                Text(\n"
+            "                    text = \"BOARDS (HOLD CUSTOM TO EDIT)\",\n"
+            "                    style = MaterialTheme.typography.labelSmall.copy(\n"
+            "                        fontWeight = FontWeight.Bold,\n"
+            "                        letterSpacing = 0.8.sp,\n"
+            "                        fontSize = 10.sp,\n"
+            "                        color = PinterestTextSecondary\n"
+            "                    )\n"
+            "                )\n"
+            "            }\n",
+            "            Row(\n"
+            "                verticalAlignment = Alignment.CenterVertically,\n"
+            "                modifier = Modifier\n"
+            "                    .padding(horizontal = 16.dp, vertical = 4.dp)\n"
+            "                    .clickable { onOpenBoardPicker() }\n"
+            "                    .testTag(\"boards_label_open_picker\")\n"
+            "            ) {\n"
+            "                Icon(\n"
+            "                    imageVector = Icons.Default.History,\n"
+            "                    contentDescription = null,\n"
+            "                    tint = PinterestTextSecondary,\n"
+            "                    modifier = Modifier.size(14.dp)\n"
+            "                )\n"
+            "                Spacer(modifier = Modifier.width(4.dp))\n"
+            "                Text(\n"
+            "                    text = \"BOARDS (HOLD CUSTOM TO EDIT) — TAP TO SWITCH\",\n"
+            "                    style = MaterialTheme.typography.labelSmall.copy(\n"
+            "                        fontWeight = FontWeight.Bold,\n"
+            "                        letterSpacing = 0.8.sp,\n"
+            "                        fontSize = 10.sp,\n"
+            "                        color = PinterestTextSecondary\n"
+            "                    )\n"
+            "                )\n"
+            "            }\n",
+            1,
         )
-        ps_changed = True
-        log("  ✓ MOVE call passes albums")
+        changed = True
+        log("  ✓ BOARDS label clickable")
 
-    old_banner = '"Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}"'
-    new_banner = '"Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size + transfer.albumIds.size} item${if ((transfer.pinIds.size + transfer.albumIds.size) != 1) "s" else ""}"'
-    if old_banner in ps_t:
-        ps_t = ps_t.replace(old_banner, new_banner, 1)
-        ps_changed = True
-        log("  ✓ banner combined count")
-    elif new_banner in ps_t:
-        log("  ✓ banner already updated")
+    if changed:
+        f.write_text(t, encoding="utf-8")
 
-    if ps_changed:
-        ps_f.write_text(ps_t, encoding="utf-8")
 
-    # ---------- Self-verify ----------
+# ============================================================
+# PATCH 6 — PinBoardGalleryScreen wiring
+# ============================================================
+def patch_gallery_screen():
+    log("\n=== PATCH: PinBoardGalleryScreen ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # 6a. Collect imageRefreshCounters + add board-picker state
+    if "val imageRefreshCounters by viewModel.imageRefreshCounters" not in t:
+        anchor = "    val pendingAlbumTransfer by viewModel.pendingAlbumTransfer.collectAsStateWithLifecycle()\n"
+        add = (
+            anchor +
+            "    val imageRefreshCounters by viewModel.imageRefreshCounters.collectAsStateWithLifecycle()\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ imageRefreshCounters collected")
+
+    if "var isBoardPickerOpen" not in t:
+        anchor = "    var showDeleteSelectionDialog by remember { mutableStateOf(false) }\n"
+        add = (
+            anchor +
+            "    var isBoardPickerOpen by remember { mutableStateOf(false) }\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ isBoardPickerOpen state")
+
+    # 6b. liveActiveAlbum (reactive) — insert after customDateAlbums declaration
+    if "val liveActiveAlbum = remember(activeAlbum, customDateAlbums)" not in t:
+        anchor = (
+            "    val topLevelCustomAlbums = remember(customDateAlbums) {\n"
+            "        customDateAlbums.filter { it.parentAlbumId == null }\n"
+            "    }\n"
+        )
+        add = (
+            anchor +
+            "\n"
+            "    // Reactive re-derivation of the currently opened album from live data.\n"
+            "    val liveActiveAlbum = remember(activeAlbum, customDateAlbums) {\n"
+            "        activeAlbum?.let { a -> customDateAlbums.firstOrNull { it.id == a.id } ?: a }\n"
+            "    }\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ liveActiveAlbum derived")
+        else:
+            log("  ⚠ topLevelCustomAlbums anchor missing")
+
+    # 6c. currentSubAlbums — use liveActiveAlbum
+    old_subs = (
+        "    val currentSubAlbums = remember(activeAlbum, customDateAlbums) {\n"
+        "        val active = activeAlbum\n"
+        "        if (active != null) {\n"
+        "            (customDateAlbums.filter { it.parentAlbumId == active.id } + active.subAlbums).distinctBy { it.id }\n"
+        "        } else {\n"
+        "            emptyList()\n"
+        "        }\n"
+        "    }\n"
+    )
+    new_subs = (
+        "    val currentSubAlbums = remember(liveActiveAlbum, customDateAlbums) {\n"
+        "        val active = liveActiveAlbum\n"
+        "        if (active != null) {\n"
+        "            (customDateAlbums.filter { it.parentAlbumId == active.id } + active.subAlbums).distinctBy { it.id }\n"
+        "        } else {\n"
+        "            emptyList()\n"
+        "        }\n"
+        "    }\n"
+    )
+    if old_subs in t:
+        t = t.replace(old_subs, new_subs, 1); changed = True
+        log("  ✓ currentSubAlbums uses liveActiveAlbum")
+
+    # 6d. Opened-album sub-albums: add selection + pending transfer drill-in
+    old_active_view = (
+        "                } else if (activeAlbum != null) {\n"
+        "                    // 2. Opened Album mode: display sub-albums (if any) and collection of images for the selected album\n"
+        "                    if (currentSubAlbums.isNotEmpty()) {\n"
+        "                        items(\n"
+        "                            items = currentSubAlbums,\n"
+        "                            key = { alb -> \"subalbum_${alb.id}_${alb.isFavorite}\" }\n"
+        "                        ) { subAlb ->\n"
+        "                            AlbumCard(\n"
+        "                                album = subAlb,\n"
+        "                                columnCount = columnCount,\n"
+        "                                isFavorite = subAlb.isFavorite,\n"
+        "                                isPortrait = portraitAlbumCards,\n"
+        "                                onClick = {\n"
+        "                                    viewModel.openAlbum(subAlb)\n"
+        "                                },\n"
+        "                                onLongClick = {\n"
+        "                                    viewModel.toggleAlbumFavorites(subAlb.id, subAlb.title, subAlb.pins)\n"
+        "                                },\n"
+        "                                onSwipePreview = {\n"
+        "                                    previewAlbum = subAlb\n"
+        "                                }\n"
+        "                            )\n"
+        "                        }\n"
+        "                    }\n"
+        "\n"
+        "                    val albumPins = activeAlbum!!.pins.sortedByDescending { it.dateAddedMillis }\n"
+    )
+    new_active_view = (
+        "                } else if (liveActiveAlbum != null) {\n"
+        "                    // 2. Opened Album mode: display sub-albums (if any) and collection of images for the selected album\n"
+        "                    if (currentSubAlbums.isNotEmpty()) {\n"
+        "                        items(\n"
+        "                            items = currentSubAlbums,\n"
+        "                            key = { alb -> \"subalbum_${alb.id}_${alb.isFavorite}\" }\n"
+        "                        ) { subAlb ->\n"
+        "                            val isSelectedAlb = selectedAlbumIds.contains(subAlb.id)\n"
+        "                            AlbumCard(\n"
+        "                                album = subAlb,\n"
+        "                                columnCount = columnCount,\n"
+        "                                isFavorite = subAlb.isFavorite,\n"
+        "                                isPortrait = portraitAlbumCards,\n"
+        "                                isSelected = isSelectedAlb,\n"
+        "                                isSelectionMode = isSelectionMode,\n"
+        "                                onClick = {\n"
+        "                                    when {\n"
+        "                                        pendingAlbumTransfer != null -> viewModel.executeAlbumTransfer(subAlb, currentBoard?.id ?: \"\")\n"
+        "                                        else -> viewModel.openAlbum(subAlb)\n"
+        "                                    }\n"
+        "                                },\n"
+        "                                onLongClick = {\n"
+        "                                    when {\n"
+        "                                        pendingAlbumTransfer != null -> viewModel.openAlbum(subAlb)\n"
+        "                                        else -> viewModel.toggleAlbumFavorites(subAlb.id, subAlb.title, subAlb.pins)\n"
+        "                                    }\n"
+        "                                },\n"
+        "                                onSelectToggle = { viewModel.toggleAlbumSelection(subAlb.id) },\n"
+        "                                onSwipePreview = {\n"
+        "                                    previewAlbum = subAlb\n"
+        "                                }\n"
+        "                            )\n"
+        "                        }\n"
+        "                    }\n"
+        "\n"
+        "                    val albumPins = allPinsForAlbums.filter { it.albumId == liveActiveAlbum!!.id }\n"
+        "                        .sortedByDescending { it.dateAddedMillis }\n"
+    )
+    if old_active_view in t:
+        t = t.replace(old_active_view, new_active_view, 1); changed = True
+        log("  ✓ opened-album sub-albums — selection + drill-in + live pins")
+    else:
+        log("  ⚠ opened-album view anchor missing")
+
+    # 6e. Update key/index use in opened-album itemsIndexed - need to handle liveActiveAlbum reference
+    old_items_idx = (
+        "                    itemsIndexed(\n"
+        "                        items = albumPins,\n"
+        "                        key = { index, pin -> \"album_${activeAlbum!!.id}_${pin.id}_$index\" }\n"
+        "                    ) { index, pin ->\n"
+    )
+    new_items_idx = (
+        "                    itemsIndexed(\n"
+        "                        items = albumPins,\n"
+        "                        key = { index, pin -> \"album_${liveActiveAlbum!!.id}_${pin.id}_$index\" }\n"
+        "                    ) { index, pin ->\n"
+    )
+    if old_items_idx in t:
+        t = t.replace(old_items_idx, new_items_idx, 1); changed = True
+
+    # 6f. Opened-album pin cards: add refreshCounter
+    old_open_pin = (
+        "                        PinCard(\n"
+        "                            pin = pin,\n"
+        "                            columnCount = columnCount,\n"
+        "                            isSelected = isSelected,\n"
+        "                            isSelectionMode = isSelectionMode,\n"
+        "                            isFavorite = isFav,\n"
+        "                            hideTitleAndAuthor = hidePinTitlesAndAuthors,\n"
+        "                            onClick = {\n"
+        "                                if (isSelectionMode) {\n"
+        "                                    viewModel.toggleSelection(pin.id)\n"
+        "                                } else {\n"
+        "                                    viewModel.openFullscreen(index)\n"
+        "                                }\n"
+        "                            },\n"
+        "                            onLongClick = {\n"
+        "                                if (isSelectionMode) {\n"
+        "                                    viewModel.toggleSelection(pin.id)\n"
+        "                                } else {\n"
+        "                                    viewModel.toggleFavorite(pin)\n"
+        "                                }\n"
+        "                            }\n"
+        "                        )\n"
+    )
+    new_open_pin = (
+        "                        PinCard(\n"
+        "                            pin = pin,\n"
+        "                            columnCount = columnCount,\n"
+        "                            isSelected = isSelected,\n"
+        "                            isSelectionMode = isSelectionMode,\n"
+        "                            isFavorite = isFav,\n"
+        "                            hideTitleAndAuthor = hidePinTitlesAndAuthors,\n"
+        "                            refreshCounter = imageRefreshCounters[pin.id] ?: 0,\n"
+        "                            onClick = {\n"
+        "                                if (isSelectionMode) {\n"
+        "                                    viewModel.toggleSelection(pin.id)\n"
+        "                                } else {\n"
+        "                                    viewModel.openFullscreen(index)\n"
+        "                                }\n"
+        "                            },\n"
+        "                            onLongClick = {\n"
+        "                                if (isSelectionMode) {\n"
+        "                                    viewModel.toggleSelection(pin.id)\n"
+        "                                } else {\n"
+        "                                    viewModel.toggleFavorite(pin)\n"
+        "                                }\n"
+        "                            }\n"
+        "                        )\n"
+    )
+    if old_open_pin in t:
+        t = t.replace(old_open_pin, new_open_pin, 1); changed = True
+        log("  ✓ opened-album pins refreshCounter")
+
+    # 6g. groupByAlbum top-level albums: add selection
+    old_group_album = (
+        "                    items(\n"
+        "                        items = albums,\n"
+        "                        key = { album -> \"${album.id}_${album.isFavorite}\" }\n"
+        "                    ) { album ->\n"
+        "                        AlbumCard(\n"
+        "                            album = album,\n"
+        "                            columnCount = columnCount,\n"
+        "                            isFavorite = album.isFavorite,\n"
+        "                            isPortrait = portraitAlbumCards,\n"
+        "                            onClick = {\n"
+        "                                viewModel.openAlbum(album)\n"
+        "                            },\n"
+        "                            onLongClick = {\n"
+        "                                viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)\n"
+        "                            },\n"
+        "                            onSwipePreview = {\n"
+        "                                previewAlbum = album\n"
+        "                            }\n"
+        "                        )\n"
+        "                    }\n"
+    )
+    new_group_album = (
+        "                    items(\n"
+        "                        items = albums,\n"
+        "                        key = { album -> \"${album.id}_${album.isFavorite}\" }\n"
+        "                    ) { album ->\n"
+        "                        val isSelectedAlb = selectedAlbumIds.contains(album.id)\n"
+        "                        AlbumCard(\n"
+        "                            album = album,\n"
+        "                            columnCount = columnCount,\n"
+        "                            isFavorite = album.isFavorite,\n"
+        "                            isPortrait = portraitAlbumCards,\n"
+        "                            isSelected = isSelectedAlb,\n"
+        "                            isSelectionMode = isSelectionMode,\n"
+        "                            onClick = {\n"
+        "                                when {\n"
+        "                                    pendingAlbumTransfer != null -> viewModel.executeAlbumTransfer(album, currentBoard?.id ?: \"\")\n"
+        "                                    else -> viewModel.openAlbum(album)\n"
+        "                                }\n"
+        "                            },\n"
+        "                            onLongClick = {\n"
+        "                                when {\n"
+        "                                    pendingAlbumTransfer != null -> viewModel.openAlbum(album)\n"
+        "                                    else -> viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)\n"
+        "                                }\n"
+        "                            },\n"
+        "                            onSelectToggle = { viewModel.toggleAlbumSelection(album.id) },\n"
+        "                            onSwipePreview = {\n"
+        "                                previewAlbum = album\n"
+        "                            }\n"
+        "                        )\n"
+        "                    }\n"
+    )
+    if old_group_album in t:
+        t = t.replace(old_group_album, new_group_album, 1); changed = True
+        log("  ✓ groupByAlbum albums — selection + drill-in")
+
+    # 6h. galleryItems path — onLongClick drills in during pending transfer
+    old_gallery_long = (
+        "                                onLongClick = {\n"
+        "                                    viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)\n"
+        "                                },\n"
+    )
+    new_gallery_long = (
+        "                                onLongClick = {\n"
+        "                                    when {\n"
+        "                                        pendingAlbumTransfer != null -> viewModel.openAlbum(album)\n"
+        "                                        else -> viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)\n"
+        "                                    }\n"
+        "                                },\n"
+    )
+    if old_gallery_long in t:
+        t = t.replace(old_gallery_long, new_gallery_long, 1); changed = True
+        log("  ✓ galleryItems — long-press drill-in during pending transfer")
+
+    # 6i. galleryItems pin cards — refreshCounter
+    old_gallery_pin = (
+        "                            PinCard(\n"
+        "                                pin = pin,\n"
+        "                                columnCount = columnCount,\n"
+        "                                isSelected = isSelected,\n"
+        "                                isSelectionMode = isSelectionMode,\n"
+        "                                isFavorite = isFav,\n"
+        "                                hideTitleAndAuthor = hidePinTitlesAndAuthors,\n"
+        "                                onClick = {\n"
+        "                                    if (isSelectionMode) {\n"
+        "                                        viewModel.toggleSelection(pin.id)\n"
+        "                                    } else {\n"
+        "                                        viewModel.openFullscreen(item.pinIndexInLoose)\n"
+        "                                    }\n"
+        "                                },\n"
+        "                                onLongClick = {\n"
+        "                                    if (isSelectionMode) {\n"
+        "                                        viewModel.toggleSelection(pin.id)\n"
+        "                                    } else {\n"
+        "                                        viewModel.toggleFavorite(pin)\n"
+        "                                    }\n"
+        "                                }\n"
+        "                            )\n"
+    )
+    new_gallery_pin = (
+        "                            PinCard(\n"
+        "                                pin = pin,\n"
+        "                                columnCount = columnCount,\n"
+        "                                isSelected = isSelected,\n"
+        "                                isSelectionMode = isSelectionMode,\n"
+        "                                isFavorite = isFav,\n"
+        "                                hideTitleAndAuthor = hidePinTitlesAndAuthors,\n"
+        "                                refreshCounter = imageRefreshCounters[pin.id] ?: 0,\n"
+        "                                onClick = {\n"
+        "                                    if (isSelectionMode) {\n"
+        "                                        viewModel.toggleSelection(pin.id)\n"
+        "                                    } else {\n"
+        "                                        viewModel.openFullscreen(item.pinIndexInLoose)\n"
+        "                                    }\n"
+        "                                },\n"
+        "                                onLongClick = {\n"
+        "                                    if (isSelectionMode) {\n"
+        "                                        viewModel.toggleSelection(pin.id)\n"
+        "                                    } else {\n"
+        "                                        viewModel.toggleFavorite(pin)\n"
+        "                                    }\n"
+        "                                }\n"
+        "                            )\n"
+    )
+    if old_gallery_pin in t:
+        t = t.replace(old_gallery_pin, new_gallery_pin, 1); changed = True
+        log("  ✓ galleryItems pins refreshCounter")
+
+    # 6j. date-group PinCard — refreshCounter (same shape as above but shorter)
+    old_date_pin = (
+        "                            PinCard(\n"
+        "                                pin = pin,\n"
+        "                                columnCount = columnCount,\n"
+        "                                isSelected = isSelected,\n"
+        "                                isSelectionMode = isSelectionMode,\n"
+        "                                isFavorite = isFav,\n"
+        "                                hideTitleAndAuthor = hidePinTitlesAndAuthors,\n"
+    )
+    new_date_pin = (
+        "                            PinCard(\n"
+        "                                pin = pin,\n"
+        "                                columnCount = columnCount,\n"
+        "                                isSelected = isSelected,\n"
+        "                                isSelectionMode = isSelectionMode,\n"
+        "                                isFavorite = isFav,\n"
+        "                                hideTitleAndAuthor = hidePinTitlesAndAuthors,\n"
+        "                                refreshCounter = imageRefreshCounters[pin.id] ?: 0,\n"
+    )
+    if old_date_pin in t and "refreshCounter = imageRefreshCounters[pin.id] ?: 0,\n                                onClick = {\n                                    if (isSelectionMode) {\n                                        viewModel.toggleSelection(pin.id)\n                                    } else {\n                                        viewModel.openFullscreen(if (index >= 0) index else 0)" not in t:
+        # Only replace if this is the date-group one (no refreshCounter yet in this block)
+        idx = t.find(old_date_pin)
+        if idx >= 0:
+            end_idx = t.find("                            )\n", idx)
+            if end_idx > 0:
+                block = t[idx:end_idx + len("                            )\n")]
+                if "refreshCounter" not in block:
+                    t = t[:idx] + new_date_pin + t[idx + len(old_date_pin):]
+                    changed = True
+                    log("  ✓ date-group pins refreshCounter")
+
+    # 6k. FullscreenGalleryViewer — pass refreshCounters + onRefreshImage + liveActiveAlbum pins
+    if "refreshCounters = imageRefreshCounters," not in t:
+        old_fs = "                FullscreenGalleryViewer(\n"
+        new_fs = (
+            "                FullscreenGalleryViewer(\n"
+            "                    refreshCounters = imageRefreshCounters,\n"
+            "                    onRefreshImage = { p -> viewModel.refreshImage(p.id) },\n"
+        )
+        if old_fs in t:
+            t = t.replace(old_fs, new_fs, 1); changed = True
+            log("  ✓ FullscreenGalleryViewer refresh params")
+
+    old_fs_pins = "                val fullScreenPins = activeAlbum?.pins ?: "
+    new_fs_pins = "                val fullScreenPins = liveActiveAlbum?.pins ?: "
+    if old_fs_pins in t:
+        t = t.replace(old_fs_pins, new_fs_pins, 1); changed = True
+        log("  ✓ fullScreenPins uses liveActiveAlbum")
+
+    # 6l. BoardHeader — onOpenBoardPicker callback
+    old_bh = (
+        "                        BoardHeader(\n"
+        "                            board = board,\n"
+        "                            boardHistory = boardHistory,\n"
+        "                            currentPinCount = if (activeAlbum != null) activeAlbum!!.pins.size else displayedPins.size,\n"
+        "                            boardsListScrollState = boardsListScrollState,\n"
+    )
+    new_bh = (
+        "                        BoardHeader(\n"
+        "                            board = board,\n"
+        "                            boardHistory = boardHistory,\n"
+        "                            currentPinCount = if (liveActiveAlbum != null) liveActiveAlbum!!.pins.size else displayedPins.size,\n"
+        "                            boardsListScrollState = boardsListScrollState,\n"
+        "                            onOpenBoardPicker = { isBoardPickerOpen = true },\n"
+    )
+    if old_bh in t:
+        t = t.replace(old_bh, new_bh, 1); changed = True
+        log("  ✓ BoardHeader onOpenBoardPicker")
+
+    # 6m. Add board picker dialog (near end of composable, before closing braces)
+    if "BoardPickerDialog(" not in t:
+        anchor = "    // Delete selection (albums involved) — ask how\n"
+        add = (
+            "    // Board picker (from title or BOARDS label tap)\n"
+            "    com.example.ui.dialogs.BoardPickerDialog(\n"
+            "        isOpen = isBoardPickerOpen,\n"
+            "        boards = boardHistory,\n"
+            "        currentBoardUrl = currentBoard?.boardUrl,\n"
+            "        onDismiss = { isBoardPickerOpen = false },\n"
+            "        onSelectBoard = { url ->\n"
+            "            viewModel.loadBoardFromUrl(url)\n"
+            "            isBoardPickerOpen = false\n"
+            "        }\n"
+            "    )\n"
+            "\n"
+            "    // Delete selection (albums involved) — ask how\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ BoardPickerDialog rendered")
+
+    # 6n. Horizontal board pill list auto-scroll on board change
+    if "// Auto-scroll pill list to opened board" not in t:
+        anchor = (
+            "    LaunchedEffect(activeAlbum) {\n"
+            "        if (viewModel.boardsListScrollIndex > 0 || viewModel.boardsListScrollOffset > 0) {\n"
+            "            boardsListScrollState.scrollToItem(\n"
+            "                viewModel.boardsListScrollIndex,\n"
+            "                viewModel.boardsListScrollOffset\n"
+            "            )\n"
+            "        }\n"
+            "    }\n"
+        )
+        add = (
+            anchor +
+            "\n"
+            "    // Auto-scroll pill list to opened board\n"
+            "    LaunchedEffect(currentBoard?.id, boardHistory.size) {\n"
+            "        val cur = currentBoard ?: return@LaunchedEffect\n"
+            "        val idx = boardHistory.indexOfFirst {\n"
+            "            it.url.trimEnd('/').equals(cur.boardUrl.trimEnd('/'), ignoreCase = true) ||\n"
+            "                (it.boardId.isNotBlank() && it.boardId == cur.id)\n"
+            "        }\n"
+            "        if (idx >= 0) {\n"
+            "            boardsListScrollState.animateScrollToItem(idx)\n"
+            "        }\n"
+            "    }\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ board pill list auto-scroll")
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# Self-verify
+# ============================================================
+def verify_patches():
     log("\n=== Self-verify ===")
-    t_v = vm_f.read_text(encoding="utf-8")
-    t_p = ps_f.read_text(encoding="utf-8")
     checks = [
-        ("PendingAlbumTransfer.albumIds", "val albumIds: Set<String>," in t_v),
-        ("beginAlbumTransfer 3-arg", "fun beginAlbumTransfer(pinIds: Set<String>, albumIds: Set<String>, mode: AlbumTransferMode)" in t_v),
-        ("performTransfer helper", "private suspend fun performTransfer(" in t_v),
-        ("executeAlbumTransfer replaced", "// Comprehensive executeAlbumTransfer" in t_v),
-        ("executeAlbumTransferToCurrentBoard replaced", "// Comprehensive executeAlbumTransferToCurrentBoard" in t_v),
-        ("moveToTopInternal extended", "// Extended: dissolve parent albums that become empty" in t_v),
-        ("cycle prevention", "Cannot transfer an album into itself" in t_v),
-        ("copy call has albums", "viewModel.beginAlbumTransfer(selectedPinIds, selectedAlbumIds" in t_p),
-        ("banner combined count", "transfer.pinIds.size + transfer.albumIds.size" in t_p),
+        ("app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt", [
+            "val imageRefreshCounters: StateFlow<Map<String, Int>>",
+            "fun refreshImage(pinId: String)",
+            "val parentAlbumId = _activeAlbum.value?.id",
+            "// New: opened-album-aware executeAlbumTransferToCurrentBoard",
+        ]),
+        ("app/src/main/java/com/example/ui/components/PinCard.kt", [
+            "refreshCounter: Int = 0",
+            "pin-thumb:${pin.id}:r$refreshCounter",
+        ]),
+        ("app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt", [
+            "refreshCounters: Map<String, Int> = emptyMap()",
+            "onRefreshImage: (PinItem) -> Unit",
+            "onRefreshImage(currentPin)",
+            "refreshCounters[pin.id]",
+        ]),
+        ("app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt", [
+            "fun BoardPickerDialog(",
+        ]),
+        ("app/src/main/java/com/example/ui/components/BoardHeader.kt", [
+            "onOpenBoardPicker: () -> Unit",
+            "board_title_open_picker",
+            "boards_label_open_picker",
+        ]),
+        ("app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt", [
+            "val liveActiveAlbum = remember(activeAlbum, customDateAlbums)",
+            "onSelectToggle = { viewModel.toggleAlbumSelection(subAlb.id) }",
+            "onLongClick = {\n                                    when {\n                                        pendingAlbumTransfer != null -> viewModel.openAlbum(subAlb)",
+            "refreshCounters = imageRefreshCounters,",
+            "onRefreshImage = { p -> viewModel.refreshImage(p.id) }",
+            "onOpenBoardPicker = { isBoardPickerOpen = true }",
+            "com.example.ui.dialogs.BoardPickerDialog(",
+            "// Auto-scroll pill list to opened board",
+        ]),
     ]
     all_ok = True
-    for label, ok in checks:
-        log(f"  {'✓' if ok else '✗'} {label}")
-        if not ok: all_ok = False
+    for rel, markers in checks:
+        fp = PROJECT_ROOT / rel
+        if not fp.exists():
+            log(f"  ✗ {rel} missing"); all_ok = False; continue
+        content = fp.read_text(encoding="utf-8")
+        for m in markers:
+            if m not in content:
+                log(f"  ✗ MISSING in {rel.split('/')[-1]}: {m[:70]}")
+                all_ok = False
+        if all_ok:
+            log(f"  ✓ {rel.split('/')[-1]}")
     if not all_ok:
         log("\n✗ VERIFICATION FAILED"); sys.exit(1)
 
@@ -645,7 +1373,8 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Move/Copy albums + mixed selection (nested album support)"])
+        run(["git", "commit", "-m",
+             "Sub-album selection, drill-in transfer, board picker, refresh counters"])
 
 
 def verify_keystore_tracked():
@@ -794,13 +1523,19 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — Move/Copy albums + mixed selection")
+    log("PinBoard — sub-album select, drill-in, refresh, board picker")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_transfer_albums()
+    patch_viewmodel()
+    patch_pin_card()
+    patch_fullscreen()
+    patch_board_picker_dialog()
+    patch_board_header()
+    patch_gallery_screen()
+    verify_patches()
 
     ensure_release_keystore()
     patch_build_gradle()

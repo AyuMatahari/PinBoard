@@ -68,6 +68,7 @@ fun BoardHeader(
     onOpenLinkDialog: () -> Unit,
     onOpenCreateCustomBoard: () -> Unit = {},
     onEditCurrentCustomBoard: () -> Unit = {},
+    onOpenBoardPicker: () -> Unit = {},
     boardsListScrollState: LazyListState = rememberLazyListState(),
     modifier: Modifier = Modifier
 ) {
@@ -97,7 +98,10 @@ fun BoardHeader(
                     ),
                     color = MaterialTheme.colorScheme.onSurface,
                     maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .clickable { onOpenBoardPicker() }
+                        .testTag("board_title_open_picker")
                 )
 
                 if (board.isCustom) {
@@ -274,7 +278,10 @@ fun BoardHeader(
         if (boardHistory.isNotEmpty()) {
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)
+                modifier = Modifier
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable { onOpenBoardPicker() }
+                    .testTag("boards_label_open_picker")
             ) {
                 Icon(
                     imageVector = Icons.Default.History,
@@ -284,7 +291,7 @@ fun BoardHeader(
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
-                    text = "BOARDS (HOLD CUSTOM TO EDIT)",
+                    text = "BOARDS (HOLD CUSTOM TO EDIT) — TAP TO SWITCH",
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 0.8.sp,

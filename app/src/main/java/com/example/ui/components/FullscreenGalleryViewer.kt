@@ -119,6 +119,8 @@ fun FullscreenGalleryViewer(
     onClose: () -> Unit,
     onDownloadSingle: (PinItem) -> Unit,
     disableArrowNavigation: Boolean = false,
+    refreshCounters: Map<String, Int> = emptyMap(),
+    onRefreshImage: (PinItem) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     if (pins.isEmpty()) {
@@ -141,8 +143,6 @@ fun FullscreenGalleryViewer(
     var showControls by remember { mutableStateOf(false) }
     var isCurrentPageZoomed by remember { mutableStateOf(false) }
     var pinForImageHoldDialog by remember { mutableStateOf<PinItem?>(null) }
-    // Per-pin refresh counter; increment forces a fresh network fetch
-    val imageRefreshKeys = remember { mutableStateMapOf<String, Int>() }
 
     BackHandler {
         onClose()
@@ -264,14 +264,14 @@ fun FullscreenGalleryViewer(
                     },
                 contentAlignment = Alignment.Center
             ) {
-                val pageRefreshKey = imageRefreshKeys[pin.id] ?: 0
+                val pageRefreshKey = refreshCounters[pin.id] ?: 0
                 AsyncImage(
                     model = ImageRequest.Builder(context)
                         .data(pin.imageUrl)
                         .apply {
                             if (pageRefreshKey > 0) {
-                                memoryCacheKey("${pin.imageUrl}#refresh=$pageRefreshKey")
-                                diskCacheKey("${pin.imageUrl}#refresh=$pageRefreshKey")
+                                memoryCacheKey("pin-full:${pin.id}:r$pageRefreshKey")
+                                diskCacheKey("pin-full:${pin.id}:r$pageRefreshKey")
                             }
                         }
                         .crossfade(true)
@@ -368,8 +368,7 @@ fun FullscreenGalleryViewer(
                         // Refresh image button (reloads from source URL, bypasses cache)
                         IconButton(
                             onClick = {
-                                val key = currentPin.id
-                                imageRefreshKeys[key] = (imageRefreshKeys[key] ?: 0) + 1
+                                onRefreshImage(currentPin)
                                 Toast.makeText(context, "Refreshing image...", Toast.LENGTH_SHORT).show()
                             },
                             modifier = Modifier

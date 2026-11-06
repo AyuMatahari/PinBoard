@@ -149,6 +149,7 @@ fun PinBoardGalleryScreen(
     val selectedPinIds by viewModel.selectedPinIds.collectAsStateWithLifecycle()
     val selectedAlbumIds by viewModel.selectedAlbumIds.collectAsStateWithLifecycle()
     val pendingAlbumTransfer by viewModel.pendingAlbumTransfer.collectAsStateWithLifecycle()
+    val imageRefreshCounters by viewModel.imageRefreshCounters.collectAsStateWithLifecycle()
     val repositioningAlbumId by viewModel.repositioningAlbumId.collectAsStateWithLifecycle()
     val scrollToAlbumId by viewModel.scrollToAlbumId.collectAsStateWithLifecycle()
     val snackbarActionLabel by viewModel.snackbarActionLabel.collectAsStateWithLifecycle()
@@ -183,6 +184,7 @@ fun PinBoardGalleryScreen(
     var showCopyDialog by remember { mutableStateOf(false) }
     var showMoveDialog by remember { mutableStateOf(false) }
     var showDeleteSelectionDialog by remember { mutableStateOf(false) }
+    var isBoardPickerOpen by remember { mutableStateOf(false) }
     var isReorderBoardsDialogOpen by remember { mutableStateOf(false) }
     val forceBoardTypeOrder by viewModel.forceBoardTypeOrder.collectAsStateWithLifecycle()
 
@@ -213,6 +215,18 @@ fun PinBoardGalleryScreen(
                 viewModel.boardsListScrollIndex,
                 viewModel.boardsListScrollOffset
             )
+        }
+    }
+
+    // Auto-scroll pill list to opened board
+    LaunchedEffect(currentBoard?.id, boardHistory.size) {
+        val cur = currentBoard ?: return@LaunchedEffect
+        val idx = boardHistory.indexOfFirst {
+            it.url.trimEnd('/').equals(cur.boardUrl.trimEnd('/'), ignoreCase = true) ||
+                (it.boardId.isNotBlank() && it.boardId == cur.id)
+        }
+        if (idx >= 0) {
+            boardsListScrollState.animateScrollToItem(idx)
         }
     }
 
@@ -255,6 +269,11 @@ fun PinBoardGalleryScreen(
 
     val topLevelCustomAlbums = remember(customDateAlbums) {
         customDateAlbums.filter { it.parentAlbumId == null }
+    }
+
+    // Reactive re-derivation of the currently opened album from live data.
+    val liveActiveAlbum = remember(activeAlbum, customDateAlbums) {
+        activeAlbum?.let { a -> customDateAlbums.firstOrNull { it.id == a.id } ?: a }
     }
 
     val loosePins = remember(allPinsForAlbums) {
@@ -391,8 +410,8 @@ fun PinBoardGalleryScreen(
         }
     }
 
-    val currentSubAlbums = remember(activeAlbum, customDateAlbums) {
-        val active = activeAlbum
+    val currentSubAlbums = remember(liveActiveAlbum, customDateAlbums) {
+        val active = liveActiveAlbum
         if (active != null) {
             (customDateAlbums.filter { it.parentAlbumId == active.id } + active.subAlbums).distinctBy { it.id }
         } else {
@@ -576,8 +595,9 @@ fun PinBoardGalleryScreen(
                         BoardHeader(
                             board = board,
                             boardHistory = boardHistory,
-                            currentPinCount = if (activeAlbum != null) activeAlbum!!.pins.size else displayedPins.size,
+                            currentPinCount = if (liveActiveAlbum != null) liveActiveAlbum!!.pins.size else displayedPins.size,
                             boardsListScrollState = boardsListScrollState,
+                            onOpenBoardPicker = { isBoardPickerOpen = true },
                             onHistoryItemSelected = { url -> viewModel.loadBoardFromUrl(url) },
                             onCustomBoardPillLongClick = { historyItem ->
                                 viewModel.getBoardForHistoryItem(historyItem)?.let {
@@ -830,40 +850,60 @@ fun PinBoardGalleryScreen(
                         items = albums,
                         key = { album -> "${album.id}_${album.isFavorite}" }
                     ) { album ->
+                        val isSelectedAlb = selectedAlbumIds.contains(album.id)
                         AlbumCard(
                             album = album,
                             columnCount = columnCount,
                             isFavorite = album.isFavorite,
                             isPortrait = portraitAlbumCards,
+                            isSelected = isSelectedAlb,
+                            isSelectionMode = isSelectionMode,
                             onClick = {
-                                viewModel.openAlbum(album)
+                                when {
+                                    pendingAlbumTransfer != null -> viewModel.executeAlbumTransfer(album, currentBoard?.id ?: "")
+                                    else -> viewModel.openAlbum(album)
+                                }
                             },
                             onLongClick = {
-                                viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)
+                                when {
+                                    pendingAlbumTransfer != null -> viewModel.openAlbum(album)
+                                    else -> viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)
+                                }
                             },
+                            onSelectToggle = { viewModel.toggleAlbumSelection(album.id) },
                             onSwipePreview = {
                                 previewAlbum = album
                             }
                         )
                     }
-                } else if (activeAlbum != null) {
+                } else if (liveActiveAlbum != null) {
                     // 2. Opened Album mode: display sub-albums (if any) and collection of images for the selected album
                     if (currentSubAlbums.isNotEmpty()) {
                         items(
                             items = currentSubAlbums,
                             key = { alb -> "subalbum_${alb.id}_${alb.isFavorite}" }
                         ) { subAlb ->
+                            val isSelectedAlb = selectedAlbumIds.contains(subAlb.id)
                             AlbumCard(
                                 album = subAlb,
                                 columnCount = columnCount,
                                 isFavorite = subAlb.isFavorite,
                                 isPortrait = portraitAlbumCards,
+                                isSelected = isSelectedAlb,
+                                isSelectionMode = isSelectionMode,
                                 onClick = {
-                                    viewModel.openAlbum(subAlb)
+                                    when {
+                                        pendingAlbumTransfer != null -> viewModel.executeAlbumTransfer(subAlb, currentBoard?.id ?: "")
+                                        else -> viewModel.openAlbum(subAlb)
+                                    }
                                 },
                                 onLongClick = {
-                                    viewModel.toggleAlbumFavorites(subAlb.id, subAlb.title, subAlb.pins)
+                                    when {
+                                        pendingAlbumTransfer != null -> viewModel.openAlbum(subAlb)
+                                        else -> viewModel.toggleAlbumFavorites(subAlb.id, subAlb.title, subAlb.pins)
+                                    }
                                 },
+                                onSelectToggle = { viewModel.toggleAlbumSelection(subAlb.id) },
                                 onSwipePreview = {
                                     previewAlbum = subAlb
                                 }
@@ -871,10 +911,11 @@ fun PinBoardGalleryScreen(
                         }
                     }
 
-                    val albumPins = activeAlbum!!.pins.sortedByDescending { it.dateAddedMillis }
+                    val albumPins = allPinsForAlbums.filter { it.albumId == liveActiveAlbum!!.id }
+                        .sortedByDescending { it.dateAddedMillis }
                     itemsIndexed(
                         items = albumPins,
-                        key = { index, pin -> "album_${activeAlbum!!.id}_${pin.id}_$index" }
+                        key = { index, pin -> "album_${liveActiveAlbum!!.id}_${pin.id}_$index" }
                     ) { index, pin ->
                         val isSelected = selectedPinIds.contains(pin.id)
                         val isFav = favoritePinKeys.contains(pin.id) || favoritePinKeys.contains(pin.imageUrl)
@@ -885,6 +926,7 @@ fun PinBoardGalleryScreen(
                             isSelectionMode = isSelectionMode,
                             isFavorite = isFav,
                             hideTitleAndAuthor = hidePinTitlesAndAuthors,
+                            refreshCounter = imageRefreshCounters[pin.id] ?: 0,
                             onClick = {
                                 if (isSelectionMode) {
                                     viewModel.toggleSelection(pin.id)
@@ -917,7 +959,10 @@ fun PinBoardGalleryScreen(
                                     viewModel.openAlbum(album)
                                 },
                                 onLongClick = {
-                                    viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)
+                                    when {
+                                        pendingAlbumTransfer != null -> viewModel.openAlbum(album)
+                                        else -> viewModel.toggleAlbumFavorites(album.id, album.title, album.pins)
+                                    }
                                 },
                                 onSwipePreview = {
                                     previewAlbum = album
@@ -952,6 +997,7 @@ fun PinBoardGalleryScreen(
                                 isSelectionMode = isSelectionMode,
                                 isFavorite = isFav,
                                 hideTitleAndAuthor = hidePinTitlesAndAuthors,
+                                refreshCounter = imageRefreshCounters[pin.id] ?: 0,
                                 onClick = {
                                     if (isSelectionMode) {
                                         viewModel.toggleSelection(pin.id)
@@ -1014,6 +1060,7 @@ fun PinBoardGalleryScreen(
                                 isSelectionMode = isSelectionMode,
                                 isFavorite = isFav,
                                 hideTitleAndAuthor = hidePinTitlesAndAuthors,
+                                refreshCounter = imageRefreshCounters[pin.id] ?: 0,
                                 onClick = {
                                     if (isSelectionMode) {
                                         viewModel.toggleSelection(pin.id)
@@ -1281,8 +1328,10 @@ fun PinBoardGalleryScreen(
 
             // Fullscreen Gallery Viewer Modal Overlay
             fullscreenPinIndex?.let { index ->
-                val fullScreenPins = activeAlbum?.pins ?: (if (topLevelCustomAlbums.isNotEmpty()) viewModel.getAllSortedPins().filter { it.albumId == null } else viewModel.getAllSortedPins()).ifEmpty { displayedPins }
+                val fullScreenPins = liveActiveAlbum?.pins ?: (if (topLevelCustomAlbums.isNotEmpty()) viewModel.getAllSortedPins().filter { it.albumId == null } else viewModel.getAllSortedPins()).ifEmpty { displayedPins }
                 FullscreenGalleryViewer(
+                    refreshCounters = imageRefreshCounters,
+                    onRefreshImage = { p -> viewModel.refreshImage(p.id) },
                     pins = fullScreenPins,
                     initialIndex = index.coerceIn(0, (fullScreenPins.size - 1).coerceAtLeast(0)),
                     disableArrowNavigation = disableArrowNavigation,
@@ -1659,6 +1708,18 @@ fun PinBoardGalleryScreen(
         },
         onConfirm = { targetBoardIds ->
             viewModel.moveSelectedPinsToBoards(targetBoardIds, selectedPinIds)
+        }
+    )
+
+    // Board picker (from title or BOARDS label tap)
+    com.example.ui.dialogs.BoardPickerDialog(
+        isOpen = isBoardPickerOpen,
+        boards = boardHistory,
+        currentBoardUrl = currentBoard?.boardUrl,
+        onDismiss = { isBoardPickerOpen = false },
+        onSelectBoard = { url ->
+            viewModel.loadBoardFromUrl(url)
+            isBoardPickerOpen = false
         }
     )
 
