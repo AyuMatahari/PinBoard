@@ -1452,7 +1452,7 @@ fun PinBoardGalleryScreen(
                         )
                     }
                     Text(
-                        text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size} image${if (transfer.pinIds.size > 1) "s" else ""}",
+                        text = "Tap an album to ${if (transfer.mode == com.example.viewmodel.AlbumTransferMode.MOVE) "move" else "copy"} ${transfer.pinIds.size + transfer.albumIds.size} item${if ((transfer.pinIds.size + transfer.albumIds.size) != 1) "s" else ""}",
                         color = Color.White,
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Medium,
@@ -1637,7 +1637,7 @@ fun PinBoardGalleryScreen(
         onDismiss = { showCopyDialog = false },
         onTransferToAlbum = {
             showCopyDialog = false
-            viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.COPY)
+            viewModel.beginAlbumTransfer(selectedPinIds, selectedAlbumIds, com.example.viewmodel.AlbumTransferMode.COPY)
         },
         onConfirm = { targetBoardIds ->
             viewModel.copySelectedPinsToBoards(targetBoardIds, selectedPinIds)
@@ -1655,7 +1655,7 @@ fun PinBoardGalleryScreen(
         onDismiss = { showMoveDialog = false },
         onTransferToAlbum = {
             showMoveDialog = false
-            viewModel.beginAlbumTransfer(selectedPinIds, com.example.viewmodel.AlbumTransferMode.MOVE)
+            viewModel.beginAlbumTransfer(selectedPinIds, selectedAlbumIds, com.example.viewmodel.AlbumTransferMode.MOVE)
         },
         onConfirm = { targetBoardIds ->
             viewModel.moveSelectedPinsToBoards(targetBoardIds, selectedPinIds)

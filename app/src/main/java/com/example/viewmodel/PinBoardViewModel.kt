@@ -52,6 +52,7 @@ enum class DeleteSelectionMode { DISSOLVE, DELETE_WITH_CONTENTS, PINS_ONLY }
 
 data class PendingAlbumTransfer(
     val pinIds: Set<String>,
+    val albumIds: Set<String>,
     val mode: AlbumTransferMode,
     val sourceBoardId: String,
     val savedSelectionPinIds: Set<String>,
@@ -2788,16 +2789,17 @@ class PinBoardViewModel(
         }
     }
 
-    fun beginAlbumTransfer(pinIds: Set<String>, mode: AlbumTransferMode) {
-        if (pinIds.isEmpty()) return
+    fun beginAlbumTransfer(pinIds: Set<String>, albumIds: Set<String>, mode: AlbumTransferMode) {
+        if (pinIds.isEmpty() && albumIds.isEmpty()) return
         val board = _currentBoard.value ?: return
         _pendingAlbumTransfer.value = PendingAlbumTransfer(
-            pinIds = pinIds, mode = mode, sourceBoardId = board.id,
+            pinIds = pinIds, albumIds = albumIds, mode = mode, sourceBoardId = board.id,
             savedSelectionPinIds = _selectedPinIds.value,
             savedSelectionAlbumIds = _selectedAlbumIds.value
         )
         _isSelectionMode.value = false
     }
+
 
     fun cancelAlbumTransferAndRestore() {
         val transfer = _pendingAlbumTransfer.value ?: return
@@ -2807,60 +2809,178 @@ class PinBoardViewModel(
         _isSelectionMode.value = true
     }
 
+    private suspend fun performTransfer(
+        dao: BoardDao,
+        sourceBoardId: String,
+        pinIds: Set<String>,
+        albumIds: Set<String>,
+        targetBoardId: String,
+        targetAlbumId: String?,
+        mode: AlbumTransferMode
+    ): Pair<Int, Int> {
+        val sourcePins = dao.getPinsForBoard(sourceBoardId).map { it.toPinItem() }
+        val sourceAlbums = dao.getAlbumsForBoard(sourceBoardId)
+        val selectedAlbums = sourceAlbums.filter { albumIds.contains(it.id) }
+        if (selectedAlbums.isEmpty() && pinIds.isEmpty()) return 0 to 0
+        val selectedAlbumIdSet = selectedAlbums.map { it.id }.toSet()
+
+        // Full album tree (selected + all descendants)
+        val albumIdsInTransfer = mutableSetOf<String>()
+        val toVisit = selectedAlbums.map { it.id }.toMutableList()
+        while (toVisit.isNotEmpty()) {
+            val id = toVisit.removeAt(0)
+            if (!albumIdsInTransfer.add(id)) continue
+            sourceAlbums.filter { it.parentAlbumId == id }.forEach { toVisit.add(it.id) }
+        }
+
+        // Cycle prevention
+        if (targetAlbumId != null && albumIdsInTransfer.contains(targetAlbumId)) {
+            throw IllegalStateException("Cannot transfer an album into itself or its descendants")
+        }
+
+        // Pins traveling with albums
+        val pinsInAlbums = sourcePins.filter { it.albumId != null && albumIdsInTransfer.contains(it.albumId) }
+        // Standalone pins (explicitly selected, not in transferred albums)
+        val standalonePins = sourcePins.filter { pinIds.contains(it.id) && (it.albumId == null || !albumIdsInTransfer.contains(it.albumId)) }
+
+        val targetPinDates = dao.getPinsForBoard(targetBoardId).map { it.dateAddedMillis }
+        val targetAlbumDates = dao.getAlbumsForBoard(targetBoardId).map { it.dateAddedMillis }
+        var nextDate = maxOf(targetPinDates.maxOrNull() ?: 0L, targetAlbumDates.maxOrNull() ?: 0L) + 60_000L
+        val crossingBoard = sourceBoardId != targetBoardId
+
+        fun isRootOfTransfer(album: com.example.data.local.CustomAlbumEntity): Boolean {
+            var p = album.parentAlbumId
+            while (p != null) {
+                if (selectedAlbumIdSet.contains(p)) return false
+                p = sourceAlbums.firstOrNull { it.id == p }?.parentAlbumId
+            }
+            return true
+        }
+
+        when (mode) {
+            AlbumTransferMode.COPY -> {
+                val albumIdMap = mutableMapOf<String, String>()
+                val albumsToCopy = sourceAlbums.filter { albumIdsInTransfer.contains(it.id) }
+                val roots = selectedAlbums.filter { isRootOfTransfer(it) }
+                val ordered = mutableListOf<com.example.data.local.CustomAlbumEntity>()
+                val visited = mutableSetOf<String>()
+                fun visit(album: com.example.data.local.CustomAlbumEntity) {
+                    if (!visited.add(album.id)) return
+                    ordered.add(album)
+                    albumsToCopy.filter { it.parentAlbumId == album.id }.forEach { visit(it) }
+                }
+                roots.forEach { visit(it) }
+                albumsToCopy.forEach { if (it.id !in visited) visit(it) }
+
+                var pinCounter = 0
+                val newPins = mutableListOf<PinEntity>()
+                ordered.forEach { album ->
+                    val newId = "album_copy_${System.currentTimeMillis()}_${(1000..9999).random()}"
+                    albumIdMap[album.id] = newId
+                    val newParent = if (isRootOfTransfer(album)) targetAlbumId else albumIdMap[album.parentAlbumId]
+                    val thisDate = nextDate; nextDate += 1000L
+                    dao.insertAlbum(album.copy(
+                        id = newId, boardId = targetBoardId,
+                        parentAlbumId = newParent, dateAddedMillis = thisDate
+                    ))
+                    pinsInAlbums.filter { it.albumId == album.id }.forEach { pin ->
+                        val thisPinDate = nextDate; nextDate += 100L
+                        newPins.add(PinEntity.fromPinItem(
+                            pin.copy(
+                                id = "pin_copy_${System.currentTimeMillis()}_${pinCounter}_${(1000..9999).random()}",
+                                albumId = newId, dateAddedMillis = thisPinDate
+                            ),
+                            targetBoardId, pinCounter++
+                        ))
+                    }
+                }
+                standalonePins.forEach { pin ->
+                    val thisPinDate = nextDate; nextDate += 100L
+                    newPins.add(PinEntity.fromPinItem(
+                        pin.copy(
+                            id = "pin_copy_${System.currentTimeMillis()}_${pinCounter}_${(1000..9999).random()}",
+                            albumId = targetAlbumId, dateAddedMillis = thisPinDate
+                        ),
+                        targetBoardId, pinCounter++
+                    ))
+                }
+                if (newPins.isNotEmpty()) dao.upsertPinsSafely(newPins)
+                return newPins.size to ordered.size
+            }
+            AlbumTransferMode.MOVE -> {
+                val albumsToMove = sourceAlbums.filter { albumIdsInTransfer.contains(it.id) }
+                albumsToMove.forEach { album ->
+                    val newParent = if (isRootOfTransfer(album)) targetAlbumId else album.parentAlbumId
+                    val newDate = if (isRootOfTransfer(album)) { val d = nextDate; nextDate += 1000L; d } else album.dateAddedMillis
+                    dao.insertAlbum(album.copy(
+                        boardId = targetBoardId, parentAlbumId = newParent, dateAddedMillis = newDate
+                    ))
+                }
+                if (crossingBoard) {
+                    val movedPins = pinsInAlbums.map { pin ->
+                        PinEntity.fromPinItem(pin, targetBoardId, pin.boardPosition)
+                    }
+                    if (movedPins.isNotEmpty()) {
+                        dao.upsertPinsSafely(movedPins)
+                        dao.deletePinsFromBoard(sourceBoardId, pinsInAlbums.map { it.id })
+                    }
+                }
+                val standaloneEntities = standalonePins.mapIndexed { i, pin ->
+                    PinEntity.fromPinItem(
+                        pin.copy(albumId = targetAlbumId, dateAddedMillis = nextDate + i * 100L),
+                        targetBoardId, i
+                    )
+                }
+                if (standaloneEntities.isNotEmpty()) {
+                    dao.upsertPinsSafely(standaloneEntities)
+                    if (crossingBoard) {
+                        dao.deletePinsFromBoard(sourceBoardId, standalonePins.map { it.id })
+                    }
+                }
+                return standalonePins.size + pinsInAlbums.size to albumsToMove.size
+            }
+        }
+    }
+
+    // Comprehensive executeAlbumTransfer — handles pins + albums
     fun executeAlbumTransfer(targetAlbum: DateAlbum, targetBoardId: String) {
         val transfer = _pendingAlbumTransfer.value ?: return
         val ctx = appContext ?: return
         viewModelScope.launch {
             val dao = AppDatabase.getDatabase(ctx).boardDao()
-            // DB-source pins — safe when user navigates away from source board
-            val sourcePins = withContext(Dispatchers.IO) {
-                dao.getPinsForBoard(transfer.sourceBoardId)
-                    .filter { transfer.pinIds.contains(it.id) }
-                    .map { it.toPinItem() }
-            }
-            if (sourcePins.isEmpty()) {
+            try {
+                val (pinCount, albumCount) = performTransfer(
+                    dao = dao, sourceBoardId = transfer.sourceBoardId,
+                    pinIds = transfer.pinIds, albumIds = transfer.albumIds,
+                    targetBoardId = targetBoardId, targetAlbumId = targetAlbum.id,
+                    mode = transfer.mode
+                )
+                val curr = _currentBoard.value
+                if (curr != null) {
+                    val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(curr.id).map { it.toPinItem() } }
+                    val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(curr.id) }
+                    withContext(Dispatchers.Main) {
+                        _rawPins.value = refreshed
+                        _customAlbums.value = refreshedAlbums
+                        _currentBoard.value = curr.copy(pins = refreshed, pinCount = refreshed.size)
+                        updateDisplayedPins()
+                    }
+                }
                 _pendingAlbumTransfer.value = null
-                _snackbarMessage.value = "No images to transfer"
-                return@launch
-            }
-            val albumId = targetAlbum.id
-            if (transfer.sourceBoardId == targetBoardId) {
-                withContext(Dispatchers.IO) {
-                    sourcePins.forEach { pin -> dao.movePinsToAlbum(listOf(pin.id), albumId) }
-                }
-            } else {
-                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(targetBoardId).toSet() }
-                val toAdd = sourcePins.filter { !existingUrls.contains(it.imageUrl) }
-                    .map { it.copy(albumId = albumId) }
-                withContext(Dispatchers.IO) {
-                    if (toAdd.isNotEmpty()) {
-                        dao.upsertPinsSafely(toAdd.mapIndexed { i, p ->
-                            PinEntity.fromPinItem(p, targetBoardId, i)
-                        })
-                    }
-                    if (transfer.mode == AlbumTransferMode.MOVE) {
-                        dao.deletePinsFromBoard(transfer.sourceBoardId, transfer.pinIds.toList())
-                    }
-                }
-            }
-            val curr = _currentBoard.value
-            if (curr != null && (curr.id == targetBoardId || curr.id == transfer.sourceBoardId)) {
-                val refreshed = withContext(Dispatchers.IO) {
-                    dao.getPinsForBoard(curr.id).map { it.toPinItem() }
-                }
                 withContext(Dispatchers.Main) {
-                    _rawPins.value = refreshed
-                    _currentBoard.value = curr.copy(pins = refreshed, pinCount = refreshed.size)
-                    updateDisplayedPins()
+                    clearSelection()
+                    val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
+                    val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
+                    val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
+                    _snackbarMessage.value = "$verb $pinPart$albumPart to \"${targetAlbum.title}\""
                 }
-            }
-            _pendingAlbumTransfer.value = null
-            withContext(Dispatchers.Main) {
-                clearSelection()
-                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${sourcePins.size} image(s) to ${targetAlbum.title}"
+            } catch (e: IllegalStateException) {
+                _pendingAlbumTransfer.value = null
+                withContext(Dispatchers.Main) { _snackbarMessage.value = e.message ?: "Cannot transfer" }
             }
         }
     }
+
 
 
     fun deleteSelectionAndAlbums(pinIds: Set<String>, albumIds: Set<String>, mode: DeleteSelectionMode) {
@@ -2927,10 +3047,9 @@ class PinBoardViewModel(
     }
 
     // Move pins/albums to top of the board (also dissolves empty albums)
+    // Extended: dissolve parent albums that become empty
     private suspend fun moveToTopInternal(sourceBoardId: String, pinIds: Set<String>, albumIds: Set<String>, dao: BoardDao) {
-        val allPins = withContext(Dispatchers.IO) {
-            dao.getPinsForBoard(sourceBoardId).map { it.toPinItem() }
-        }
+        val allPins = withContext(Dispatchers.IO) { dao.getPinsForBoard(sourceBoardId).map { it.toPinItem() } }
         val allAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(sourceBoardId) }
         val maxPinDate = allPins.maxOfOrNull { it.dateAddedMillis } ?: 0L
         val maxAlbumDate = allAlbums.maxOfOrNull { it.dateAddedMillis } ?: 0L
@@ -2943,14 +3062,18 @@ class PinBoardViewModel(
                 p.copy(albumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }
             } else p
         }
-
+        albumIds.forEach { movedId ->
+            val parent = allAlbums.firstOrNull { it.id == movedId }?.parentAlbumId
+            if (parent != null) affectedAlbumIds.add(parent)
+        }
         val updatedAlbums = allAlbums.map { a ->
             if (albumIds.contains(a.id)) {
-                a.copy(dateAddedMillis = nextDate).also { nextDate += 1000L }
+                a.copy(parentAlbumId = null, dateAddedMillis = nextDate).also { nextDate += 1000L }
             } else a
         }
-
-        val nonEmptyAlbumIds = updatedPins.mapNotNull { it.albumId }.toSet()
+        val pinsByAlbum = updatedPins.filter { it.albumId != null }.groupBy { it.albumId!! }
+        val childrenByAlbum = updatedAlbums.filter { it.parentAlbumId != null }.groupBy { it.parentAlbumId!! }
+        val nonEmptyAlbumIds = pinsByAlbum.keys + childrenByAlbum.keys
         val dissolvedAlbumIds = affectedAlbumIds - nonEmptyAlbumIds
         val finalAlbums = updatedAlbums.filterNot { it.id in dissolvedAlbumIds }
 
@@ -2972,59 +3095,51 @@ class PinBoardViewModel(
     }
 
 
+
+    // Comprehensive executeAlbumTransferToCurrentBoard — handles pins + albums
     fun executeAlbumTransferToCurrentBoard() {
         val transfer = _pendingAlbumTransfer.value ?: return
         val currentBoard = _currentBoard.value ?: return
         viewModelScope.launch {
             val ctx = appContext ?: return@launch
             val dao = AppDatabase.getDatabase(ctx).boardDao()
-            // DB-source pins — safe when navigating to another board
-            val sourcePins = withContext(Dispatchers.IO) {
-                dao.getPinsForBoard(transfer.sourceBoardId)
-                    .filter { transfer.pinIds.contains(it.id) }
-                    .map { it.toPinItem() }
-            }
-            if (sourcePins.isEmpty()) {
-                _pendingAlbumTransfer.value = null
-                _snackbarMessage.value = "No images to transfer"
-                return@launch
-            }
-            if (currentBoard.id == transfer.sourceBoardId) {
-                if (transfer.mode == AlbumTransferMode.MOVE) {
-                    moveToTopInternal(transfer.sourceBoardId, sourcePins.map { it.id }.toSet(), emptySet(), dao)
-                    _snackbarMessage.value = "Moved ${sourcePins.size} to top of board"
-                } else {
-                    _snackbarMessage.value = "Already on this board"
-                }
-            } else {
-                val existingUrls = withContext(Dispatchers.IO) { dao.getImageUrlsForBoard(currentBoard.id).toSet() }
-                val baseDate = System.currentTimeMillis()
-                val toAdd = sourcePins.filter { !existingUrls.contains(it.imageUrl) }
-                    .mapIndexed { i, p -> p.copy(albumId = null, dateAddedMillis = baseDate + i * 1000L) }
-                withContext(Dispatchers.IO) {
-                    if (toAdd.isNotEmpty()) {
-                        dao.upsertPinsSafely(toAdd.mapIndexed { i, p ->
-                            PinEntity.fromPinItem(p, currentBoard.id, i)
-                        })
-                    }
+            try {
+                if (currentBoard.id == transfer.sourceBoardId) {
                     if (transfer.mode == AlbumTransferMode.MOVE) {
-                        dao.deletePinsFromBoard(transfer.sourceBoardId, transfer.pinIds.toList())
+                        moveToTopInternal(transfer.sourceBoardId, transfer.pinIds, transfer.albumIds, dao)
+                        _snackbarMessage.value = "Moved to top of board"
+                    } else {
+                        _snackbarMessage.value = "Already on this board"
                     }
+                } else {
+                    val (pinCount, albumCount) = performTransfer(
+                        dao = dao, sourceBoardId = transfer.sourceBoardId,
+                        pinIds = transfer.pinIds, albumIds = transfer.albumIds,
+                        targetBoardId = currentBoard.id, targetAlbumId = null,
+                        mode = transfer.mode
+                    )
+                    val refreshed = withContext(Dispatchers.IO) { dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() } }
+                    val refreshedAlbums = withContext(Dispatchers.IO) { dao.getAlbumsForBoard(currentBoard.id) }
+                    withContext(Dispatchers.Main) {
+                        _rawPins.value = refreshed
+                        _customAlbums.value = refreshedAlbums
+                        _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
+                        updateDisplayedPins()
+                    }
+                    val verb = if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"
+                    val pinPart = "$pinCount image${if (pinCount != 1) "s" else ""}"
+                    val albumPart = if (albumCount > 0) " + $albumCount album${if (albumCount != 1) "s" else ""}" else ""
+                    _snackbarMessage.value = "$verb $pinPart$albumPart to ${currentBoard.title}"
                 }
-                val refreshed = withContext(Dispatchers.IO) {
-                    dao.getPinsForBoard(currentBoard.id).map { it.toPinItem() }
-                }
-                withContext(Dispatchers.Main) {
-                    _rawPins.value = refreshed
-                    _currentBoard.value = currentBoard.copy(pins = refreshed, pinCount = refreshed.size)
-                    updateDisplayedPins()
-                }
-                _snackbarMessage.value = "${if (transfer.mode == AlbumTransferMode.MOVE) "Moved" else "Copied"} ${toAdd.size} to ${currentBoard.title}"
+            } catch (e: IllegalStateException) {
+                _snackbarMessage.value = e.message ?: "Cannot transfer"
+            } finally {
+                _pendingAlbumTransfer.value = null
+                withContext(Dispatchers.Main) { clearSelection() }
             }
-            _pendingAlbumTransfer.value = null
-            withContext(Dispatchers.Main) { clearSelection() }
         }
     }
+
 
 
     override fun onCleared() {
