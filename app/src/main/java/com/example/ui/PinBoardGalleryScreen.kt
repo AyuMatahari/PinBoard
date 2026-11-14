@@ -1342,8 +1342,8 @@ fun PinBoardGalleryScreen(
                 }
             }
 
-            // Fullscreen Gallery Viewer Modal Overlay
-                        if (isFullscreenActive) {
+            // Fullscreen Gallery Viewer Modal Overlay (ID-based)
+            if (isFullscreenActive) {
                 val fullScreenPins = when {
                     liveActiveAlbum != null -> liveActiveAlbum!!.pins
                     galleryPinsForFullscreen.isNotEmpty() -> galleryPinsForFullscreen
@@ -1366,7 +1366,7 @@ fun PinBoardGalleryScreen(
                     onDeleteSingle = { pin -> viewModel.deleteSinglePin(pin) },
                     onClose = { viewModel.closeFullscreen() },
                     onDownloadSingle = { pin -> viewModel.downloadSingle(context, pin) }
-                }
+                )
             }
 
             // Album Quick Preview Overlay (screen-fitting ~18 images preview on swipe)
