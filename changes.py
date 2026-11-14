@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — ID-based fullscreen (brace-balanced) + drag-reorder board picker
+PinBoard Gallery — fix dateGroups forward reference (re-run) + ID fullscreen + drag picker
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,7 +72,6 @@ def tool_available(name):
 
 
 def find_matching_brace(text, open_idx):
-    """Given index of '{', return index of its matching '}'."""
     depth = 0
     i = open_idx
     while i < len(text):
@@ -85,18 +84,88 @@ def find_matching_brace(text, open_idx):
                 if text[i] == '"':
                     break
                 i += 1
-        elif c == "{":
-            depth += 1
+        elif c == "{": depth += 1
         elif c == "}":
             depth -= 1
-            if depth == 0:
-                return i
+            if depth == 0: return i
         i += 1
     return -1
 
 
 # ============================================================
-# PATCH 1 — ViewModel fullscreenPinId (idempotent)
+# PATCH 0 — CRITICAL: fix isStandardMasonryActive forward reference
+# ============================================================
+def patch_forward_reference():
+    log("\n=== PATCH: isStandardMasonryActive forward reference (CRITICAL) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+
+    date_groups_idx = t.find("val dateGroups = remember(")
+    is_std_idx = t.find("val isStandardMasonryActive")
+    albums_idx = t.find("val albums = remember(allPinsForAlbums")
+
+    if date_groups_idx < 0:
+        log("  ✗ dateGroups declaration not found"); sys.exit(1)
+    if albums_idx < 0:
+        log("  ✗ albums declaration not found"); sys.exit(1)
+
+    if is_std_idx >= 0 and is_std_idx > date_groups_idx:
+        log("  ✓ already correctly placed (after dateGroups)"); return
+
+    # Remove all existing occurrences (however many, wherever they are)
+    removed = 0
+    while True:
+        idx = t.find("val isStandardMasonryActive")
+        if idx < 0:
+            break
+        line_start = t.rfind("\n", 0, idx) + 1
+        # Find the closing `dateGroups.isNotEmpty())` — end of the declaration
+        end_marker = "dateGroups.isNotEmpty())"
+        end_idx = t.find(end_marker, idx)
+        if end_idx < 0:
+            # Fallback: end at the next newline
+            end_idx = t.find("\n", idx)
+            if end_idx < 0:
+                break
+            end_idx += 1
+        else:
+            end_idx += len(end_marker)
+            # Consume trailing newline(s)
+            while end_idx < len(t) and t[end_idx] == "\n":
+                end_idx += 1
+        t = t[:line_start] + t[end_idx:]
+        removed += 1
+        # Re-scan since positions shifted
+        is_std_idx = t.find("val isStandardMasonryActive")
+        if is_std_idx < 0:
+            break
+
+    if removed > 0:
+        log(f"  ✓ removed {removed} misplaced declaration(s)")
+
+    # Re-insert correctly — before `albums = remember(allPinsForAlbums`
+    # (`albums` is declared AFTER `dateGroups` in the original file)
+    block = (
+        "    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&\n"
+        "        !(separateByDate && dateGroups.isNotEmpty())\n"
+        "\n"
+    )
+    if "    val albums = remember(allPinsForAlbums" in t:
+        t = t.replace(
+            "    val albums = remember(allPinsForAlbums",
+            block + "    val albums = remember(allPinsForAlbums",
+            1,
+        )
+        log("  ✓ reinserted after dateGroups, before albums")
+    else:
+        log("  ✗ could not find albums anchor for reinsertion"); sys.exit(1)
+
+    f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 1 — ViewModel fullscreenPinId
 # ============================================================
 def patch_vm_fullscreen_pin_id():
     log("\n=== PATCH: ViewModel fullscreenPinId ===")
@@ -157,15 +226,15 @@ def patch_vm_fullscreen_pin_id():
         )
         if old_open in t:
             t = t.replace(old_open, new_open, 1); changed = True
-            log("  ✓ openFullscreenByPinId + closeFullscreen")
+            log("  ✓ openFullscreenByPinId")
 
     if changed: f.write_text(t, encoding="utf-8")
 
 
 # ============================================================
-# PATCH 2 — Screen: collect state + ID-based clicks (idempotent)
+# PATCH 2 — Screen state + ID clicks
 # ============================================================
-def patch_screen_fullscreen_state_and_clicks():
+def patch_screen_state_and_clicks():
     log("\n=== PATCH: Screen state + ID clicks ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
@@ -183,7 +252,6 @@ def patch_screen_fullscreen_state_and_clicks():
             t = t.replace(old_collect, new_collect, 1); changed = True
             log("  ✓ collect state + isFullscreenActive")
 
-    # Replace `fullscreenPinIndex == null` → `!isFullscreenActive`
     n = t.count("fullscreenPinIndex == null")
     if n > 0:
         t = t.replace("fullscreenPinIndex == null", "!isFullscreenActive")
@@ -192,42 +260,42 @@ def patch_screen_fullscreen_state_and_clicks():
 
     t = t.replace("fullscreenPinIndex != null", "isFullscreenActive")
 
-    # Gallery click → ID
-    old_click_gallery = (
+    # Gallery click
+    old_click_g = (
         "                                        val visualIdx = galleryPinsForFullscreen.indexOfFirst { it.id == pin.id }\n"
         "                                            .coerceAtLeast(0)\n"
         "                                        viewModel.openFullscreen(visualIdx)\n"
     )
-    if old_click_gallery in t:
-        t = t.replace(old_click_gallery, "                                        viewModel.openFullscreenByPinId(pin.id)\n", 1)
+    if old_click_g in t:
+        t = t.replace(old_click_g, "                                        viewModel.openFullscreenByPinId(pin.id)\n", 1)
         changed = True
         log("  ✓ galleryItems click → ID")
 
-    # Album view click → ID
-    old_album_click = (
+    # Album view click
+    old_click_a = (
         "                                } else {\n"
         "                                    viewModel.openFullscreen(index)\n"
         "                                }\n"
     )
-    if old_album_click in t:
-        idx = t.find(old_album_click)
+    if old_click_a in t:
+        idx = t.find(old_click_a)
         if idx > 0:
             t = t[:idx] + (
                 "                                } else {\n"
                 "                                    viewModel.openFullscreenByPinId(pin.id)\n"
                 "                                }\n"
-            ) + t[idx + len(old_album_click):]
+            ) + t[idx + len(old_click_a):]
             changed = True
             log("  ✓ album view click → ID")
 
-    # Date-group click → ID
-    old_date_click = (
+    # Date-group click
+    old_click_d = (
         "                                } else {\n"
         "                                    viewModel.openFullscreen(if (index >= 0) index else 0)\n"
         "                                }\n"
     )
-    if old_date_click in t:
-        t = t.replace(old_date_click, (
+    if old_click_d in t:
+        t = t.replace(old_click_d, (
             "                                } else {\n"
             "                                    viewModel.openFullscreenByPinId(pin.id)\n"
             "                                }\n"
@@ -235,20 +303,18 @@ def patch_screen_fullscreen_state_and_clicks():
         changed = True
         log("  ✓ date-group click → ID")
 
-    if changed:
-        f.write_text(t, encoding="utf-8")
+    if changed: f.write_text(t, encoding="utf-8")
 
 
 # ============================================================
-# PATCH 3 — Screen: fullscreen render block (brace-balanced)
+# PATCH 3 — Fullscreen render block (brace-balanced)
 # ============================================================
 def patch_screen_fullscreen_render():
-    log("\n=== PATCH: Screen fullscreen render (brace-balanced) ===")
+    log("\n=== PATCH: Fullscreen render (brace-balanced) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    # Already patched?
     if ("if (isFullscreenActive) {" in t
             and "fullscreenPinId != null -> fullScreenPins.indexOfFirst { it.id == fullscreenPinId }" in t):
         log("  ✓ already patched"); return
@@ -256,22 +322,17 @@ def patch_screen_fullscreen_render():
     marker = "fullscreenPinIndex?.let {"
     idx = t.find(marker)
     if idx < 0:
-        log("  ✗ marker 'fullscreenPinIndex?.let {' not found"); sys.exit(1)
+        log("  ✗ marker not found"); sys.exit(1)
 
-    open_brace = idx + len(marker) - 1  # marker ends with '{'
+    open_brace = idx + len(marker) - 1
     close_brace = find_matching_brace(t, open_brace)
     if close_brace < 0:
         log("  ✗ matching brace not found"); sys.exit(1)
 
-    # Detect original indentation from the line containing the marker
     line_start = t.rfind("\n", 0, idx) + 1
-    original_indent = t[line_start:idx]
-
-    # Compose the new block using the detected indent so it aligns with surrounding code
-    ind = original_indent
+    ind = t[line_start:idx]
     inner = ind + "    "
     inner2 = inner + "    "
-    inner3 = inner2 + "    "
 
     new_block = (
         f"{ind}if (isFullscreenActive) {{\n"
@@ -303,11 +364,11 @@ def patch_screen_fullscreen_render():
 
     t = t[:idx] + new_block + t[close_brace + 1:]
     f.write_text(t, encoding="utf-8")
-    log(f"  ✓ fullscreen render replaced (via brace-balance, {close_brace - idx} chars → {len(new_block)} chars)")
+    log(f"  ✓ fullscreen block replaced ({close_brace - idx} chars → {len(new_block)} chars)")
 
 
 # ============================================================
-# PATCH 4 — BoardPickerDialog with drag-reorder (idempotent)
+# PATCH 4 — BoardPickerDialog with drag-reorder
 # ============================================================
 NEW_BOARD_PICKER = r'''package com.example.ui.dialogs
 
@@ -346,7 +407,6 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -536,7 +596,7 @@ fun BoardPickerDialog(
 
 
 def patch_board_picker_dialog():
-    log("\n=== PATCH: BoardPickerDialog (drag-reorder) ===")
+    log("\n=== PATCH: BoardPickerDialog ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt"
     if f.exists():
         t = f.read_text(encoding="utf-8")
@@ -548,9 +608,9 @@ def patch_board_picker_dialog():
 
 
 # ============================================================
-# PATCH 5 — Wire onReorderBoards (idempotent)
+# PATCH 5 — Wire onReorderBoards
 # ============================================================
-def patch_wire_reorder_callback():
+def patch_wire_reorder():
     log("\n=== PATCH: Wire onReorderBoards ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
@@ -587,68 +647,86 @@ def patch_wire_reorder_callback():
     if old_call in t:
         t = t.replace(old_call, new_call, 1)
         f.write_text(t, encoding="utf-8")
-        log("  ✓ onReorderBoards wired")
+        log("  ✓ wired")
     else:
-        log("  ⚠ anchor missing — trying fallback")
+        # Fallback: balance-paren insertion
         idx = t.find("com.example.ui.dialogs.BoardPickerDialog(")
         if idx < 0:
-            log("  ✗ BoardPickerDialog call not found"); sys.exit(1)
+            log("  ✗ call not found"); sys.exit(1)
         paren_idx = t.find("(", idx)
         depth = 0
         i = paren_idx
         while i < len(t):
-            if t[i] == "(":
-                depth += 1
+            if t[i] == "(": depth += 1
             elif t[i] == ")":
                 depth -= 1
                 if depth == 0:
                     t = t[:i] + ",\n        onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }\n    " + t[i:]
                     f.write_text(t, encoding="utf-8")
-                    log("  ✓ onReorderBoards wired (fallback)")
+                    log("  ✓ wired (fallback)")
                     return
             i += 1
 
 
 # ============================================================
-# Self-verify
+# Verify
 # ============================================================
-def verify_patches():
-    log("\n=== Self-verify ===")
+def verify_all():
+    log("\n=== VERIFY ===")
+
+    # CRITICAL: forward reference
+    fp = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not fp.exists():
+        log("  ✗ PinBoardGalleryScreen.kt missing"); sys.exit(1)
+    content = fp.read_text(encoding="utf-8")
+
+    date_groups_idx = content.find("val dateGroups = remember(")
+    is_std_idx = content.find("val isStandardMasonryActive")
+    is_std_count = content.count("val isStandardMasonryActive")
+
+    if date_groups_idx < 0:
+        log("  ✗ dateGroups declaration not found"); sys.exit(1)
+    if is_std_idx < 0:
+        log("  ✗ isStandardMasonryActive declaration not found"); sys.exit(1)
+    if is_std_idx < date_groups_idx:
+        log(f"  ✗ isStandardMasonryActive BEFORE dateGroups (will fail to compile!)")
+        log(f"    isStandardMasonryActive idx={is_std_idx}, dateGroups idx={date_groups_idx}")
+        sys.exit(1)
+    if is_std_count != 1:
+        log(f"  ✗ expected 1 isStandardMasonryActive declaration, found {is_std_count}"); sys.exit(1)
+    log("  ✓ isStandardMasonryActive after dateGroups, single declaration")
+
+    # Other markers
     checks = [
         ("app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt", [
             "private val _fullscreenPinId",
             "fun openFullscreenByPinId(pinId: String)",
-            "_fullscreenPinId.value = pinId",
         ]),
         ("app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt", [
             "val fullscreenPinId by viewModel.fullscreenPinId",
             "val isFullscreenActive = ",
-            "viewModel.openFullscreenByPinId(pin.id)",
-            "if (isFullscreenActive) {",
             "fullscreenPinId != null -> fullScreenPins.indexOfFirst { it.id == fullscreenPinId }",
             "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }",
         ]),
         ("app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt", [
             "detectDragGesturesAfterLongPress",
-            "onReorderBoards: (List<BoardHistoryItem>) -> Unit = {}",
             "onReorderBoards(newList)",
         ]),
     ]
-    all_ok = True
     for rel, markers in checks:
-        fp = PROJECT_ROOT / rel
-        if not fp.exists():
-            log(f"  ✗ {rel} missing"); all_ok = False; continue
-        content = fp.read_text(encoding="utf-8")
-        local_ok = True
+        fp2 = PROJECT_ROOT / rel
+        if not fp2.exists():
+            log(f"  ✗ {rel} missing"); sys.exit(1)
+        c = fp2.read_text(encoding="utf-8")
+        ok = True
         for m in markers:
-            if m not in content:
-                log(f"  ✗ MISSING in {rel.split('/')[-1]}: {m[:70]}")
-                local_ok = False; all_ok = False
-        if local_ok:
+            if m not in c:
+                log(f"  ✗ MISSING in {rel.split('/')[-1]}: {m[:60]}")
+                ok = False
+        if ok:
             log(f"  ✓ {rel.split('/')[-1]}")
-    if not all_ok:
-        log("\n✗ VERIFICATION FAILED"); sys.exit(1)
+        else:
+            sys.exit(1)
 
 
 # ============================================================
@@ -778,7 +856,7 @@ def setup_git():
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
         run(["git", "commit", "-m",
-             "Fix fullscreen render (brace-balanced); ID-based navigation + drag picker"])
+             "Fix dateGroups forward reference (re-apply); keep ID fullscreen + drag picker"])
 
 
 def verify_keystore_tracked():
@@ -927,18 +1005,24 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — brace-balanced fullscreen + drag picker")
+    log("PinBoard — fix dateGroups forward ref + ID fullscreen + drag picker")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
+    # CRITICAL: fix forward reference FIRST
+    patch_forward_reference()
+
+    # Then other patches (all idempotent)
     patch_vm_fullscreen_pin_id()
-    patch_screen_fullscreen_state_and_clicks()
+    patch_screen_state_and_clicks()
     patch_screen_fullscreen_render()
     patch_board_picker_dialog()
-    patch_wire_reorder_callback()
-    verify_patches()
+    patch_wire_reorder()
+
+    # Verify everything BEFORE CI
+    verify_all()
 
     ensure_release_keystore()
     patch_build_gradle()
