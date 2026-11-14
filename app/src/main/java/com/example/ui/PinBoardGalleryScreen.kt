@@ -303,9 +303,6 @@ fun PinBoardGalleryScreen(
     }
 
     // True when standard masonry grid is the active view
-    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&
-        !(separateByDate && dateGroups.isNotEmpty())
-
     // Scroll to album when requested (after combine/creation)
     LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {
         val targetId = scrollToAlbumId ?: return@LaunchedEffect
@@ -337,6 +334,9 @@ fun PinBoardGalleryScreen(
             emptyList()
         }
     }
+
+    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&
+        !(separateByDate && dateGroups.isNotEmpty())
 
     val albums = remember(allPinsForAlbums, customDateAlbums, topLevelCustomAlbums, separateByDate, groupByAlbum, favoriteAlbumIds, favoritePinKeys) {
         if (!groupByAlbum) emptyList()

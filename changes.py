@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — 4 fixes (re-run, VM anchor corrected)
+PinBoard Gallery — fix isStandardMasonryActive forward reference
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,569 +72,105 @@ def tool_available(name):
 
 
 # ============================================================
-# PATCH 1 — Share put-into-album (idempotent)
+# THE FIX — relocate isStandardMasonryActive after dateGroups
 # ============================================================
-def patch_share_put_into_album():
-    log("\n=== PATCH: Share — save-multiple-to-new-album ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/ShareTargetActivity.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if 'testTag("share_put_into_album_checkbox")' in t:
-        log("  ✓ already patched"); return
-
-    changed = False
-    # (same logic as before)
-    if "var putIntoAlbum by remember { mutableStateOf(false) }" not in t:
-        anchor = "    var extractMultipleImages by remember { mutableStateOf(false) }\n"
-        if anchor in t:
-            t = t.replace(anchor, anchor + "    var putIntoAlbum by remember { mutableStateOf(false) }\n", 1)
-            changed = True
-            log("  ✓ putIntoAlbum state")
-
-    old_after = (
-        "                        Column {\n"
-        "                            Text(\"Add multiple main images from webpage\",\n"
-        "                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold)\n"
-        "                            Text(\"Extract content images in order\",\n"
-        "                                fontSize = 10.sp, color = PinterestTextSecondary)\n"
-        "                        }\n"
-        "                    }\n"
-        "                }\n"
-    )
-    new_after = (
-        "                        Column {\n"
-        "                            Text(\"Add multiple main images from webpage\",\n"
-        "                                fontSize = 12.sp, fontWeight = FontWeight.SemiBold)\n"
-        "                            Text(\"Extract content images in order\",\n"
-        "                                fontSize = 10.sp, color = PinterestTextSecondary)\n"
-        "                        }\n"
-        "                    }\n"
-        "                    if (extractMultipleImages) {\n"
-        "                        Row(\n"
-        "                            modifier = Modifier.fillMaxWidth()\n"
-        "                                .combinedClickable(\n"
-        "                                    onClick = { putIntoAlbum = !putIntoAlbum },\n"
-        "                                    onLongClick = { putIntoAlbum = !putIntoAlbum }\n"
-        "                                )\n"
-        "                                .padding(start = 24.dp, top = 4.dp)\n"
-        "                                .testTag(\"share_put_into_album_checkbox\"),\n"
-        "                            verticalAlignment = Alignment.CenterVertically\n"
-        "                        ) {\n"
-        "                            Checkbox(\n"
-        "                                checked = putIntoAlbum,\n"
-        "                                onCheckedChange = { putIntoAlbum = it },\n"
-        "                                colors = CheckboxDefaults.colors(checkedColor = PinterestRed)\n"
-        "                            )\n"
-        "                            Spacer(Modifier.width(4.dp))\n"
-        "                            Column {\n"
-        "                                Text(\"Save to new album\",\n"
-        "                                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold)\n"
-        "                                Text(\"Multiple images grouped as one album\",\n"
-        "                                    fontSize = 10.sp, color = PinterestTextSecondary)\n"
-        "                            }\n"
-        "                        }\n"
-        "                    }\n"
-        "                }\n"
-    )
-    if old_after in t:
-        t = t.replace(old_after, new_after, 1); changed = True
-        log("  ✓ putIntoAlbum checkbox")
-
-    old_cb = (
-        "                    onSaveToSelected = { boards, extractMultiple ->\n"
-        "                        finish()\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)\n"
-        "                    },\n"
-        "                    onHoldBoard = { boardId, extractMultiple ->\n"
-        "                        finish()\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple)\n"
-        "                    }\n"
-    )
-    new_cb = (
-        "                    onSaveToSelected = { boards, extractMultiple, putAlbum ->\n"
-        "                        finish()\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple, putAlbum)\n"
-        "                    },\n"
-        "                    onHoldBoard = { boardId, extractMultiple, putAlbum ->\n"
-        "                        finish()\n"
-        "                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple, putAlbum)\n"
-        "                    }\n"
-    )
-    if old_cb in t:
-        t = t.replace(old_cb, new_cb, 1); changed = True
-        log("  ✓ callbacks include putAlbum")
-
-    old_sig = (
-        "    private fun performSaveToBoards(\n"
-        "        links: List<String>,\n"
-        "        uris: List<Uri>,\n"
-        "        targetBoardIds: List<String>,\n"
-        "        extractMultiple: Boolean\n"
-        "    ) {\n"
-    )
-    new_sig = (
-        "    private fun performSaveToBoards(\n"
-        "        links: List<String>,\n"
-        "        uris: List<Uri>,\n"
-        "        targetBoardIds: List<String>,\n"
-        "        extractMultiple: Boolean,\n"
-        "        putIntoAlbum: Boolean = false\n"
-        "    ) {\n"
-    )
-    if old_sig in t:
-        t = t.replace(old_sig, new_sig, 1); changed = True
-        log("  ✓ performSaveToBoards signature")
-
-    old_loop = (
-        "                for (boardId in targetBoardIds) {\n"
-        "                    val existingIds = dao.getPinIdsForBoard(boardId).toSet()\n"
-        "                    val existingUrls = dao.getImageUrlsForBoard(boardId).toSet()\n"
-        "                    val toInsert = pins.filter {\n"
-        "                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)\n"
-        "                    }\n"
-        "                    if (toInsert.isNotEmpty()) {\n"
-        "                        dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n"
-        "                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)\n"
-        "                        })\n"
-        "                    }\n"
-        "                }\n"
-    )
-    new_loop = (
-        "                for (boardId in targetBoardIds) {\n"
-        "                    val existingIds = dao.getPinIdsForBoard(boardId).toSet()\n"
-        "                    val existingUrls = dao.getImageUrlsForBoard(boardId).toSet()\n"
-        "                    val toInsert = pins.filter {\n"
-        "                        !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)\n"
-        "                    }\n"
-        "                    if (toInsert.isNotEmpty()) {\n"
-        "                        var albumId: String? = null\n"
-        "                        if (putIntoAlbum && toInsert.size > 1) {\n"
-        "                            val aId = \"album_${System.currentTimeMillis()}_${(1000..9999).random()}\"\n"
-        "                            dao.insertAlbum(com.example.data.local.CustomAlbumEntity(\n"
-        "                                id = aId, boardId = boardId, parentAlbumId = null,\n"
-        "                                title = \"Album (${toInsert.size} images)\",\n"
-        "                                sourceUrl = links.firstOrNull() ?: \"\",\n"
-        "                                dateAddedMillis = System.currentTimeMillis(),\n"
-        "                                orderIndex = 0, isFavorite = false\n"
-        "                            ))\n"
-        "                            albumId = aId\n"
-        "                        }\n"
-        "                        dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->\n"
-        "                            PinEntity.fromPinItem(p.copy(albumId = albumId), boardId, i)\n"
-        "                        })\n"
-        "                    }\n"
-        "                }\n"
-    )
-    if old_loop in t:
-        t = t.replace(old_loop, new_loop, 1); changed = True
-        log("  ✓ album creation in save loop")
-
-    old_dialog_sig = (
-        "    onSaveToSelected: (List<String>, Boolean) -> Unit,\n"
-        "    onHoldBoard: (String, Boolean) -> Unit\n"
-    )
-    new_dialog_sig = (
-        "    onSaveToSelected: (List<String>, Boolean, Boolean) -> Unit,\n"
-        "    onHoldBoard: (String, Boolean, Boolean) -> Unit\n"
-    )
-    if old_dialog_sig in t:
-        t = t.replace(old_dialog_sig, new_dialog_sig, 1); changed = True
-        log("  ✓ dialog signature")
-
-    old_btn = (
-        "                        onClick = {\n"
-        "                            if (selectedBoardIds.isNotEmpty()) {\n"
-        "                                onSaveToSelected(selectedBoardIds.toList(), extractMultipleImages)\n"
-        "                            } else {\n"
-        "                                onClose()\n"
-        "                            }\n"
-        "                        },\n"
-    )
-    new_btn = (
-        "                        onClick = {\n"
-        "                            if (selectedBoardIds.isNotEmpty()) {\n"
-        "                                onSaveToSelected(selectedBoardIds.toList(), extractMultipleImages, putIntoAlbum && extractMultipleImages)\n"
-        "                            } else {\n"
-        "                                onClose()\n"
-        "                            }\n"
-        "                        },\n"
-    )
-    if old_btn in t:
-        t = t.replace(old_btn, new_btn, 1); changed = True
-        log("  ✓ save button click")
-
-    old_long = "onLongClick = { onHoldBoard(board.id, extractMultipleImages) }"
-    new_long = "onLongClick = { onHoldBoard(board.id, extractMultipleImages, putIntoAlbum && extractMultipleImages) }"
-    if old_long in t:
-        t = t.replace(old_long, new_long, 1); changed = True
-        log("  ✓ long-press passes flag")
-
-    if changed: f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PATCH 2 — AddManualImagesDialog + ViewModel (FIXED)
-# ============================================================
-def patch_manual_put_into_album():
-    log("\n=== PATCH: AddManual — save-multiple-to-new-album ===")
-
-    # ---- Dialog ----
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/AddManualImagesDialog.kt"
-    if not f.exists(): log("  ✗ dialog not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if 'testTag("manual_put_into_album_checkbox")' in t:
-        log("  ✓ dialog already patched")
-    else:
-        changed = False
-        if "var putIntoAlbum by remember { mutableStateOf(false) }" not in t:
-            anchor = "    var extractMultipleImages by remember { mutableStateOf(false) }\n"
-            if anchor in t:
-                t = t.replace(anchor, anchor + "    var putIntoAlbum by remember { mutableStateOf(false) }\n", 1)
-                changed = True
-
-        old_sig = "    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean) -> Unit\n"
-        new_sig = "    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean, putIntoAlbum: Boolean) -> Unit\n"
-        if old_sig in t:
-            t = t.replace(old_sig, new_sig, 1); changed = True
-            log("  ✓ dialog signature")
-
-        old_after = (
-            "                    Spacer(Modifier.width(6.dp))\n"
-            "                    Column {\n"
-            "                        Text(\"Add multiple main images from webpage\",\n"
-            "                            fontSize = 13.sp, fontWeight = FontWeight.SemiBold)\n"
-            "                        Text(\"Extract all content images from webpage in order\",\n"
-            "                            fontSize = 11.sp, color = PinterestTextSecondary)\n"
-            "                    }\n"
-            "                }\n"
-        )
-        new_after = (
-            "                    Spacer(Modifier.width(6.dp))\n"
-            "                    Column {\n"
-            "                        Text(\"Add multiple main images from webpage\",\n"
-            "                            fontSize = 13.sp, fontWeight = FontWeight.SemiBold)\n"
-            "                        Text(\"Extract all content images from webpage in order\",\n"
-            "                            fontSize = 11.sp, color = PinterestTextSecondary)\n"
-            "                    }\n"
-            "                }\n"
-            "\n"
-            "                if (extractMultipleImages) {\n"
-            "                    Row(\n"
-            "                        verticalAlignment = Alignment.CenterVertically,\n"
-            "                        modifier = Modifier\n"
-            "                            .fillMaxWidth()\n"
-            "                            .padding(start = 24.dp)\n"
-            "                            .clickable { putIntoAlbum = !putIntoAlbum }\n"
-            "                            .padding(vertical = 4.dp)\n"
-            "                            .testTag(\"manual_put_into_album_checkbox\")\n"
-            "                    ) {\n"
-            "                        Checkbox(\n"
-            "                            checked = putIntoAlbum,\n"
-            "                            onCheckedChange = { putIntoAlbum = it },\n"
-            "                            colors = CheckboxDefaults.colors(checkedColor = PinterestRed)\n"
-            "                        )\n"
-            "                        Spacer(Modifier.width(6.dp))\n"
-            "                        Column {\n"
-            "                            Text(\"Save to new album\",\n"
-            "                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold)\n"
-            "                            Text(\"Multiple images grouped as one album\",\n"
-            "                                fontSize = 11.sp, color = PinterestTextSecondary)\n"
-            "                        }\n"
-            "                    }\n"
-            "                }\n"
-        )
-        if old_after in t:
-            t = t.replace(old_after, new_after, 1); changed = True
-            log("  ✓ dialog checkbox")
-
-        old_call = (
-            "                onClick = {\n"
-            "                    if (extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty()) {\n"
-            "                        onAddImages(textInput.trim(), selectedBoardIds.toList(), extractMultipleImages)\n"
-            "                        onDismiss()\n"
-            "                    }\n"
-            "                },\n"
-        )
-        new_call = (
-            "                onClick = {\n"
-            "                    if (extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty()) {\n"
-            "                        onAddImages(\n"
-            "                            textInput.trim(),\n"
-            "                            selectedBoardIds.toList(),\n"
-            "                            extractMultipleImages,\n"
-            "                            putIntoAlbum && extractMultipleImages\n"
-            "                        )\n"
-            "                        onDismiss()\n"
-            "                    }\n"
-            "                },\n"
-        )
-        if old_call in t:
-            t = t.replace(old_call, new_call, 1); changed = True
-            log("  ✓ dialog call")
-
-        if changed: f.write_text(t, encoding="utf-8")
-
-    # ---- ViewModel (THE FIX) ----
-    vf = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
-    if not vf.exists(): log("  ✗ VM not found"); sys.exit(1)
-    vt = vf.read_text(encoding="utf-8")
-    vm_changed = False
-
-    # Step A: locate function body and check signature
-    idx = vt.find("fun addManualImages(")
-    if idx < 0:
-        log("  ✗ addManualImages function not found"); sys.exit(1)
-    end_sig_idx = vt.find(") {", idx)
-    if end_sig_idx < 0:
-        log("  ✗ addManualImages signature close not found"); sys.exit(1)
-    sig_block = vt[idx:end_sig_idx]
-
-    # Step A1: ensure putIntoAlbum parameter exists
-    if "putIntoAlbum: Boolean" not in sig_block:
-        vt = vt[:end_sig_idx] + ",\n        putIntoAlbum: Boolean = false" + vt[end_sig_idx:]
-        vm_changed = True
-        log("  ✓ putIntoAlbum parameter added to signature")
-    else:
-        log("  ✓ putIntoAlbum parameter already present")
-
-    # Step A2: remove any leftover hardcoded `val putIntoAlbum = false`
-    if "\n        val putIntoAlbum = false\n" in vt:
-        vt = vt.replace("\n        val putIntoAlbum = false\n", "\n", 1)
-        vm_changed = True
-        log("  ✓ removed hardcoded val putIntoAlbum=false")
-
-    # Step A3: verify the existing album-creation block is intact
-    if "if (putIntoAlbum && resolvedPins.isNotEmpty())" in vt:
-        log("  ✓ existing album-creation block present")
-    elif "if (putIntoAlbum && resolvedPins.size > 1)" in vt:
-        log("  ✓ existing album-creation block present (>1 variant)")
-    else:
-        log("  ⚠ album-creation block not found — inspect manually")
-
-    # Step A4: ensure targetAlbumId derivation exists (needed for correct nested behavior)
-    if "val targetAlbumId: String? = _activeAlbumId" not in vt and "_activeAlbumId = if (!putIntoAlbum)" not in vt:
-        # Fall back: add derivation if missing entirely
-        anchor = vt[idx:end_sig_idx + 3]  # through ") {"
-        addition = (
-            "\n"
-            "        // derive target album (only when NOT creating new album)\n"
-            "        val _activeAlbumId = if (!putIntoAlbum) {\n"
-            "            _activeAlbum.value?.let { alb ->\n"
-            "                if (_currentBoard.value != null && targetBoardIds.contains(_currentBoard.value!!.id)) alb.id else null\n"
-            "            }\n"
-            "        } else null\n"
-            "        val targetAlbumId: String? = _activeAlbumId\n"
-        )
-        # Insert right after signature close
-        insert_at = end_sig_idx + 3
-        vt = vt[:insert_at] + addition + vt[insert_at:]
-        vm_changed = True
-        log("  ✓ targetAlbumId derivation added")
-    else:
-        log("  ✓ targetAlbumId derivation already present")
-
-    if vm_changed:
-        vf.write_text(vt, encoding="utf-8")
-
-    # ---- Gallery screen wiring (idempotent) ----
-    ps_f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    ps_t = ps_f.read_text(encoding="utf-8")
-    if "onAddImages = { text, targetBoards, extractMultiple, putAlbum ->" in ps_t:
-        log("  ✓ gallery screen call already patched")
-    else:
-        old_ps_call = (
-            "        onAddImages = { text, targetBoards, extractMultiple ->\n"
-            "            viewModel.addManualImages(text, targetBoards, extractMultiple)\n"
-            "        }\n"
-        )
-        new_ps_call = (
-            "        onAddImages = { text, targetBoards, extractMultiple, putAlbum ->\n"
-            "            viewModel.addManualImages(text, targetBoards, extractMultiple, putAlbum)\n"
-            "        }\n"
-        )
-        if old_ps_call in ps_t:
-            ps_t = ps_t.replace(old_ps_call, new_ps_call, 1)
-            ps_f.write_text(ps_t, encoding="utf-8")
-            log("  ✓ gallery screen call updated")
-
-
-# ============================================================
-# PATCH 3 — Rename Boards label (idempotent)
-# ============================================================
-def patch_boards_label():
-    log("\n=== PATCH: Rename Boards label ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/BoardHeader.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if '"BOARDS"' in t and "BOARDS (HOLD CUSTOM TO EDIT)" not in t:
-        log("  ✓ already renamed"); return
-
-    for old in [
-        'text = "BOARDS (HOLD CUSTOM TO EDIT) — TAP TO SWITCH",',
-        'text = "BOARDS (HOLD CUSTOM TO EDIT)",',
-    ]:
-        if old in t:
-            t = t.replace(old, 'text = "BOARDS",', 1)
-            f.write_text(t, encoding="utf-8")
-            log("  ✓ renamed to just BOARDS")
-            return
-    log("  ⚠ text anchor missing")
-
-
-# ============================================================
-# PATCH 4 — Fullscreen order (idempotent)
-# ============================================================
-def patch_fullscreen_order():
-    log("\n=== PATCH: Fullscreen order = visual grid order ===")
+def patch_forward_reference():
+    log("\n=== PATCH: Fix isStandardMasonryActive forward reference ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    if "galleryPinsForFullscreen" in t and "isStandardMasonryActive" in t:
-        log("  ✓ already patched"); return
+    # Step 1: Remove ALL occurrences of the (misplaced) declaration.
+    # We match from "val isStandardMasonryActive = ..." up to and including the
+    # closing "dateGroups.isNotEmpty())" plus any trailing newlines.
+    start_marker = "    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&\n"
+    end_marker = "dateGroups.isNotEmpty())"
 
-    changed = False
+    removed = 0
+    while True:
+        start_idx = t.find(start_marker)
+        if start_idx < 0:
+            break
+        end_idx = t.find(end_marker, start_idx + len(start_marker))
+        if end_idx < 0:
+            break
+        end_idx += len(end_marker)
+        # Consume trailing newlines that belonged to this block
+        while end_idx < len(t) and t[end_idx] == "\n":
+            end_idx += 1
+        t = t[:start_idx] + t[end_idx:]
+        removed += 1
 
-    if "galleryPinsForFullscreen" not in t:
-        anchor = "    val galleryItemsPlaceholder = galleryItems\n"
-        if anchor not in t:
-            log("  ⚠ galleryItemsPlaceholder anchor missing"); return
-        add = (
-            anchor +
-            "\n"
-            "    val galleryPinsForFullscreen = remember(galleryItems) {\n"
-            "        galleryItems.mapNotNull { it.pin }\n"
-            "    }\n"
-            "\n"
+    if removed == 0:
+        log("  ✓ no misplaced declaration found (either not present or already correct)")
+    else:
+        log(f"  ✓ removed {removed} misplaced declaration(s)")
+
+    # Step 2: Ensure exactly one correct declaration exists, placed BEFORE
+    # `val albums = remember(allPinsForAlbums` (which is declared after dateGroups).
+    albums_anchor = "    val albums = remember(allPinsForAlbums"
+    if albums_anchor not in t:
+        log("  ✗ albums anchor not found — aborting"); sys.exit(1)
+
+    if "    val isStandardMasonryActive = " in t:
+        log("  ✓ already correctly placed — no insert needed")
+    else:
+        block = (
             "    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&\n"
             "        !(separateByDate && dateGroups.isNotEmpty())\n"
+            "\n"
         )
-        t = t.replace(anchor, add, 1); changed = True
-        log("  ✓ galleryPinsForFullscreen + isStandardMasonryActive")
+        t = t.replace(albums_anchor, block + albums_anchor, 1)
+        log("  ✓ inserted isStandardMasonryActive after dateGroups (before albums)")
 
-    if "galleryPinsForFullscreen.indexOfFirst" not in t:
-        old_click = (
-            "                                onClick = {\n"
-            "                                    if (isSelectionMode) {\n"
-            "                                        viewModel.toggleSelection(pin.id)\n"
-            "                                    } else {\n"
-            "                                        viewModel.openFullscreen(item.pinIndexInLoose)\n"
-            "                                    }\n"
-            "                                },\n"
-        )
-        new_click = (
-            "                                onClick = {\n"
-            "                                    if (isSelectionMode) {\n"
-            "                                        viewModel.toggleSelection(pin.id)\n"
-            "                                    } else {\n"
-            "                                        val visualIdx = galleryPinsForFullscreen.indexOfFirst { it.id == pin.id }\n"
-            "                                            .coerceAtLeast(0)\n"
-            "                                        viewModel.openFullscreen(visualIdx)\n"
-            "                                    }\n"
-            "                                },\n"
-        )
-        if old_click in t:
-            t = t.replace(old_click, new_click, 1); changed = True
-            log("  ✓ click uses visual index")
-
-    old_fs = (
-        "    fullscreenPinIndex?.let { index ->\n"
-        "        val fullScreenPins = liveActiveAlbum?.pins ?: (if (topLevelCustomAlbums.isNotEmpty()) viewModel.getAllSortedPins().filter { it.albumId == null } else viewModel.getAllSortedPins()).ifEmpty { displayedPins }\n"
-    )
-    new_fs = (
-        "    fullscreenPinIndex?.let { index ->\n"
-        "        val fullScreenPins = when {\n"
-        "            liveActiveAlbum != null -> liveActiveAlbum!!.pins\n"
-        "            isStandardMasonryActive && galleryPinsForFullscreen.isNotEmpty() -> galleryPinsForFullscreen\n"
-        "            else -> viewModel.getAllSortedPins().ifEmpty { displayedPins }\n"
-        "        }\n"
-    )
-    if old_fs in t:
-        t = t.replace(old_fs, new_fs, 1); changed = True
-        log("  ✓ fullscreen pins source")
-
-    if changed: f.write_text(t, encoding="utf-8")
+    f.write_text(t, encoding="utf-8")
 
 
 # ============================================================
-# PATCH 5 — Date-album pins (idempotent)
+# Verify: isStandardMasonryActive appears AFTER dateGroups declaration
 # ============================================================
-def patch_date_album_pins():
-    log("\n=== PATCH: Date-album pins visible when opened ===")
+def verify_fix():
+    log("\n=== Verify ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    if "isCustomAlbumActive" in t:
-        log("  ✓ already patched"); return
+    date_groups_idx = t.find("val dateGroups = remember(")
+    albums_idx = t.find("val albums = remember(allPinsForAlbums")
+    is_std_idx = t.find("val isStandardMasonryActive")
 
-    old = (
-        "                    val albumPins = allPinsForAlbums.filter { it.albumId == liveActiveAlbum!!.id }\n"
-        "                        .sortedByDescending { it.dateAddedMillis }\n"
-    )
-    new = (
-        "                    val isCustomAlbumActive = customDateAlbums.any { it.id == liveActiveAlbum!!.id }\n"
-        "                    val albumPins = (if (isCustomAlbumActive) {\n"
-        "                        allPinsForAlbums.filter { it.albumId == liveActiveAlbum.id }\n"
-        "                    } else {\n"
-        "                        liveActiveAlbum.pins\n"
-        "                    }).sortedByDescending { it.dateAddedMillis }\n"
-    )
-    if old in t:
-        t = t.replace(old, new, 1)
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ date-album pins use captured pins")
-    else:
-        log("  ⚠ albumPins anchor missing")
+    ok = True
 
+    if date_groups_idx < 0:
+        log("  ✗ dateGroups declaration not found"); ok = False
+    if albums_idx < 0:
+        log("  ✗ albums declaration not found"); ok = False
+    if is_std_idx < 0:
+        log("  ✗ isStandardMasonryActive not found"); ok = False
 
-# ============================================================
-# Self-verify (FIXED markers)
-# ============================================================
-def verify_patches():
-    log("\n=== Self-verify ===")
-    checks = [
-        ("app/src/main/java/com/example/ui/ShareTargetActivity.kt", [
-            'testTag("share_put_into_album_checkbox")',
-            "putIntoAlbum && extractMultipleImages",
-            "putIntoAlbum: Boolean = false",
-        ]),
-        ("app/src/main/java/com/example/ui/dialogs/AddManualImagesDialog.kt", [
-            'testTag("manual_put_into_album_checkbox")',
-            "putIntoAlbum: Boolean",
-        ]),
-        ("app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt", [
-            "putIntoAlbum: Boolean = false",                              # parameter present
-            "if (putIntoAlbum && resolvedPins.isNotEmpty())",             # actual existing block
-        ]),
-        ("app/src/main/java/com/example/ui/components/BoardHeader.kt", [
-            'text = "BOARDS",',
-        ]),
-        ("app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt", [
-            "galleryPinsForFullscreen",
-            "isStandardMasonryActive",
-            "galleryPinsForFullscreen.indexOfFirst",
-            "isCustomAlbumActive",
-            "liveActiveAlbum.pins",
-        ]),
-    ]
-    all_ok = True
-    for rel, markers in checks:
-        fp = PROJECT_ROOT / rel
-        if not fp.exists():
-            log(f"  ✗ {rel} missing"); all_ok = False; continue
-        content = fp.read_text(encoding="utf-8")
-        local_ok = True
-        for m in markers:
-            if m not in content:
-                log(f"  ✗ MISSING in {rel.split('/')[-1]}: {m[:70]}")
-                local_ok = False; all_ok = False
-        if local_ok:
-            log(f"  ✓ {rel.split('/')[-1]}")
-    if not all_ok:
+    if ok:
+        # isStandardMasonryActive must come AFTER dateGroups
+        if is_std_idx < date_groups_idx:
+            log(f"  ✗ isStandardMasonryActive still before dateGroups "
+                f"(idx={is_std_idx}, dateGroups={date_groups_idx})")
+            ok = False
+        else:
+            log(f"  ✓ isStandardMasonryActive placed after dateGroups")
+
+        # Sanity: only one occurrence
+        count = t.count("val isStandardMasonryActive")
+        if count != 1:
+            log(f"  ✗ expected 1 occurrence of isStandardMasonryActive, found {count}")
+            ok = False
+        else:
+            log("  ✓ exactly one isStandardMasonryActive declaration")
+
+        # galleryPinsForFullscreen still present
+        if "val galleryPinsForFullscreen" not in t:
+            log("  ✗ galleryPinsForFullscreen missing"); ok = False
+        else:
+            log("  ✓ galleryPinsForFullscreen intact")
+
+    if not ok:
         log("\n✗ VERIFICATION FAILED"); sys.exit(1)
 
 
@@ -764,8 +300,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m",
-             "Fix self-verify markers; VM putIntoAlbum parameter; 4 feature patches"])
+        run(["git", "commit", "-m", "Fix isStandardMasonryActive forward reference to dateGroups"])
 
 
 def verify_keystore_tracked():
@@ -914,18 +449,14 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — 4 fixes (re-run, VM anchor fixed)")
+    log("PinBoard — fix isStandardMasonryActive forward reference")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_share_put_into_album()
-    patch_manual_put_into_album()
-    patch_boards_label()
-    patch_fullscreen_order()
-    patch_date_album_pins()
-    verify_patches()
+    patch_forward_reference()
+    verify_fix()
 
     ensure_release_keystore()
     patch_build_gradle()
