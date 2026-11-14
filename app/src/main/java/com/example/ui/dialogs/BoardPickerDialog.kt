@@ -1,12 +1,15 @@
 package com.example.ui.dialogs
 
-// v2-drag-reorder
+// v3-pill-drag
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,28 +23,28 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Bookmark
-import androidx.compose.material.icons.filled.DragHandle
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -52,9 +55,9 @@ import com.example.ui.theme.PinterestBlack
 import com.example.ui.theme.PinterestPillGray
 import com.example.ui.theme.PinterestRed
 import com.example.ui.theme.PinterestTextSecondary
-import kotlin.math.roundToInt
 
 
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun BoardPickerDialog(
     isOpen: Boolean,
@@ -67,12 +70,10 @@ fun BoardPickerDialog(
     if (!isOpen) return
 
     var localBoards by remember(boards) { mutableStateOf(boards) }
-    var draggedIndex by remember { mutableStateOf<Int?>(null) }
-    var accumulatedDrag by remember { mutableFloatStateOf(0f) }
-
-    val density = LocalDensity.current
-    val itemHeightDp = 56.dp
-    val itemHeightPx = with(density) { itemHeightDp.toPx() }
+    var draggedUrl by remember { mutableStateOf<String?>(null) }
+    var dragOffset by remember { mutableStateOf(Offset.Zero) }
+    var suppressClickUntil by remember { mutableStateOf(0L) }
+    val itemBounds = remember { mutableMapOf<String, Rect>() }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -94,82 +95,92 @@ fun BoardPickerDialog(
                     .heightIn(max = 500.dp)
                     .verticalScroll(rememberScrollState())
             ) {
-                localBoards.forEachIndexed { index, item ->
-                    val isCurrent = currentBoardUrl?.trimEnd('/')
-                        ?.equals(item.url.trimEnd('/'), ignoreCase = true) == true
-                    val isDragged = draggedIndex == index
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    localBoards.forEach { item ->
+                        val isCurrent = currentBoardUrl?.trimEnd('/')
+                            ?.equals(item.url.trimEnd('/'), ignoreCase = true) == true
+                        val isDragged = draggedUrl == item.url
 
-                    val isFav = item.boardId == "board_favorites" || item.url.contains("favorites")
-                    val isMySave = item.boardId == "board_my_save" || item.url.contains("my_save")
-                    val isDump = item.boardId == "board_dump" || item.url.contains("dump")
+                        val isFav = item.boardId == "board_favorites" || item.url.contains("favorites")
+                        val isMySave = item.boardId == "board_my_save" || item.url.contains("my_save")
+                        val isDump = item.boardId == "board_dump" || item.url.contains("dump")
 
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(itemHeightDp)
-                            .padding(vertical = 2.dp)
-                            .graphicsLayer {
-                                if (isDragged) {
-                                    translationY = accumulatedDrag
-                                    shadowElevation = 12.dp.toPx()
-                                    alpha = 0.95f
-                                    scaleX = 1.02f
-                                    scaleY = 1.02f
-                                }
-                            }
-                            .zIndex(if (isDragged) 1f else 0f)
-                            .pointerInput(item.url, localBoards.size) {
-                                detectDragGesturesAfterLongPress(
-                                    onDragStart = {
-                                        draggedIndex = index
-                                        accumulatedDrag = 0f
-                                    },
-                                    onDrag = { change: PointerInputChange, dragAmount: Offset ->
-                                        change.consume()
-                                        accumulatedDrag += dragAmount.y
-                                    },
-                                    onDragEnd = {
-                                        val offset = (accumulatedDrag / itemHeightPx).roundToInt()
-                                        val targetIdx = (index + offset)
-                                            .coerceIn(0, localBoards.size - 1)
-                                        if (targetIdx != index) {
-                                            val newList = localBoards.toMutableList()
-                                            val moved = newList.removeAt(index)
-                                            newList.add(targetIdx, moved)
-                                            localBoards = newList
-                                            onReorderBoards(newList)
-                                        }
-                                        draggedIndex = null
-                                        accumulatedDrag = 0f
-                                    },
-                                    onDragCancel = {
-                                        draggedIndex = null
-                                        accumulatedDrag = 0f
-                                    }
-                                )
-                            }
-                    ) {
-                        Box(
+                        Surface(
+                            shape = RoundedCornerShape(20.dp),
+                            color = if (isCurrent) PinterestRed else PinterestPillGray,
                             modifier = Modifier
-                                .fillMaxWidth()
+                                .onGloballyPositioned { coords ->
+                                    itemBounds[item.url] = coords.boundsInRoot()
+                                }
+                                .graphicsLayer {
+                                    if (isDragged) {
+                                        translationX = dragOffset.x
+                                        translationY = dragOffset.y
+                                        shadowElevation = 12.dp.toPx()
+                                        scaleX = 1.06f
+                                        scaleY = 1.06f
+                                        alpha = 0.95f
+                                    }
+                                }
+                                .zIndex(if (isDragged) 1f else 0f)
+                                .pointerInput(item.url, localBoards.size) {
+                                    detectDragGesturesAfterLongPress(
+                                        onDragStart = {
+                                            draggedUrl = item.url
+                                            dragOffset = Offset.Zero
+                                        },
+                                        onDrag = { change: PointerInputChange, amount: Offset ->
+                                            change.consume()
+                                            dragOffset += amount
+                                        },
+                                        onDragEnd = {
+                                            val current = draggedUrl
+                                            draggedUrl = null
+                                            suppressClickUntil = System.currentTimeMillis() + 250
+                                            if (current != null) {
+                                                val draggedBounds = itemBounds[current]
+                                                if (draggedBounds != null && dragOffset.getDistance() > 8f) {
+                                                    val finalCenter = draggedBounds.center + dragOffset
+                                                    val target = itemBounds.entries
+                                                        .filter { it.key != current }
+                                                        .minByOrNull { (it.value.center - finalCenter).getDistance() }
+                                                    if (target != null) {
+                                                        val fromIdx = localBoards.indexOfFirst { it.url == current }
+                                                        val toIdx = localBoards.indexOfFirst { it.url == target.key }
+                                                        if (fromIdx >= 0 && toIdx >= 0 && fromIdx != toIdx) {
+                                                            val newList = localBoards.toMutableList()
+                                                            val moved = newList.removeAt(fromIdx)
+                                                            newList.add(toIdx, moved)
+                                                            localBoards = newList
+                                                            onReorderBoards(newList)
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            dragOffset = Offset.Zero
+                                        },
+                                        onDragCancel = {
+                                            draggedUrl = null
+                                            dragOffset = Offset.Zero
+                                            suppressClickUntil = System.currentTimeMillis() + 250
+                                        }
+                                    )
+                                }
                                 .clickable {
-                                    if (draggedIndex == null) {
+                                    if (System.currentTimeMillis() > suppressClickUntil) {
                                         onSelectBoard(item.url)
                                         onDismiss()
                                     }
                                 }
                                 .testTag("board_picker_pill_${item.url.hashCode()}")
-                                .background(
-                                    color = if (isCurrent) PinterestRed else PinterestPillGray,
-                                    shape = RoundedCornerShape(24.dp)
-                                )
-                                .padding(horizontal = 14.dp, vertical = 12.dp),
-                            contentAlignment = Alignment.CenterStart
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.Start
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
                             ) {
                                 Icon(
                                     imageVector = when {
@@ -181,30 +192,23 @@ fun BoardPickerDialog(
                                     },
                                     contentDescription = null,
                                     tint = if (isCurrent) Color.White else PinterestRed,
-                                    modifier = Modifier.size(14.dp)
+                                    modifier = Modifier.size(13.dp)
                                 )
-                                Spacer(Modifier.width(8.dp))
+                                Spacer(Modifier.width(6.dp))
                                 Text(
                                     text = item.title.ifBlank { "Board" },
                                     fontSize = 13.sp,
                                     fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isCurrent) Color.White else PinterestBlack,
-                                    modifier = Modifier.weight(1f)
+                                    color = if (isCurrent) Color.White else PinterestBlack
                                 )
                                 if (item.isCustom && !isFav && !isMySave && !isDump) {
+                                    Spacer(Modifier.width(4.dp))
                                     Text(
                                         text = "· Custom",
                                         fontSize = 10.sp,
                                         color = if (isCurrent) Color.White.copy(alpha = 0.7f) else PinterestTextSecondary
                                     )
-                                    Spacer(Modifier.width(6.dp))
                                 }
-                                Icon(
-                                    imageVector = Icons.Default.DragHandle,
-                                    contentDescription = "Drag to reorder",
-                                    tint = if (isCurrent) Color.White.copy(alpha = 0.7f) else PinterestTextSecondary,
-                                    modifier = Modifier.size(16.dp)
-                                )
                             }
                         }
                     }
