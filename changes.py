@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — force-fix isFullscreenActive + BoardPickerDialog dy
+PinBoard Gallery — fix declaration order (fullscreenPinId before isFullscreenActive)
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,7 +72,158 @@ def tool_available(name):
 
 
 # ============================================================
-# NEW BOARD PICKER (v2 — dragAmount.y, version marker)
+# CRITICAL PATCH — Fix declaration order deterministically
+# ============================================================
+def patch_declaration_order():
+    log("\n=== PATCH: Fix fullscreenPinId / isFullscreenActive order ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    orig = t
+
+    # STEP 1: Remove ALL existing fullscreenPinId collection declarations
+    removed_pinid = 0
+    while True:
+        # Match the full line: "    val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()"
+        m = re.search(r'\n[ \t]*val fullscreenPinId by viewModel\.fullscreenPinId\.collectAsStateWithLifecycle\(\)', t)
+        if not m: break
+        line_start = m.start() + 1  # skip leading \n
+        line_end = t.find("\n", line_start)
+        if line_end < 0: line_end = len(t)
+        t = t[:m.start()] + t[line_end:]
+        removed_pinid += 1
+        if removed_pinid > 20: break
+    if removed_pinid > 0:
+        log(f"  ✓ removed {removed_pinid} existing fullscreenPinId collection(s)")
+
+    # STEP 2: Remove ALL existing isFullscreenActive declarations
+    removed_std = 0
+    while True:
+        m = re.search(r'\n[ \t]*val isFullscreenActive = [^\n]*', t)
+        if not m: break
+        line_start = m.start()
+        line_end = t.find("\n", m.end())
+        if line_end < 0: line_end = len(t)
+        t = t[:line_start] + t[line_end:]
+        removed_std += 1
+        if removed_std > 20: break
+    if removed_std > 0:
+        log(f"  ✓ removed {removed_std} existing isFullscreenActive declaration(s)")
+
+    # STEP 3: Find fullscreenPinIndex collection anchor (insertion point)
+    anchors = [
+        r'\n([ \t]*)val fullscreenPinIndex by viewModel\.fullscreenPinIndex\.collectAsStateWithLifecycle\(\)',
+        r'\n([ \t]*)val currentBoard by viewModel\.currentBoard\.collectAsStateWithLifecycle\(\)',
+    ]
+    matched = None
+    for pat in anchors:
+        m = re.search(pat, t)
+        if m:
+            matched = m
+            break
+
+    if not matched:
+        log("  ✗ no insertion anchor found"); sys.exit(1)
+
+    indent = matched.group(1)
+    insert_at = matched.end()
+
+    # STEP 4: Insert BOTH lines in guaranteed order
+    # fullscreenPinId FIRST, isFullscreenActive SECOND (uses it)
+    new_lines = (
+        f"\n{indent}val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()"
+        f"\n{indent}val isFullscreenActive = fullscreenPinId != null || fullscreenPinIndex != null"
+    )
+    t = t[:insert_at] + new_lines + t[insert_at:]
+
+    if t != orig:
+        f.write_text(t, encoding="utf-8")
+        log(f"  ✓ declarations reordered (indent='{indent}')")
+    else:
+        log("  ✓ no change (already correct)")
+
+    # STEP 5: Verify order right now
+    pinid_idx = t.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
+    std_idx = t.find("val isFullscreenActive = ")
+    if pinid_idx < 0:
+        log("  ✗ fullscreenPinId not found after insert"); sys.exit(1)
+    if std_idx < 0:
+        log("  ✗ isFullscreenActive not found after insert"); sys.exit(1)
+    if pinid_idx > std_idx:
+        log(f"  ✗ ORDER STILL WRONG: fullscreenPinId idx={pinid_idx}, isFullscreenActive idx={std_idx}")
+        sys.exit(1)
+    log(f"  ✓ order confirmed (fullscreenPinId before isFullscreenActive)")
+
+
+# ============================================================
+# ViewModel fullscreenPinId (idempotent)
+# ============================================================
+def patch_vm_fullscreen_pin_id():
+    log("\n=== PATCH: ViewModel fullscreenPinId ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    if "private val _fullscreenPinId" not in t:
+        anchor = (
+            "    private val _fullscreenPinIndex = MutableStateFlow<Int?>(null)\n"
+            "    val fullscreenPinIndex: StateFlow<Int?> = _fullscreenPinIndex.asStateFlow()\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, anchor + (
+                "\n"
+                "    private val _fullscreenPinId = MutableStateFlow<String?>(null)\n"
+                "    val fullscreenPinId: StateFlow<String?> = _fullscreenPinId.asStateFlow()\n"
+            ), 1)
+            changed = True
+            log("  ✓ fullscreenPinId state")
+
+    if "fun openFullscreenByPinId" not in t:
+        old_open = (
+            "    fun openFullscreen(index: Int) {\n"
+            "        if (!_isSelectionMode.value) {\n"
+            "            _fullscreenPinIndex.value = index\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    fun closeFullscreen() {\n"
+            "        _fullscreenPinIndex.value = null\n"
+            "    }\n"
+        )
+        new_open = (
+            "    fun openFullscreen(index: Int) {\n"
+            "        if (!_isSelectionMode.value) {\n"
+            "            _fullscreenPinIndex.value = index\n"
+            "            _fullscreenPinId.value = null\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    fun openFullscreenByPinId(pinId: String) {\n"
+            "        if (!_isSelectionMode.value) {\n"
+            "            _fullscreenPinId.value = pinId\n"
+            "            _fullscreenPinIndex.value = null\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    fun closeFullscreen() {\n"
+            "        _fullscreenPinIndex.value = null\n"
+            "        _fullscreenPinId.value = null\n"
+            "    }\n"
+        )
+        if old_open in t:
+            t = t.replace(old_open, new_open, 1)
+            changed = True
+            log("  ✓ openFullscreenByPinId")
+        else:
+            log("  ⚠ openFullscreen anchor missing")
+
+    if changed: f.write_text(t, encoding="utf-8")
+    else: log("  ✓ already patched")
+
+
+# ============================================================
+# BoardPickerDialog v2 (idempotent)
 # ============================================================
 NEW_BOARD_PICKER = r'''package com.example.ui.dialogs
 
@@ -302,173 +453,20 @@ fun BoardPickerDialog(
 '''
 
 
-# ============================================================
-# PATCH — Force-rewrite BoardPickerDialog
-# ============================================================
-def patch_board_picker_force():
-    log("\n=== PATCH: BoardPickerDialog (force v2) ===")
+def patch_board_picker():
+    log("\n=== PATCH: BoardPickerDialog ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt"
     if f.exists():
         t = f.read_text(encoding="utf-8")
-        if "// v2-drag-reorder" in t and "drag.dy" not in t and "dragAmount.y" in t:
+        if "// v2-drag-reorder" in t and "dragAmount.y" in t and "drag.dy" not in t:
             log("  ✓ already at v2"); return
-        log("  → forcing rewrite (existing file broken or old)")
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(NEW_BOARD_PICKER, encoding="utf-8")
-    log("  ✓ v2 written (dragAmount.y, explicit types)")
+    log("  ✓ v2 written")
 
 
 # ============================================================
-# PATCH — Force-ensure isFullscreenActive declaration
-# ============================================================
-def patch_is_fullscreen_active_force():
-    log("\n=== PATCH: isFullscreenActive (force) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    # 1) Remove ALL existing `val isFullscreenActive = ...` declarations
-    removed = 0
-    while True:
-        idx = t.find("val isFullscreenActive")
-        if idx < 0: break
-        line_start = t.rfind("\n", 0, idx) + 1
-        # Find end of the val statement (next newline after closing expression)
-        line_end = t.find("\n", idx)
-        if line_end < 0:
-            line_end = len(t)
-        # Remove the full line
-        t = t[:line_start] + t[line_end + 1:]
-        removed += 1
-        if removed > 20: break  # safety
-    if removed > 0:
-        log(f"  ✓ removed {removed} existing isFullscreenActive declaration(s)")
-
-    # 2) Find an insertion anchor — `val fullscreenPinIndex by ...` line
-    anchors = [
-        r'(\n([ \t]+)val fullscreenPinIndex by viewModel\.fullscreenPinIndex\.collectAsStateWithLifecycle\(\))',
-        r'(\n([ \t]+)val fullscreenPinId by viewModel\.fullscreenPinId\.collectAsStateWithLifecycle\(\))',
-        r'(\n([ \t]+)val currentBoard by viewModel\.currentBoard\.collectAsStateWithLifecycle\(\))',
-    ]
-    matched = None
-    for pat in anchors:
-        m = re.search(pat, t)
-        if m:
-            matched = m
-            break
-
-    if not matched:
-        log("  ✗ no insertion anchor matched"); sys.exit(1)
-
-    indent = matched.group(2)
-    insert_at = matched.end(1)
-    decl = f"\n{indent}val isFullscreenActive = fullscreenPinId != null || fullscreenPinIndex != null"
-    t = t[:insert_at] + decl + t[insert_at:]
-    log(f"  ✓ single isFullscreenActive declaration inserted (indent='{indent}')")
-
-    f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PATCH — ViewModel fullscreenPinId (idempotent)
-# ============================================================
-def patch_vm_fullscreen_pin_id():
-    log("\n=== PATCH: ViewModel fullscreenPinId ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    if "private val _fullscreenPinId" not in t:
-        anchor = (
-            "    private val _fullscreenPinIndex = MutableStateFlow<Int?>(null)\n"
-            "    val fullscreenPinIndex: StateFlow<Int?> = _fullscreenPinIndex.asStateFlow()\n"
-        )
-        if anchor in t:
-            t = t.replace(anchor, anchor + (
-                "\n"
-                "    private val _fullscreenPinId = MutableStateFlow<String?>(null)\n"
-                "    val fullscreenPinId: StateFlow<String?> = _fullscreenPinId.asStateFlow()\n"
-            ), 1)
-            changed = True
-            log("  ✓ fullscreenPinId state")
-        else:
-            log("  ⚠ fullscreenPinIndex anchor missing")
-
-    if "fun openFullscreenByPinId" not in t:
-        old_open = (
-            "    fun openFullscreen(index: Int) {\n"
-            "        if (!_isSelectionMode.value) {\n"
-            "            _fullscreenPinIndex.value = index\n"
-            "        }\n"
-            "    }\n"
-            "\n"
-            "    fun closeFullscreen() {\n"
-            "        _fullscreenPinIndex.value = null\n"
-            "    }\n"
-        )
-        new_open = (
-            "    fun openFullscreen(index: Int) {\n"
-            "        if (!_isSelectionMode.value) {\n"
-            "            _fullscreenPinIndex.value = index\n"
-            "            _fullscreenPinId.value = null\n"
-            "        }\n"
-            "    }\n"
-            "\n"
-            "    fun openFullscreenByPinId(pinId: String) {\n"
-            "        if (!_isSelectionMode.value) {\n"
-            "            _fullscreenPinId.value = pinId\n"
-            "            _fullscreenPinIndex.value = null\n"
-            "        }\n"
-            "    }\n"
-            "\n"
-            "    fun closeFullscreen() {\n"
-            "        _fullscreenPinIndex.value = null\n"
-            "        _fullscreenPinId.value = null\n"
-            "    }\n"
-        )
-        if old_open in t:
-            t = t.replace(old_open, new_open, 1)
-            changed = True
-            log("  ✓ openFullscreenByPinId")
-        else:
-            log("  ⚠ openFullscreen/closeFullscreen anchor missing")
-
-    if changed: f.write_text(t, encoding="utf-8")
-    else: log("  ✓ already patched")
-
-
-# ============================================================
-# PATCH — fullscreenPinId collection (idempotent)
-# ============================================================
-def patch_fullscreen_pin_id_collection():
-    log("\n=== PATCH: fullscreenPinId collection ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    t = f.read_text(encoding="utf-8")
-
-    if "val fullscreenPinId by viewModel.fullscreenPinId" in t:
-        log("  ✓ already present"); return
-
-    old_anchor = "    val fullscreenPinIndex by viewModel.fullscreenPinIndex.collectAsStateWithLifecycle()\n"
-    if old_anchor in t:
-        t = t.replace(old_anchor, old_anchor + "    val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()\n", 1)
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ added")
-        return
-
-    m = re.search(r'(\n([ \t]+)val fullscreenPinIndex by viewModel\.fullscreenPinIndex\.collectAsStateWithLifecycle\(\))', t)
-    if m:
-        indent = m.group(2)
-        insert_at = m.end(1)
-        t = t[:insert_at] + f"\n{indent}val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()" + t[insert_at:]
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ added (regex)")
-    else:
-        log("  ✗ fullscreenPinIndex collection not found"); sys.exit(1)
-
-
-# ============================================================
-# PATCH — Wire onReorderBoards (idempotent)
+# Wire onReorderBoards (idempotent)
 # ============================================================
 def patch_wire_reorder():
     log("\n=== PATCH: Wire onReorderBoards ===")
@@ -478,7 +476,6 @@ def patch_wire_reorder():
     if "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }" in t:
         log("  ✓ already wired"); return
 
-    # Paren-balanced insertion
     idx = t.find("com.example.ui.dialogs.BoardPickerDialog(")
     if idx < 0:
         log("  ✗ call not found"); sys.exit(1)
@@ -486,8 +483,7 @@ def patch_wire_reorder():
     depth = 0
     i = paren_idx
     while i < len(t):
-        if t[i] == "(":
-            depth += 1
+        if t[i] == "(": depth += 1
         elif t[i] == ")":
             depth -= 1
             if depth == 0:
@@ -496,11 +492,11 @@ def patch_wire_reorder():
                 log("  ✓ wired")
                 return
         i += 1
-    log("  ✗ call paren balance failed"); sys.exit(1)
+    log("  ✗ paren balance failed"); sys.exit(1)
 
 
 # ============================================================
-# Verification
+# Verify
 # ============================================================
 def verify_all():
     log("\n=== VERIFY ===")
@@ -516,43 +512,31 @@ def verify_all():
     vmt = vm.read_text(encoding="utf-8")
     bpt = bp.read_text(encoding="utf-8")
 
-    # Fatal checks
     checks = []
 
-    # 1. isFullscreenActive declared EXACTLY once, before first use
-    decl_count = pts.count("val isFullscreenActive =")
-    checks.append(("isFullscreenActive declared exactly once", decl_count == 1))
-    if decl_count == 1:
-        decl_idx = pts.find("val isFullscreenActive =")
-        # Find first USE that isn't the declaration itself (search after decl)
-        after_decl = pts[decl_idx + 30:]
-        has_use = ("isFullscreenActive" in after_decl)
-        checks.append(("isFullscreenActive used after declaration", has_use))
-    else:
-        checks.append(("isFullscreenActive used after declaration", False))
+    # CRITICAL: order check
+    pinid_idx = pts.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
+    std_idx = pts.find("val isFullscreenActive = ")
+    pinid_count = pts.count("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
+    std_count = pts.count("val isFullscreenActive = ")
 
-    # 2. fullscreenPinId collection present
-    checks.append(("fullscreenPinId collection",
-                   "val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()" in pts))
+    checks.append(("fullscreenPinId declared", pinid_idx >= 0))
+    checks.append(("isFullscreenActive declared", std_idx >= 0))
+    checks.append(("fullscreenPinId declared EXACTLY once", pinid_count == 1))
+    checks.append(("isFullscreenActive declared EXACTLY once", std_count == 1))
+    checks.append(("ORDER: fullscreenPinId BEFORE isFullscreenActive",
+                   pinid_idx >= 0 and std_idx >= 0 and pinid_idx < std_idx))
 
-    # 3. BoardPickerDialog uses dragAmount.y (not drag.dy)
-    checks.append(("BoardPicker uses dragAmount.y", "dragAmount.y" in bpt))
-    checks.append(("BoardPicker has no drag.dy", "drag.dy" not in bpt))
-    checks.append(("BoardPicker v2 marker", "// v2-drag-reorder" in bpt))
-    checks.append(("BoardPicker has detectDragGesturesAfterLongPress",
-                   "detectDragGesturesAfterLongPress" in bpt))
-    checks.append(("BoardPicker has onReorderBoards call",
-                   "onReorderBoards(newList)" in bpt))
-
-    # 4. VM has fullscreenPinId
-    checks.append(("VM fullscreenPinId", "private val _fullscreenPinId" in vmt))
+    # All other feature markers
+    checks.append(("VM fullscreenPinId state", "private val _fullscreenPinId" in vmt))
     checks.append(("VM openFullscreenByPinId", "fun openFullscreenByPinId(pinId: String)" in vmt))
+    checks.append(("BoardPicker v2", "// v2-drag-reorder" in bpt))
+    checks.append(("BoardPicker dragAmount.y", "dragAmount.y" in bpt))
+    checks.append(("BoardPicker no drag.dy", "drag.dy" not in bpt))
+    checks.append(("BoardPicker reorder callback", "onReorderBoards(newList)" in bpt))
+    checks.append(("onReorderBoards wired", "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }" in pts))
 
-    # 5. onReorderBoards wired in screen
-    checks.append(("onReorderBoards wired",
-                   "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }" in pts))
-
-    # 6. Bracket balance on PinBoardGalleryScreen.kt
+    # Bracket balance on Screen
     def strip_strings_comments(text):
         out = []
         i = 0
@@ -724,7 +708,7 @@ def setup_git():
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
         run(["git", "commit", "-m",
-             "Force-fix isFullscreenActive declaration + BoardPicker v2 (dragAmount.y)"])
+             "Fix declaration order: fullscreenPinId BEFORE isFullscreenActive"])
 
 
 def verify_keystore_tracked():
@@ -873,31 +857,24 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — force-fix isFullscreenActive + BoardPicker v2")
+    log("PinBoard — fix declaration order")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    # 1) Force-rewrite BoardPickerDialog (idempotent via version marker)
-    patch_board_picker_force()
+    # 1. CRITICAL: fix declaration order deterministically
+    patch_declaration_order()
 
-    # 2) ViewModel fullscreenPinId (idempotent)
+    # 2. Everything else (idempotent)
     patch_vm_fullscreen_pin_id()
-
-    # 3) Screen: fullscreenPinId collection (must come BEFORE isFullscreenActive insertion)
-    patch_fullscreen_pin_id_collection()
-
-    # 4) Screen: FORCE-cleanup + insert isFullscreenActive declaration
-    patch_is_fullscreen_active_force()
-
-    # 5) Wire onReorderBoards (idempotent)
+    patch_board_picker()
     patch_wire_reorder()
 
-    # 6) Verify before CI
+    # 3. Verify before CI
     verify_all()
 
-    # 7) Build pipeline
+    # 4. Pipeline
     ensure_release_keystore()
     patch_build_gradle()
     ensure_gradle_wrapper()
