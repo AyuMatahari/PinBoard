@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — BoardPicker v3: pill FlowRow + drag-drop (visual preserved)
+PinBoard Gallery — add missing boundsInRoot import
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,294 +72,76 @@ def tool_available(name):
 
 
 # ============================================================
-# NEW BOARD PICKER (v3 — pills + drag-drop)
+# THE FIX — add boundsInRoot import
 # ============================================================
-NEW_BOARD_PICKER = r'''package com.example.ui.dialogs
-
-// v3-pill-drag
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bookmark
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Link
-import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Icon
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.PointerInputChange
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import androidx.compose.ui.zIndex
-import com.example.model.BoardHistoryItem
-import com.example.ui.theme.PinterestBlack
-import com.example.ui.theme.PinterestPillGray
-import com.example.ui.theme.PinterestRed
-import com.example.ui.theme.PinterestTextSecondary
-
-
-@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
-@Composable
-fun BoardPickerDialog(
-    isOpen: Boolean,
-    boards: List<BoardHistoryItem>,
-    currentBoardUrl: String?,
-    onDismiss: () -> Unit,
-    onSelectBoard: (String) -> Unit,
-    onReorderBoards: (List<BoardHistoryItem>) -> Unit = {}
-) {
-    if (!isOpen) return
-
-    var localBoards by remember(boards) { mutableStateOf(boards) }
-    var draggedUrl by remember { mutableStateOf<String?>(null) }
-    var dragOffset by remember { mutableStateOf(Offset.Zero) }
-    var suppressClickUntil by remember { mutableStateOf(0L) }
-    val itemBounds = remember { mutableMapOf<String, Rect>() }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = {
-            Column {
-                Text("Switch board", fontWeight = FontWeight.Bold, fontSize = 16.sp)
-                Spacer(Modifier.height(4.dp))
-                Text(
-                    "Tap to open · Hold to drag reorder",
-                    fontSize = 11.sp,
-                    color = PinterestTextSecondary
-                )
-            }
-        },
-        text = {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 500.dp)
-                    .verticalScroll(rememberScrollState())
-            ) {
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    localBoards.forEach { item ->
-                        val isCurrent = currentBoardUrl?.trimEnd('/')
-                            ?.equals(item.url.trimEnd('/'), ignoreCase = true) == true
-                        val isDragged = draggedUrl == item.url
-
-                        val isFav = item.boardId == "board_favorites" || item.url.contains("favorites")
-                        val isMySave = item.boardId == "board_my_save" || item.url.contains("my_save")
-                        val isDump = item.boardId == "board_dump" || item.url.contains("dump")
-
-                        Surface(
-                            shape = RoundedCornerShape(20.dp),
-                            color = if (isCurrent) PinterestRed else PinterestPillGray,
-                            modifier = Modifier
-                                .onGloballyPositioned { coords ->
-                                    itemBounds[item.url] = coords.boundsInRoot()
-                                }
-                                .graphicsLayer {
-                                    if (isDragged) {
-                                        translationX = dragOffset.x
-                                        translationY = dragOffset.y
-                                        shadowElevation = 12.dp.toPx()
-                                        scaleX = 1.06f
-                                        scaleY = 1.06f
-                                        alpha = 0.95f
-                                    }
-                                }
-                                .zIndex(if (isDragged) 1f else 0f)
-                                .pointerInput(item.url, localBoards.size) {
-                                    detectDragGesturesAfterLongPress(
-                                        onDragStart = {
-                                            draggedUrl = item.url
-                                            dragOffset = Offset.Zero
-                                        },
-                                        onDrag = { change: PointerInputChange, amount: Offset ->
-                                            change.consume()
-                                            dragOffset += amount
-                                        },
-                                        onDragEnd = {
-                                            val current = draggedUrl
-                                            draggedUrl = null
-                                            suppressClickUntil = System.currentTimeMillis() + 250
-                                            if (current != null) {
-                                                val draggedBounds = itemBounds[current]
-                                                if (draggedBounds != null && dragOffset.getDistance() > 8f) {
-                                                    val finalCenter = draggedBounds.center + dragOffset
-                                                    val target = itemBounds.entries
-                                                        .filter { it.key != current }
-                                                        .minByOrNull { (it.value.center - finalCenter).getDistance() }
-                                                    if (target != null) {
-                                                        val fromIdx = localBoards.indexOfFirst { it.url == current }
-                                                        val toIdx = localBoards.indexOfFirst { it.url == target.key }
-                                                        if (fromIdx >= 0 && toIdx >= 0 && fromIdx != toIdx) {
-                                                            val newList = localBoards.toMutableList()
-                                                            val moved = newList.removeAt(fromIdx)
-                                                            newList.add(toIdx, moved)
-                                                            localBoards = newList
-                                                            onReorderBoards(newList)
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            dragOffset = Offset.Zero
-                                        },
-                                        onDragCancel = {
-                                            draggedUrl = null
-                                            dragOffset = Offset.Zero
-                                            suppressClickUntil = System.currentTimeMillis() + 250
-                                        }
-                                    )
-                                }
-                                .clickable {
-                                    if (System.currentTimeMillis() > suppressClickUntil) {
-                                        onSelectBoard(item.url)
-                                        onDismiss()
-                                    }
-                                }
-                                .testTag("board_picker_pill_${item.url.hashCode()}")
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp)
-                            ) {
-                                Icon(
-                                    imageVector = when {
-                                        isFav -> Icons.Default.Favorite
-                                        isMySave -> Icons.Default.Bookmark
-                                        isDump -> Icons.Default.Folder
-                                        item.isCustom -> Icons.Default.Folder
-                                        else -> Icons.Default.Link
-                                    },
-                                    contentDescription = null,
-                                    tint = if (isCurrent) Color.White else PinterestRed,
-                                    modifier = Modifier.size(13.dp)
-                                )
-                                Spacer(Modifier.width(6.dp))
-                                Text(
-                                    text = item.title.ifBlank { "Board" },
-                                    fontSize = 13.sp,
-                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
-                                    color = if (isCurrent) Color.White else PinterestBlack
-                                )
-                                if (item.isCustom && !isFav && !isMySave && !isDump) {
-                                    Spacer(Modifier.width(4.dp))
-                                    Text(
-                                        text = "· Custom",
-                                        fontSize = 10.sp,
-                                        color = if (isCurrent) Color.White.copy(alpha = 0.7f) else PinterestTextSecondary
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if (localBoards.isEmpty()) {
-                    Spacer(Modifier.height(12.dp))
-                    Text("No boards available.", fontSize = 12.sp, color = PinterestTextSecondary)
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = {
-            TextButton(onClick = onDismiss) { Text("Close", color = PinterestBlack) }
-        },
-        shape = RoundedCornerShape(20.dp)
-    )
-}
-'''
-
-
-def patch_board_picker_v3():
-    log("\n=== PATCH: BoardPicker v3 (pills + drag) ===")
+def patch_bounds_in_root_import():
+    log("\n=== PATCH: add boundsInRoot import ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt"
-    if f.exists():
-        t = f.read_text(encoding="utf-8")
-        if "// v3-pill-drag" in t and "FlowRow" in t and "dragOffset += amount" in t:
-            log("  ✓ already v3"); return
-        log("  → forcing v3 rewrite")
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(NEW_BOARD_PICKER, encoding="utf-8")
-    log("  ✓ v3 written (FlowRow pills + drop-based drag)")
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+
+    if "import androidx.compose.ui.layout.boundsInRoot" in t:
+        log("  ✓ already imported"); return
+
+    if "boundsInRoot()" not in t:
+        log("  ⚠ boundsInRoot() not used — nothing to import"); return
+
+    # Insert right after onGloballyPositioned (same package) — or after Offset if not found
+    anchor = "import androidx.compose.ui.layout.onGloballyPositioned\n"
+    if anchor in t:
+        t = t.replace(anchor, "import androidx.compose.ui.layout.boundsInRoot\n" + anchor, 1)
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ imported (after onGloballyPositioned)")
+        return
+
+    # Fallback: after Offset import
+    anchor2 = "import androidx.compose.ui.geometry.Offset\n"
+    if anchor2 in t:
+        t = t.replace(anchor2, anchor2 + "import androidx.compose.ui.layout.boundsInRoot\n", 1)
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ imported (after Offset)")
+        return
+
+    # Last resort: prepend after package
+    m = re.match(r"(package\s+\S+\s*\n)", t)
+    if m:
+        t = t[:m.end(1)] + "import androidx.compose.ui.layout.boundsInRoot\n" + t[m.end(1):]
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ imported (after package)")
+        return
+
+    log("  ✗ could not insert import"); sys.exit(1)
 
 
 # ============================================================
-# Declaration order fix (idempotent)
+# Preserved idempotent fixes from prior turns
 # ============================================================
 def patch_declaration_order():
-    log("\n=== PATCH: declaration order (fullscreenPinId before isFullscreenActive) ===")
+    log("\n=== PATCH: declaration order ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
-    orig = t
 
-    # Remove fullscreenPinId collection lines
-    removed_pinid = 0
+    pi = t.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
+    si = t.find("val isFullscreenActive = ")
+    if pi >= 0 and si >= 0 and pi < si:
+        log("  ✓ already correct"); return
+
+    # Remove existing
     while True:
         m = re.search(r'\n[ \t]*val fullscreenPinId by viewModel\.fullscreenPinId\.collectAsStateWithLifecycle\(\)', t)
         if not m: break
-        line_end = t.find("\n", m.start() + 1)
-        if line_end < 0: line_end = len(t)
-        t = t[:m.start()] + t[line_end:]
-        removed_pinid += 1
-        if removed_pinid > 20: break
-
-    # Remove isFullscreenActive lines
-    removed_std = 0
+        le = t.find("\n", m.start() + 1)
+        if le < 0: le = len(t)
+        t = t[:m.start()] + t[le:]
     while True:
         m = re.search(r'\n[ \t]*val isFullscreenActive = [^\n]*', t)
         if not m: break
-        line_end = t.find("\n", m.end())
-        if line_end < 0: line_end = len(t)
-        t = t[:m.start()] + t[line_end:]
-        removed_std += 1
-        if removed_std > 20: break
+        le = t.find("\n", m.end())
+        if le < 0: le = len(t)
+        t = t[:m.start()] + t[le:]
 
-    if removed_pinid == 0 and removed_std == 0:
-        # Check if already correct
-        pi = t.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
-        si = t.find("val isFullscreenActive = ")
-        if pi >= 0 and si >= 0 and pi < si:
-            log("  ✓ already correct"); return
-
-    log(f"  → removed {removed_pinid} fullscreenPinId, {removed_std} isFullscreenActive")
-
+    # Insert fresh
     anchors = [
         r'\n([ \t]*)val fullscreenPinIndex by viewModel\.fullscreenPinIndex\.collectAsStateWithLifecycle\(\)',
         r'\n([ \t]*)val currentBoard by viewModel\.currentBoard\.collectAsStateWithLifecycle\(\)',
@@ -369,218 +151,64 @@ def patch_declaration_order():
         m = re.search(pat, t)
         if m: matched = m; break
     if not matched:
-        log("  ✗ no anchor found"); sys.exit(1)
+        log("  ✗ anchor not found"); sys.exit(1)
 
     indent = matched.group(1)
-    insert_at = matched.end()
-    new_lines = (
+    ia = matched.end()
+    nl = (
         f"\n{indent}val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()"
         f"\n{indent}val isFullscreenActive = fullscreenPinId != null || fullscreenPinIndex != null"
     )
-    t = t[:insert_at] + new_lines + t[insert_at:]
-
+    t = t[:ia] + nl + t[ia:]
     f.write_text(t, encoding="utf-8")
-    log("  ✓ declarations reordered")
+    log("  ✓ fixed")
 
-    pinid_idx = t.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
-    std_idx = t.find("val isFullscreenActive = ")
-    if pinid_idx > std_idx:
-        log("  ✗ order still wrong"); sys.exit(1)
-    log("  ✓ order confirmed")
-
-
-def patch_vm_fullscreen_pin_id():
-    log("\n=== PATCH: ViewModel fullscreenPinId ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    if "private val _fullscreenPinId" not in t:
-        anchor = (
-            "    private val _fullscreenPinIndex = MutableStateFlow<Int?>(null)\n"
-            "    val fullscreenPinIndex: StateFlow<Int?> = _fullscreenPinIndex.asStateFlow()\n"
-        )
-        if anchor in t:
-            t = t.replace(anchor, anchor + (
-                "\n"
-                "    private val _fullscreenPinId = MutableStateFlow<String?>(null)\n"
-                "    val fullscreenPinId: StateFlow<String?> = _fullscreenPinId.asStateFlow()\n"
-            ), 1)
-            changed = True
-            log("  ✓ fullscreenPinId state")
-
-    if "fun openFullscreenByPinId" not in t:
-        old_open = (
-            "    fun openFullscreen(index: Int) {\n"
-            "        if (!_isSelectionMode.value) {\n"
-            "            _fullscreenPinIndex.value = index\n"
-            "        }\n"
-            "    }\n"
-            "\n"
-            "    fun closeFullscreen() {\n"
-            "        _fullscreenPinIndex.value = null\n"
-            "    }\n"
-        )
-        new_open = (
-            "    fun openFullscreen(index: Int) {\n"
-            "        if (!_isSelectionMode.value) {\n"
-            "            _fullscreenPinIndex.value = index\n"
-            "            _fullscreenPinId.value = null\n"
-            "        }\n"
-            "    }\n"
-            "\n"
-            "    fun openFullscreenByPinId(pinId: String) {\n"
-            "        if (!_isSelectionMode.value) {\n"
-            "            _fullscreenPinId.value = pinId\n"
-            "            _fullscreenPinIndex.value = null\n"
-            "        }\n"
-            "    }\n"
-            "\n"
-            "    fun closeFullscreen() {\n"
-            "        _fullscreenPinIndex.value = null\n"
-            "        _fullscreenPinId.value = null\n"
-            "    }\n"
-        )
-        if old_open in t:
-            t = t.replace(old_open, new_open, 1)
-            changed = True
-            log("  ✓ openFullscreenByPinId")
-        else:
-            log("  ⚠ openFullscreen anchor missing")
-
-    if changed: f.write_text(t, encoding="utf-8")
-    else: log("  ✓ already patched")
+    pi = t.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
+    si = t.find("val isFullscreenActive = ")
+    if pi > si: log("  ✗ still wrong"); sys.exit(1)
+    log("  ✓ order verified")
 
 
-def patch_wire_reorder():
-    log("\n=== PATCH: Wire onReorderBoards ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    t = f.read_text(encoding="utf-8")
-    if "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }" in t:
-        log("  ✓ already wired"); return
-
-    idx = t.find("com.example.ui.dialogs.BoardPickerDialog(")
-    if idx < 0:
-        log("  ✗ call not found"); sys.exit(1)
-    paren_idx = t.find("(", idx)
-    depth = 0
-    i = paren_idx
-    while i < len(t):
-        if t[i] == "(": depth += 1
-        elif t[i] == ")":
-            depth -= 1
-            if depth == 0:
-                t = t[:i] + ",\n        onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }\n    " + t[i:]
-                f.write_text(t, encoding="utf-8")
-                log("  ✓ wired")
-                return
-        i += 1
-    log("  ✗ paren failed"); sys.exit(1)
-
-
-# ============================================================
-# Verify
-# ============================================================
 def verify_all():
     log("\n=== VERIFY ===")
-    ps = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    vm = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
     bp = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt"
+    ps = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
 
-    for p in (ps, vm, bp):
-        if not p.exists():
-            log(f"  ✗ missing: {p}"); sys.exit(1)
+    for p in (bp, ps):
+        if not p.exists(): log(f"  ✗ missing {p}"); sys.exit(1)
 
-    pts = ps.read_text(encoding="utf-8")
-    vmt = vm.read_text(encoding="utf-8")
     bpt = bp.read_text(encoding="utf-8")
+    pts = ps.read_text(encoding="utf-8")
 
-    checks = []
-
-    # Declaration order (from prior fix)
-    pinid_idx = pts.find("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()")
-    std_idx = pts.find("val isFullscreenActive = ")
-    checks.append(("fullscreenPinId declared", pinid_idx >= 0))
-    checks.append(("isFullscreenActive declared", std_idx >= 0))
-    checks.append(("fullscreenPinId BEFORE isFullscreenActive",
-                   pinid_idx >= 0 and std_idx >= 0 and pinid_idx < std_idx))
-    checks.append(("fullscreenPinId single declaration",
-                   pts.count("val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()") == 1))
-    checks.append(("isFullscreenActive single declaration",
-                   pts.count("val isFullscreenActive = ") == 1))
-
-    # VM
-    checks.append(("VM fullscreenPinId state", "private val _fullscreenPinId" in vmt))
-    checks.append(("VM openFullscreenByPinId", "fun openFullscreenByPinId(pinId: String)" in vmt))
-
-    # BoardPicker v3: pill + drag
-    checks.append(("BoardPicker v3 marker", "// v3-pill-drag" in bpt))
-    checks.append(("BoardPicker uses FlowRow (pill layout)", "FlowRow(" in bpt))
-    checks.append(("BoardPicker pill shape RoundedCornerShape(20.dp)", "RoundedCornerShape(20.dp)" in bpt))
-    checks.append(("BoardPicker pill padding 12/7", "horizontal = 12.dp, vertical = 7.dp" in bpt))
-    checks.append(("BoardPicker drag detection", "detectDragGesturesAfterLongPress" in bpt))
-    checks.append(("BoardPicker dragOffset accumulation", "dragOffset += amount" in bpt))
-    checks.append(("BoardPicker reorder callback", "onReorderBoards(newList)" in bpt))
-    checks.append(("BoardPicker NOT a full-width Column of rows (no full-width pill modifier)",
-                   "modifier = Modifier\n                                .fillMaxWidth()\n                                .height(itemHeightDp)" not in bpt))
-
-    # Wiring
-    checks.append(("onReorderBoards wired",
-                   "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }" in pts))
-
-    # Bracket balance on screen
-    def strip(text):
-        out, i = [], 0
-        while i < len(text):
-            c = text[i]
-            if c == '"':
-                i += 1
-                while i < len(text):
-                    if text[i] == "\\": i += 2; continue
-                    if text[i] == '"': i += 1; break
-                    i += 1
-            elif c == "'":
-                i += 1
-                while i < len(text):
-                    if text[i] == "\\": i += 2; continue
-                    if text[i] == "'": i += 1; break
-                    i += 1
-            elif c == "/" and i+1 < len(text) and text[i+1] == "/":
-                while i < len(text) and text[i] != "\n": i += 1
-            elif c == "/" and i+1 < len(text) and text[i+1] == "*":
-                i += 2
-                while i+1 < len(text):
-                    if text[i] == "*" and text[i+1] == "/":
-                        i += 2; break
-                    i += 1
-            else:
-                out.append(c); i += 1
-        return "".join(out)
-
-    stripped_ps = strip(pts)
-    po, pc = stripped_ps.count("("), stripped_ps.count(")")
-    bo, bc = stripped_ps.count("{"), stripped_ps.count("}")
-    checks.append((f"Screen paren balance ({po}/{pc})", po == pc))
-    checks.append((f"Screen brace balance ({bo}/{bc})", bo == bc))
-
-    stripped_bp = strip(bpt)
-    bpo, bpc = stripped_bp.count("("), stripped_bp.count(")")
-    bbo, bbc = stripped_bp.count("{"), stripped_bp.count("}")
-    checks.append((f"BoardPicker paren balance ({bpo}/{bpc})", bpo == bpc))
-    checks.append((f"BoardPicker brace balance ({bbo}/{bbc})", bbo == bbc))
+    checks = [
+        ("boundsInRoot import present",
+         "import androidx.compose.ui.layout.boundsInRoot" in bpt),
+        ("BoardPicker uses boundsInRoot()",
+         "boundsInRoot()" in bpt),
+        ("BoardPicker v3 FlowRow",
+         "FlowRow(" in bpt and "// v3-pill-drag" in bpt),
+        ("BoardPicker drag detection",
+         "detectDragGesturesAfterLongPress" in bpt),
+        ("BoardPicker onReorderBoards call",
+         "onReorderBoards(newList)" in bpt),
+        ("fullscreenPinId declared",
+         "val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()" in pts),
+        ("isFullscreenActive declared",
+         "val isFullscreenActive = " in pts),
+        ("declaration order correct",
+         pts.find("val fullscreenPinId by") < pts.find("val isFullscreenActive = ")),
+    ]
 
     all_ok = True
     for name, ok in checks:
         log(f"  {'✓' if ok else '✗'} {name}")
         if not ok: all_ok = False
 
-    if not all_ok:
-        log("\n✗ VERIFICATION FAILED"); sys.exit(1)
+    if not all_ok: log("\n✗ VERIFICATION FAILED"); sys.exit(1)
 
 
 # ============================================================
-# Pipeline helpers (unchanged)
+# Pipeline helpers
 # ============================================================
 def read_app_version():
     p = PROJECT_ROOT / "app/build.gradle.kts"
@@ -705,7 +333,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "BoardPicker v3: pill FlowRow layout preserved + drag-drop reorder"])
+        run(["git", "commit", "-m", "Add missing boundsInRoot import to BoardPickerDialog"])
 
 
 def verify_keystore_tracked():
@@ -854,16 +482,14 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — BoardPicker v3 (pills + drag)")
+    log("PinBoard — add boundsInRoot import (BoardPicker fix)")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_board_picker_v3()
+    patch_bounds_in_root_import()
     patch_declaration_order()
-    patch_vm_fullscreen_pin_id()
-    patch_wire_reorder()
     verify_all()
 
     ensure_release_keystore()
