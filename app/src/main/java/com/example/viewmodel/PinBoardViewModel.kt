@@ -147,6 +147,9 @@ class PinBoardViewModel(
     private val _fullscreenPinIndex = MutableStateFlow<Int?>(null)
     val fullscreenPinIndex: StateFlow<Int?> = _fullscreenPinIndex.asStateFlow()
 
+    private val _fullscreenPinId = MutableStateFlow<String?>(null)
+    val fullscreenPinId: StateFlow<String?> = _fullscreenPinId.asStateFlow()
+
     private val _snackbarMessage = MutableStateFlow<String?>(null)
     val snackbarMessage: StateFlow<String?> = _snackbarMessage.asStateFlow()
 
@@ -2637,11 +2640,20 @@ class PinBoardViewModel(
     fun openFullscreen(index: Int) {
         if (!_isSelectionMode.value) {
             _fullscreenPinIndex.value = index
+            _fullscreenPinId.value = null  // index-based legacy path
+        }
+    }
+
+    fun openFullscreenByPinId(pinId: String) {
+        if (!_isSelectionMode.value) {
+            _fullscreenPinId.value = pinId
+            _fullscreenPinIndex.value = null
         }
     }
 
     fun closeFullscreen() {
         _fullscreenPinIndex.value = null
+        _fullscreenPinId.value = null
     }
 
     fun downloadSelected(context: Context) {

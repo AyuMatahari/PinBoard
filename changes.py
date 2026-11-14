@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — fix isStandardMasonryActive forward reference
+PinBoard Gallery — ID-based fullscreen (brace-balanced) + drag-reorder board picker
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -71,106 +71,583 @@ def tool_available(name):
     except Exception: return False
 
 
+def find_matching_brace(text, open_idx):
+    """Given index of '{', return index of its matching '}'."""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text):
+                if text[i] == "\\":
+                    i += 2; continue
+                if text[i] == '"':
+                    break
+                i += 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
 # ============================================================
-# THE FIX — relocate isStandardMasonryActive after dateGroups
+# PATCH 1 — ViewModel fullscreenPinId (idempotent)
 # ============================================================
-def patch_forward_reference():
-    log("\n=== PATCH: Fix isStandardMasonryActive forward reference ===")
+def patch_vm_fullscreen_pin_id():
+    log("\n=== PATCH: ViewModel fullscreenPinId ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+
+    if "_fullscreenPinId" in t and "openFullscreenByPinId" in t:
+        log("  ✓ already patched"); return
+
+    changed = False
+    if "private val _fullscreenPinId" not in t:
+        anchor = (
+            "    private val _fullscreenPinIndex = MutableStateFlow<Int?>(null)\n"
+            "    val fullscreenPinIndex: StateFlow<Int?> = _fullscreenPinIndex.asStateFlow()\n"
+        )
+        add = (
+            anchor +
+            "\n"
+            "    private val _fullscreenPinId = MutableStateFlow<String?>(null)\n"
+            "    val fullscreenPinId: StateFlow<String?> = _fullscreenPinId.asStateFlow()\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1); changed = True
+            log("  ✓ fullscreenPinId state")
+
+    if "fun openFullscreenByPinId" not in t:
+        old_open = (
+            "    fun openFullscreen(index: Int) {\n"
+            "        if (!_isSelectionMode.value) {\n"
+            "            _fullscreenPinIndex.value = index\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    fun closeFullscreen() {\n"
+            "        _fullscreenPinIndex.value = null\n"
+            "    }\n"
+        )
+        new_open = (
+            "    fun openFullscreen(index: Int) {\n"
+            "        if (!_isSelectionMode.value) {\n"
+            "            _fullscreenPinIndex.value = index\n"
+            "            _fullscreenPinId.value = null\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    fun openFullscreenByPinId(pinId: String) {\n"
+            "        if (!_isSelectionMode.value) {\n"
+            "            _fullscreenPinId.value = pinId\n"
+            "            _fullscreenPinIndex.value = null\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+            "    fun closeFullscreen() {\n"
+            "        _fullscreenPinIndex.value = null\n"
+            "        _fullscreenPinId.value = null\n"
+            "    }\n"
+        )
+        if old_open in t:
+            t = t.replace(old_open, new_open, 1); changed = True
+            log("  ✓ openFullscreenByPinId + closeFullscreen")
+
+    if changed: f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 2 — Screen: collect state + ID-based clicks (idempotent)
+# ============================================================
+def patch_screen_fullscreen_state_and_clicks():
+    log("\n=== PATCH: Screen state + ID clicks ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    if "val fullscreenPinId by viewModel.fullscreenPinId" not in t:
+        old_collect = "    val fullscreenPinIndex by viewModel.fullscreenPinIndex.collectAsStateWithLifecycle()\n"
+        new_collect = (
+            "    val fullscreenPinIndex by viewModel.fullscreenPinIndex.collectAsStateWithLifecycle()\n"
+            "    val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()\n"
+            "    val isFullscreenActive = fullscreenPinId != null || fullscreenPinIndex != null\n"
+        )
+        if old_collect in t:
+            t = t.replace(old_collect, new_collect, 1); changed = True
+            log("  ✓ collect state + isFullscreenActive")
+
+    # Replace `fullscreenPinIndex == null` → `!isFullscreenActive`
+    n = t.count("fullscreenPinIndex == null")
+    if n > 0:
+        t = t.replace("fullscreenPinIndex == null", "!isFullscreenActive")
+        changed = True
+        log(f"  ✓ {n} 'fullscreenPinIndex == null' → '!isFullscreenActive'")
+
+    t = t.replace("fullscreenPinIndex != null", "isFullscreenActive")
+
+    # Gallery click → ID
+    old_click_gallery = (
+        "                                        val visualIdx = galleryPinsForFullscreen.indexOfFirst { it.id == pin.id }\n"
+        "                                            .coerceAtLeast(0)\n"
+        "                                        viewModel.openFullscreen(visualIdx)\n"
+    )
+    if old_click_gallery in t:
+        t = t.replace(old_click_gallery, "                                        viewModel.openFullscreenByPinId(pin.id)\n", 1)
+        changed = True
+        log("  ✓ galleryItems click → ID")
+
+    # Album view click → ID
+    old_album_click = (
+        "                                } else {\n"
+        "                                    viewModel.openFullscreen(index)\n"
+        "                                }\n"
+    )
+    if old_album_click in t:
+        idx = t.find(old_album_click)
+        if idx > 0:
+            t = t[:idx] + (
+                "                                } else {\n"
+                "                                    viewModel.openFullscreenByPinId(pin.id)\n"
+                "                                }\n"
+            ) + t[idx + len(old_album_click):]
+            changed = True
+            log("  ✓ album view click → ID")
+
+    # Date-group click → ID
+    old_date_click = (
+        "                                } else {\n"
+        "                                    viewModel.openFullscreen(if (index >= 0) index else 0)\n"
+        "                                }\n"
+    )
+    if old_date_click in t:
+        t = t.replace(old_date_click, (
+            "                                } else {\n"
+            "                                    viewModel.openFullscreenByPinId(pin.id)\n"
+            "                                }\n"
+        ), 1)
+        changed = True
+        log("  ✓ date-group click → ID")
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 3 — Screen: fullscreen render block (brace-balanced)
+# ============================================================
+def patch_screen_fullscreen_render():
+    log("\n=== PATCH: Screen fullscreen render (brace-balanced) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    # Step 1: Remove ALL occurrences of the (misplaced) declaration.
-    # We match from "val isStandardMasonryActive = ..." up to and including the
-    # closing "dateGroups.isNotEmpty())" plus any trailing newlines.
-    start_marker = "    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&\n"
-    end_marker = "dateGroups.isNotEmpty())"
+    # Already patched?
+    if ("if (isFullscreenActive) {" in t
+            and "fullscreenPinId != null -> fullScreenPins.indexOfFirst { it.id == fullscreenPinId }" in t):
+        log("  ✓ already patched"); return
 
-    removed = 0
-    while True:
-        start_idx = t.find(start_marker)
-        if start_idx < 0:
-            break
-        end_idx = t.find(end_marker, start_idx + len(start_marker))
-        if end_idx < 0:
-            break
-        end_idx += len(end_marker)
-        # Consume trailing newlines that belonged to this block
-        while end_idx < len(t) and t[end_idx] == "\n":
-            end_idx += 1
-        t = t[:start_idx] + t[end_idx:]
-        removed += 1
+    marker = "fullscreenPinIndex?.let {"
+    idx = t.find(marker)
+    if idx < 0:
+        log("  ✗ marker 'fullscreenPinIndex?.let {' not found"); sys.exit(1)
 
-    if removed == 0:
-        log("  ✓ no misplaced declaration found (either not present or already correct)")
-    else:
-        log(f"  ✓ removed {removed} misplaced declaration(s)")
+    open_brace = idx + len(marker) - 1  # marker ends with '{'
+    close_brace = find_matching_brace(t, open_brace)
+    if close_brace < 0:
+        log("  ✗ matching brace not found"); sys.exit(1)
 
-    # Step 2: Ensure exactly one correct declaration exists, placed BEFORE
-    # `val albums = remember(allPinsForAlbums` (which is declared after dateGroups).
-    albums_anchor = "    val albums = remember(allPinsForAlbums"
-    if albums_anchor not in t:
-        log("  ✗ albums anchor not found — aborting"); sys.exit(1)
+    # Detect original indentation from the line containing the marker
+    line_start = t.rfind("\n", 0, idx) + 1
+    original_indent = t[line_start:idx]
 
-    if "    val isStandardMasonryActive = " in t:
-        log("  ✓ already correctly placed — no insert needed")
-    else:
-        block = (
-            "    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&\n"
-            "        !(separateByDate && dateGroups.isNotEmpty())\n"
-            "\n"
-        )
-        t = t.replace(albums_anchor, block + albums_anchor, 1)
-        log("  ✓ inserted isStandardMasonryActive after dateGroups (before albums)")
+    # Compose the new block using the detected indent so it aligns with surrounding code
+    ind = original_indent
+    inner = ind + "    "
+    inner2 = inner + "    "
+    inner3 = inner2 + "    "
 
+    new_block = (
+        f"{ind}if (isFullscreenActive) {{\n"
+        f"{inner}val fullScreenPins = when {{\n"
+        f"{inner2}liveActiveAlbum != null -> liveActiveAlbum!!.pins\n"
+        f"{inner2}galleryPinsForFullscreen.isNotEmpty() -> galleryPinsForFullscreen\n"
+        f"{inner2}else -> viewModel.getAllSortedPins().ifEmpty {{ displayedPins }}\n"
+        f"{inner}}}\n"
+        f"{inner}val initialIndex = when {{\n"
+        f"{inner2}fullscreenPinId != null -> fullScreenPins.indexOfFirst {{ it.id == fullscreenPinId }}.coerceAtLeast(0)\n"
+        f"{inner2}fullscreenPinIndex != null -> fullscreenPinIndex!!.coerceIn(0, (fullScreenPins.size - 1).coerceAtLeast(0))\n"
+        f"{inner2}else -> 0\n"
+        f"{inner}}}\n"
+        f"{inner}FullscreenGalleryViewer(\n"
+        f"{inner2}refreshCounters = imageRefreshCounters,\n"
+        f"{inner2}onRefreshImage = {{ p -> viewModel.refreshImage(p.id) }},\n"
+        f"{inner2}pins = fullScreenPins,\n"
+        f"{inner2}initialIndex = initialIndex,\n"
+        f"{inner2}disableArrowNavigation = disableArrowNavigation,\n"
+        f"{inner2}isFavorite = {{ pin -> favoritePinKeys.contains(pin.id) || favoritePinKeys.contains(pin.imageUrl) }},\n"
+        f"{inner2}onToggleFavorite = {{ pin -> viewModel.toggleFavorite(pin) }},\n"
+        f"{inner2}onMoveToTop = {{ pin -> viewModel.movePinToTop(pin) }},\n"
+        f"{inner2}onDeleteSingle = {{ pin -> viewModel.deleteSinglePin(pin) }},\n"
+        f"{inner2}onClose = {{ viewModel.closeFullscreen() }},\n"
+        f"{inner2}onDownloadSingle = {{ pin -> viewModel.downloadSingle(context, pin) }}\n"
+        f"{inner}}}\n"
+        f"{ind}}}"
+    )
+
+    t = t[:idx] + new_block + t[close_brace + 1:]
     f.write_text(t, encoding="utf-8")
+    log(f"  ✓ fullscreen render replaced (via brace-balance, {close_brace - idx} chars → {len(new_block)} chars)")
 
 
 # ============================================================
-# Verify: isStandardMasonryActive appears AFTER dateGroups declaration
+# PATCH 4 — BoardPickerDialog with drag-reorder (idempotent)
 # ============================================================
-def verify_fix():
-    log("\n=== Verify ===")
+NEW_BOARD_PICKER = r'''package com.example.ui.dialogs
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.DragHandle
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Link
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
+import com.example.model.BoardHistoryItem
+import com.example.ui.theme.PinterestBlack
+import com.example.ui.theme.PinterestPillGray
+import com.example.ui.theme.PinterestRed
+import com.example.ui.theme.PinterestTextSecondary
+import kotlin.math.roundToInt
+
+
+@Composable
+fun BoardPickerDialog(
+    isOpen: Boolean,
+    boards: List<BoardHistoryItem>,
+    currentBoardUrl: String?,
+    onDismiss: () -> Unit,
+    onSelectBoard: (String) -> Unit,
+    onReorderBoards: (List<BoardHistoryItem>) -> Unit = {}
+) {
+    if (!isOpen) return
+
+    var localBoards by remember(boards) { mutableStateOf(boards) }
+    var draggedIndex by remember { mutableStateOf<Int?>(null) }
+    var accumulatedDrag by remember { mutableFloatStateOf(0f) }
+
+    val density = LocalDensity.current
+    val itemHeightDp = 56.dp
+    val itemHeightPx = with(density) { itemHeightDp.toPx() }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text("Switch board", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Tap to open · Hold to drag reorder",
+                    fontSize = 11.sp,
+                    color = PinterestTextSecondary
+                )
+            }
+        },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 500.dp)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                localBoards.forEachIndexed { index, item ->
+                    val isCurrent = currentBoardUrl?.trimEnd('/')
+                        ?.equals(item.url.trimEnd('/'), ignoreCase = true) == true
+                    val isDragged = draggedIndex == index
+
+                    val isFav = item.boardId == "board_favorites" || item.url.contains("favorites")
+                    val isMySave = item.boardId == "board_my_save" || item.url.contains("my_save")
+                    val isDump = item.boardId == "board_dump" || item.url.contains("dump")
+
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(itemHeightDp)
+                            .padding(vertical = 2.dp)
+                            .graphicsLayer {
+                                if (isDragged) {
+                                    translationY = accumulatedDrag
+                                    shadowElevation = 12.dp.toPx()
+                                    alpha = 0.95f
+                                    scaleX = 1.02f
+                                    scaleY = 1.02f
+                                }
+                            }
+                            .zIndex(if (isDragged) 1f else 0f)
+                            .pointerInput(item.url, localBoards.size) {
+                                detectDragGesturesAfterLongPress(
+                                    onDragStart = {
+                                        draggedIndex = index
+                                        accumulatedDrag = 0f
+                                    },
+                                    onDrag = { change, drag ->
+                                        change.consume()
+                                        accumulatedDrag += drag.dy
+                                    },
+                                    onDragEnd = {
+                                        val offset = (accumulatedDrag / itemHeightPx).roundToInt()
+                                        val targetIdx = (index + offset)
+                                            .coerceIn(0, localBoards.size - 1)
+                                        if (targetIdx != index) {
+                                            val newList = localBoards.toMutableList()
+                                            val moved = newList.removeAt(index)
+                                            newList.add(targetIdx, moved)
+                                            localBoards = newList
+                                            onReorderBoards(newList)
+                                        }
+                                        draggedIndex = null
+                                        accumulatedDrag = 0f
+                                    },
+                                    onDragCancel = {
+                                        draggedIndex = null
+                                        accumulatedDrag = 0f
+                                    }
+                                )
+                            }
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    if (draggedIndex == null) {
+                                        onSelectBoard(item.url)
+                                        onDismiss()
+                                    }
+                                }
+                                .testTag("board_picker_pill_${item.url.hashCode()}")
+                                .background(
+                                    color = if (isCurrent) PinterestRed else PinterestPillGray,
+                                    shape = RoundedCornerShape(24.dp)
+                                )
+                                .padding(horizontal = 14.dp, vertical = 12.dp),
+                            contentAlignment = Alignment.CenterStart
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.Start
+                            ) {
+                                Icon(
+                                    imageVector = when {
+                                        isFav -> Icons.Default.Favorite
+                                        isMySave -> Icons.Default.Bookmark
+                                        isDump -> Icons.Default.Folder
+                                        item.isCustom -> Icons.Default.Folder
+                                        else -> Icons.Default.Link
+                                    },
+                                    contentDescription = null,
+                                    tint = if (isCurrent) Color.White else PinterestRed,
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    text = item.title.ifBlank { "Board" },
+                                    fontSize = 13.sp,
+                                    fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isCurrent) Color.White else PinterestBlack,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (item.isCustom && !isFav && !isMySave && !isDump) {
+                                    Text(
+                                        text = "· Custom",
+                                        fontSize = 10.sp,
+                                        color = if (isCurrent) Color.White.copy(alpha = 0.7f) else PinterestTextSecondary
+                                    )
+                                    Spacer(Modifier.width(6.dp))
+                                }
+                                Icon(
+                                    imageVector = Icons.Default.DragHandle,
+                                    contentDescription = "Drag to reorder",
+                                    tint = if (isCurrent) Color.White.copy(alpha = 0.7f) else PinterestTextSecondary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if (localBoards.isEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("No boards available.", fontSize = 12.sp, color = PinterestTextSecondary)
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Close", color = PinterestBlack) }
+        },
+        shape = RoundedCornerShape(20.dp)
+    )
+}
+'''
+
+
+def patch_board_picker_dialog():
+    log("\n=== PATCH: BoardPickerDialog (drag-reorder) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt"
+    if f.exists():
+        t = f.read_text(encoding="utf-8")
+        if "detectDragGesturesAfterLongPress" in t and "onReorderBoards(newList)" in t:
+            log("  ✓ already patched"); return
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(NEW_BOARD_PICKER, encoding="utf-8")
+    log("  ✓ rewritten with drag-reorder")
+
+
+# ============================================================
+# PATCH 5 — Wire onReorderBoards (idempotent)
+# ============================================================
+def patch_wire_reorder_callback():
+    log("\n=== PATCH: Wire onReorderBoards ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    date_groups_idx = t.find("val dateGroups = remember(")
-    albums_idx = t.find("val albums = remember(allPinsForAlbums")
-    is_std_idx = t.find("val isStandardMasonryActive")
+    if "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }" in t:
+        log("  ✓ already wired"); return
 
-    ok = True
+    old_call = (
+        "    com.example.ui.dialogs.BoardPickerDialog(\n"
+        "        isOpen = isBoardPickerOpen,\n"
+        "        boards = boardHistory,\n"
+        "        currentBoardUrl = currentBoard?.boardUrl,\n"
+        "        onDismiss = { isBoardPickerOpen = false },\n"
+        "        onSelectBoard = { url ->\n"
+        "            viewModel.loadBoardFromUrl(url)\n"
+        "            isBoardPickerOpen = false\n"
+        "        }\n"
+        "    )\n"
+    )
+    new_call = (
+        "    com.example.ui.dialogs.BoardPickerDialog(\n"
+        "        isOpen = isBoardPickerOpen,\n"
+        "        boards = boardHistory,\n"
+        "        currentBoardUrl = currentBoard?.boardUrl,\n"
+        "        onDismiss = { isBoardPickerOpen = false },\n"
+        "        onSelectBoard = { url ->\n"
+        "            viewModel.loadBoardFromUrl(url)\n"
+        "            isBoardPickerOpen = false\n"
+        "        },\n"
+        "        onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }\n"
+        "    )\n"
+    )
+    if old_call in t:
+        t = t.replace(old_call, new_call, 1)
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ onReorderBoards wired")
+    else:
+        log("  ⚠ anchor missing — trying fallback")
+        idx = t.find("com.example.ui.dialogs.BoardPickerDialog(")
+        if idx < 0:
+            log("  ✗ BoardPickerDialog call not found"); sys.exit(1)
+        paren_idx = t.find("(", idx)
+        depth = 0
+        i = paren_idx
+        while i < len(t):
+            if t[i] == "(":
+                depth += 1
+            elif t[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    t = t[:i] + ",\n        onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }\n    " + t[i:]
+                    f.write_text(t, encoding="utf-8")
+                    log("  ✓ onReorderBoards wired (fallback)")
+                    return
+            i += 1
 
-    if date_groups_idx < 0:
-        log("  ✗ dateGroups declaration not found"); ok = False
-    if albums_idx < 0:
-        log("  ✗ albums declaration not found"); ok = False
-    if is_std_idx < 0:
-        log("  ✗ isStandardMasonryActive not found"); ok = False
 
-    if ok:
-        # isStandardMasonryActive must come AFTER dateGroups
-        if is_std_idx < date_groups_idx:
-            log(f"  ✗ isStandardMasonryActive still before dateGroups "
-                f"(idx={is_std_idx}, dateGroups={date_groups_idx})")
-            ok = False
-        else:
-            log(f"  ✓ isStandardMasonryActive placed after dateGroups")
-
-        # Sanity: only one occurrence
-        count = t.count("val isStandardMasonryActive")
-        if count != 1:
-            log(f"  ✗ expected 1 occurrence of isStandardMasonryActive, found {count}")
-            ok = False
-        else:
-            log("  ✓ exactly one isStandardMasonryActive declaration")
-
-        # galleryPinsForFullscreen still present
-        if "val galleryPinsForFullscreen" not in t:
-            log("  ✗ galleryPinsForFullscreen missing"); ok = False
-        else:
-            log("  ✓ galleryPinsForFullscreen intact")
-
-    if not ok:
+# ============================================================
+# Self-verify
+# ============================================================
+def verify_patches():
+    log("\n=== Self-verify ===")
+    checks = [
+        ("app/src/main/java/com/example/viewmodel/PinBoardViewModel.kt", [
+            "private val _fullscreenPinId",
+            "fun openFullscreenByPinId(pinId: String)",
+            "_fullscreenPinId.value = pinId",
+        ]),
+        ("app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt", [
+            "val fullscreenPinId by viewModel.fullscreenPinId",
+            "val isFullscreenActive = ",
+            "viewModel.openFullscreenByPinId(pin.id)",
+            "if (isFullscreenActive) {",
+            "fullscreenPinId != null -> fullScreenPins.indexOfFirst { it.id == fullscreenPinId }",
+            "onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }",
+        ]),
+        ("app/src/main/java/com/example/ui/dialogs/BoardPickerDialog.kt", [
+            "detectDragGesturesAfterLongPress",
+            "onReorderBoards: (List<BoardHistoryItem>) -> Unit = {}",
+            "onReorderBoards(newList)",
+        ]),
+    ]
+    all_ok = True
+    for rel, markers in checks:
+        fp = PROJECT_ROOT / rel
+        if not fp.exists():
+            log(f"  ✗ {rel} missing"); all_ok = False; continue
+        content = fp.read_text(encoding="utf-8")
+        local_ok = True
+        for m in markers:
+            if m not in content:
+                log(f"  ✗ MISSING in {rel.split('/')[-1]}: {m[:70]}")
+                local_ok = False; all_ok = False
+        if local_ok:
+            log(f"  ✓ {rel.split('/')[-1]}")
+    if not all_ok:
         log("\n✗ VERIFICATION FAILED"); sys.exit(1)
 
 
@@ -300,7 +777,8 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Fix isStandardMasonryActive forward reference to dateGroups"])
+        run(["git", "commit", "-m",
+             "Fix fullscreen render (brace-balanced); ID-based navigation + drag picker"])
 
 
 def verify_keystore_tracked():
@@ -449,14 +927,18 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — fix isStandardMasonryActive forward reference")
+    log("PinBoard — brace-balanced fullscreen + drag picker")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_forward_reference()
-    verify_fix()
+    patch_vm_fullscreen_pin_id()
+    patch_screen_fullscreen_state_and_clicks()
+    patch_screen_fullscreen_render()
+    patch_board_picker_dialog()
+    patch_wire_reorder_callback()
+    verify_patches()
 
     ensure_release_keystore()
     patch_build_gradle()

@@ -159,6 +159,8 @@ fun PinBoardGalleryScreen(
     val loadingProgress by viewModel.loadingProgress.collectAsStateWithLifecycle()
     val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle()
     val fullscreenPinIndex by viewModel.fullscreenPinIndex.collectAsStateWithLifecycle()
+    val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()
+    val isFullscreenActive = fullscreenPinId != null || isFullscreenActive
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val boardHistory by viewModel.boardHistory.collectAsStateWithLifecycle()
 
@@ -435,7 +437,7 @@ fun PinBoardGalleryScreen(
     val topBarHeightDp = with(density) { if (topBarHeightPx > 0f) topBarHeightPx.toDp() else 96.dp }
 
     val topBarOffsetProgress by animateFloatAsState(
-        targetValue = if (topBarVisible && fullscreenPinIndex == null) 0f else -1f,
+        targetValue = if (topBarVisible && !isFullscreenActive) 0f else -1f,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
         label = "top_bar_translation"
     )
@@ -528,7 +530,7 @@ fun PinBoardGalleryScreen(
         snackbarHost = { SnackbarHost(hostState = snackbarHostState) },
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
-            if (fullscreenPinIndex == null && pendingAlbumTransfer == null) {
+            if (!isFullscreenActive && pendingAlbumTransfer == null) {
                 MultiSelectBottomBar(
                     isVisible = isSelectionMode,
                     selectedPinCount = selectedPinIds.size,
@@ -945,7 +947,7 @@ fun PinBoardGalleryScreen(
                                 if (isSelectionMode) {
                                     viewModel.toggleSelection(pin.id)
                                 } else {
-                                    viewModel.openFullscreen(index)
+                                    viewModel.openFullscreenByPinId(pin.id)
                                 }
                             },
                             onLongClick = {
@@ -1079,9 +1081,7 @@ fun PinBoardGalleryScreen(
                                     if (isSelectionMode) {
                                         viewModel.toggleSelection(pin.id)
                                     } else {
-                                        val visualIdx = galleryPinsForFullscreen.indexOfFirst { it.id == pin.id }
-                                            .coerceAtLeast(0)
-                                        viewModel.openFullscreen(visualIdx)
+                                        viewModel.openFullscreenByPinId(pin.id)
                                     }
                                 },
                                 onLongClick = {
@@ -1133,7 +1133,7 @@ fun PinBoardGalleryScreen(
             }
 
             // Seamless natural Chrome-like Auto-Hide Top Bar
-            if (fullscreenPinIndex == null) {
+            if (!isFullscreenActive) {
                 PinterestTopBar(
                     currentColumns = columnCount,
                     onColumnsChanged = { viewModel.setColumnCount(it) },
@@ -1343,13 +1343,22 @@ fun PinBoardGalleryScreen(
             }
 
             // Fullscreen Gallery Viewer Modal Overlay
-            fullscreenPinIndex?.let { index ->
-                val fullScreenPins = liveActiveAlbum?.pins ?: (if (topLevelCustomAlbums.isNotEmpty()) viewModel.getAllSortedPins().filter { it.albumId == null } else viewModel.getAllSortedPins()).ifEmpty { displayedPins }
+                        if (isFullscreenActive) {
+                val fullScreenPins = when {
+                    liveActiveAlbum != null -> liveActiveAlbum!!.pins
+                    galleryPinsForFullscreen.isNotEmpty() -> galleryPinsForFullscreen
+                    else -> viewModel.getAllSortedPins().ifEmpty { displayedPins }
+                }
+                val initialIndex = when {
+                    fullscreenPinId != null -> fullScreenPins.indexOfFirst { it.id == fullscreenPinId }.coerceAtLeast(0)
+                    fullscreenPinIndex != null -> fullscreenPinIndex!!.coerceIn(0, (fullScreenPins.size - 1).coerceAtLeast(0))
+                    else -> 0
+                }
                 FullscreenGalleryViewer(
                     refreshCounters = imageRefreshCounters,
                     onRefreshImage = { p -> viewModel.refreshImage(p.id) },
                     pins = fullScreenPins,
-                    initialIndex = index.coerceIn(0, (fullScreenPins.size - 1).coerceAtLeast(0)),
+                    initialIndex = initialIndex,
                     disableArrowNavigation = disableArrowNavigation,
                     isFavorite = { pin -> favoritePinKeys.contains(pin.id) || favoritePinKeys.contains(pin.imageUrl) },
                     onToggleFavorite = { pin -> viewModel.toggleFavorite(pin) },
@@ -1357,7 +1366,7 @@ fun PinBoardGalleryScreen(
                     onDeleteSingle = { pin -> viewModel.deleteSinglePin(pin) },
                     onClose = { viewModel.closeFullscreen() },
                     onDownloadSingle = { pin -> viewModel.downloadSingle(context, pin) }
-                )
+                }
             }
 
             // Album Quick Preview Overlay (screen-fitting ~18 images preview on swipe)
@@ -1736,7 +1745,8 @@ fun PinBoardGalleryScreen(
         onSelectBoard = { url ->
             viewModel.loadBoardFromUrl(url)
             isBoardPickerOpen = false
-        }
+        },
+        onReorderBoards = { list -> viewModel.saveReorderedBoards(list, false) }
     )
 
     // Delete selection (albums involved) — ask how
