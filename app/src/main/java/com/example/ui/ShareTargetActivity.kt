@@ -164,13 +164,13 @@ class ShareTargetActivity : ComponentActivity() {
                     sharedLinks = sharedLinks,
                     sharedImageUris = sharedImageUris,
                     onClose = { finish() },
-                    onSaveToSelected = { boards, extractMultiple ->
+                    onSaveToSelected = { boards, extractMultiple, putAlbum ->
                         finish()
-                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple)
+                        performSaveToBoards(sharedLinks, sharedImageUris, boards, extractMultiple, putAlbum)
                     },
-                    onHoldBoard = { boardId, extractMultiple ->
+                    onHoldBoard = { boardId, extractMultiple, putAlbum ->
                         finish()
-                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple)
+                        performSaveToBoards(sharedLinks, sharedImageUris, listOf(boardId), extractMultiple, putAlbum)
                     }
                 )
             }
@@ -181,7 +181,8 @@ class ShareTargetActivity : ComponentActivity() {
         links: List<String>,
         uris: List<Uri>,
         targetBoardIds: List<String>,
-        extractMultiple: Boolean
+        extractMultiple: Boolean,
+        putIntoAlbum: Boolean = false
     ) {
         appScope.launch {
             try {
@@ -211,8 +212,20 @@ class ShareTargetActivity : ComponentActivity() {
                         !existingIds.contains(it.id) && !existingUrls.contains(it.imageUrl)
                     }
                     if (toInsert.isNotEmpty()) {
+                        var albumId: String? = null
+                        if (putIntoAlbum && toInsert.size > 1) {
+                            val aId = "album_${System.currentTimeMillis()}_${(1000..9999).random()}"
+                            dao.insertAlbum(com.example.data.local.CustomAlbumEntity(
+                                id = aId, boardId = boardId, parentAlbumId = null,
+                                title = "Album (${toInsert.size} images)",
+                                sourceUrl = links.firstOrNull() ?: "",
+                                dateAddedMillis = System.currentTimeMillis(),
+                                orderIndex = 0, isFavorite = false
+                            ))
+                            albumId = aId
+                        }
                         dao.upsertPinsSafely(toInsert.mapIndexed { i, p ->
-                            PinEntity.fromPinItem(p.copy(albumId = null), boardId, i)
+                            PinEntity.fromPinItem(p.copy(albumId = albumId), boardId, i)
                         })
                     }
                 }
@@ -296,14 +309,15 @@ private fun FloatingShareDialog(
     sharedLinks: List<String>,
     sharedImageUris: List<Uri>,
     onClose: () -> Unit,
-    onSaveToSelected: (List<String>, Boolean) -> Unit,
-    onHoldBoard: (String, Boolean) -> Unit
+    onSaveToSelected: (List<String>, Boolean, Boolean) -> Unit,
+    onHoldBoard: (String, Boolean, Boolean) -> Unit
 ) {
     val context = LocalContext.current
     var boards by remember { mutableStateOf<List<BoardEntity>>(emptyList()) }
     var isLoadingBoards by remember { mutableStateOf(true) }
     val selectedBoardIds = remember { mutableStateListOf<String>() }
     var extractMultipleImages by remember { mutableStateOf(false) }
+    var putIntoAlbum by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         withContext(Dispatchers.IO) {
@@ -388,6 +402,31 @@ private fun FloatingShareDialog(
                                 fontSize = 10.sp, color = PinterestTextSecondary)
                         }
                     }
+                    if (extractMultipleImages) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth()
+                                .combinedClickable(
+                                    onClick = { putIntoAlbum = !putIntoAlbum },
+                                    onLongClick = { putIntoAlbum = !putIntoAlbum }
+                                )
+                                .padding(start = 24.dp, top = 4.dp)
+                                .testTag("share_put_into_album_checkbox"),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = putIntoAlbum,
+                                onCheckedChange = { putIntoAlbum = it },
+                                colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
+                            )
+                            Spacer(Modifier.width(4.dp))
+                            Column {
+                                Text("Save to new album",
+                                    fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                                Text("Multiple images grouped as one album",
+                                    fontSize = 10.sp, color = PinterestTextSecondary)
+                            }
+                        }
+                    }
                 }
 
                 Spacer(Modifier.height(10.dp))
@@ -418,7 +457,7 @@ private fun FloatingShareDialog(
                                             if (isSelected) selectedBoardIds.remove(board.id)
                                             else selectedBoardIds.add(board.id)
                                         },
-                                        onLongClick = { onHoldBoard(board.id, extractMultipleImages) }
+                                        onLongClick = { onHoldBoard(board.id, extractMultipleImages, putIntoAlbum && extractMultipleImages) }
                                     )
                                     .testTag("share_target_board_${board.id}")
                             ) {
@@ -462,7 +501,7 @@ private fun FloatingShareDialog(
                     Button(
                         onClick = {
                             if (selectedBoardIds.isNotEmpty()) {
-                                onSaveToSelected(selectedBoardIds.toList(), extractMultipleImages)
+                                onSaveToSelected(selectedBoardIds.toList(), extractMultipleImages, putIntoAlbum && extractMultipleImages)
                             } else {
                                 onClose()
                             }

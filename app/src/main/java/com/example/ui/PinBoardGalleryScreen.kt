@@ -297,6 +297,15 @@ fun PinBoardGalleryScreen(
     }
     val galleryItemsPlaceholder = galleryItems
 
+    // Pins in visual grid order (used for fullscreen pager navigation)
+    val galleryPinsForFullscreen = remember(galleryItems) {
+        galleryItems.mapNotNull { it.pin }
+    }
+
+    // True when standard masonry grid is the active view
+    val isStandardMasonryActive = !groupByAlbum && liveActiveAlbum == null &&
+        !(separateByDate && dateGroups.isNotEmpty())
+
     // Scroll to album when requested (after combine/creation)
     LaunchedEffect(scrollToAlbumId, galleryItemsPlaceholder) {
         val targetId = scrollToAlbumId ?: return@LaunchedEffect
@@ -911,8 +920,13 @@ fun PinBoardGalleryScreen(
                         }
                     }
 
-                    val albumPins = allPinsForAlbums.filter { it.albumId == liveActiveAlbum!!.id }
-                        .sortedByDescending { it.dateAddedMillis }
+                    // Custom albums filter by albumId; date albums use their captured pins
+                    val isCustomAlbumActive = customDateAlbums.any { it.id == liveActiveAlbum!!.id }
+                    val albumPins = (if (isCustomAlbumActive) {
+                        allPinsForAlbums.filter { it.albumId == liveActiveAlbum.id }
+                    } else {
+                        liveActiveAlbum.pins
+                    }).sortedByDescending { it.dateAddedMillis }
                     itemsIndexed(
                         items = albumPins,
                         key = { index, pin -> "album_${liveActiveAlbum!!.id}_${pin.id}_$index" }
@@ -1065,7 +1079,9 @@ fun PinBoardGalleryScreen(
                                     if (isSelectionMode) {
                                         viewModel.toggleSelection(pin.id)
                                     } else {
-                                        viewModel.openFullscreen(item.pinIndexInLoose)
+                                        val visualIdx = galleryPinsForFullscreen.indexOfFirst { it.id == pin.id }
+                                            .coerceAtLeast(0)
+                                        viewModel.openFullscreen(visualIdx)
                                     }
                                 },
                                 onLongClick = {
@@ -1662,8 +1678,8 @@ fun PinBoardGalleryScreen(
         currentBoardId = currentBoard?.id,
         currentAlbumTitle = activeAlbum?.title,
         onDismiss = { isAddManualImagesDialogOpen = false },
-        onAddImages = { text, targetBoards, extractMultiple ->
-            viewModel.addManualImages(text, targetBoards, extractMultiple)
+        onAddImages = { text, targetBoards, extractMultiple, putAlbum ->
+            viewModel.addManualImages(text, targetBoards, extractMultiple, putAlbum)
         }
     )
 

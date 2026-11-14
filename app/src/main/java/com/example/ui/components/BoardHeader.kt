@@ -291,7 +291,7 @@ fun BoardHeader(
                 )
                 Spacer(modifier = Modifier.width(4.dp))
                 Text(
-                    text = "BOARDS (HOLD CUSTOM TO EDIT) — TAP TO SWITCH",
+                    text = "BOARDS",
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontWeight = FontWeight.Bold,
                         letterSpacing = 0.8.sp,

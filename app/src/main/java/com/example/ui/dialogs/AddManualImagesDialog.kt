@@ -64,13 +64,14 @@ fun AddManualImagesDialog(
     currentBoardId: String?,
     currentAlbumTitle: String? = null,
     onDismiss: () -> Unit,
-    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean) -> Unit
+    onAddImages: (rawText: String, targetBoardIds: List<String>, extractMultipleImages: Boolean, putIntoAlbum: Boolean) -> Unit
 ) {
     if (!isOpen) return
 
     val context = LocalContext.current
     var textInput by remember { mutableStateOf("") }
     var extractMultipleImages by remember { mutableStateOf(false) }
+    var putIntoAlbum by remember { mutableStateOf(false) }
     var boardsExpanded by remember { mutableStateOf(false) }
 
     val selectedBoardIds = remember(availableBoards, currentBoardId) {
@@ -162,6 +163,31 @@ fun AddManualImagesDialog(
                     }
                 }
 
+                if (extractMultipleImages) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(start = 24.dp)
+                            .clickable { putIntoAlbum = !putIntoAlbum }
+                            .padding(vertical = 4.dp)
+                            .testTag("manual_put_into_album_checkbox")
+                    ) {
+                        Checkbox(
+                            checked = putIntoAlbum,
+                            onCheckedChange = { putIntoAlbum = it },
+                            colors = CheckboxDefaults.colors(checkedColor = PinterestRed)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Column {
+                            Text("Save to new album",
+                                fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Multiple images grouped as one album",
+                                fontSize = 11.sp, color = PinterestTextSecondary)
+                        }
+                    }
+                }
+
                 Spacer(Modifier.height(12.dp))
 
                 Row(
@@ -226,7 +252,12 @@ fun AddManualImagesDialog(
             Button(
                 onClick = {
                     if (extractedLinks.isNotEmpty() && selectedBoardIds.isNotEmpty()) {
-                        onAddImages(textInput.trim(), selectedBoardIds.toList(), extractMultipleImages)
+                        onAddImages(
+                            textInput.trim(),
+                            selectedBoardIds.toList(),
+                            extractMultipleImages,
+                            putIntoAlbum && extractMultipleImages
+                        )
                         onDismiss()
                     }
                 },

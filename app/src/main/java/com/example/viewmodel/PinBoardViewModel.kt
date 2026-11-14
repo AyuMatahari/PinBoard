@@ -1633,14 +1633,16 @@ class PinBoardViewModel(
     fun addManualImages(
         unstructuredText: String,
         targetBoardIds: List<String>,
-        extractMultipleImages: Boolean = false
+        extractMultipleImages: Boolean = false,
+        putIntoAlbum: Boolean = false
     ) {
-        // Implicit: if user is inside an album on the target board, add to that album
-        val _activeAlbumId = _activeAlbum.value?.let { alb ->
-            if (_currentBoard.value != null && targetBoardIds.contains(_currentBoard.value!!.id)) alb.id else null
-        }
+        // If putIntoAlbum is true, always create new albums (ignore active album)
+        val _activeAlbumId = if (!putIntoAlbum) {
+            _activeAlbum.value?.let { alb ->
+                if (_currentBoard.value != null && targetBoardIds.contains(_currentBoard.value!!.id)) alb.id else null
+            }
+        } else null
         val targetAlbumId: String? = _activeAlbumId
-        val putIntoAlbum = false
         val ctx = appContext ?: return
         val links = LinkExtractor.extractLinks(unstructuredText)
         if (links.isEmpty()) {
