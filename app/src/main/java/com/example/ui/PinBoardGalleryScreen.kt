@@ -159,8 +159,8 @@ fun PinBoardGalleryScreen(
     val loadingProgress by viewModel.loadingProgress.collectAsStateWithLifecycle()
     val downloadProgress by viewModel.downloadProgress.collectAsStateWithLifecycle()
     val fullscreenPinIndex by viewModel.fullscreenPinIndex.collectAsStateWithLifecycle()
+    val isFullscreenActive = fullscreenPinId != null || fullscreenPinIndex != null
     val fullscreenPinId by viewModel.fullscreenPinId.collectAsStateWithLifecycle()
-    val isFullscreenActive = fullscreenPinId != null || isFullscreenActive
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val boardHistory by viewModel.boardHistory.collectAsStateWithLifecycle()
 

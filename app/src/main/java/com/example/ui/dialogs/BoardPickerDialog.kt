@@ -1,5 +1,6 @@
 package com.example.ui.dialogs
 
+// v2-drag-reorder
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
@@ -35,9 +36,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
@@ -64,7 +66,6 @@ fun BoardPickerDialog(
 ) {
     if (!isOpen) return
 
-    // Local mutable copy — the source of truth during the dialog lifetime
     var localBoards by remember(boards) { mutableStateOf(boards) }
     var draggedIndex by remember { mutableStateOf<Int?>(null) }
     var accumulatedDrag by remember { mutableFloatStateOf(0f) }
@@ -123,9 +124,9 @@ fun BoardPickerDialog(
                                         draggedIndex = index
                                         accumulatedDrag = 0f
                                     },
-                                    onDrag = { change, drag ->
+                                    onDrag = { change: PointerInputChange, dragAmount: Offset ->
                                         change.consume()
-                                        accumulatedDrag += drag.dy
+                                        accumulatedDrag += dragAmount.y
                                     },
                                     onDragEnd = {
                                         val offset = (accumulatedDrag / itemHeightPx).roundToInt()
