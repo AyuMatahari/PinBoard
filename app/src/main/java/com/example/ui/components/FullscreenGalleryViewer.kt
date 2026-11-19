@@ -50,6 +50,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.filled.FavoriteBorder
@@ -118,6 +119,7 @@ fun FullscreenGalleryViewer(
     onDeleteSingle: (PinItem) -> Unit = {},
     onClose: () -> Unit,
     onDownloadSingle: (PinItem) -> Unit,
+    onPlayVideo: (PinItem) -> Unit = {},
     disableArrowNavigation: Boolean = false,
     refreshCounters: Map<String, Int> = emptyMap(),
     onRefreshImage: (PinItem) -> Unit = {},
@@ -186,6 +188,21 @@ fun FullscreenGalleryViewer(
                     offsetY = 0f
                     isCurrentPageZoomed = false
                 }
+            }
+
+            // Video thumbnail state
+            var extractedVideoThumb by remember(pin.id) { mutableStateOf<java.io.File?>(null) }
+            var videoThumbFailed by remember(pin.id) { mutableStateOf(false) }
+            LaunchedEffect(pin.id, pin.isVideo, pin.hasSeparateThumbnail) {
+                if (pin.isVideo && !pin.hasSeparateThumbnail && extractedVideoThumb == null && !videoThumbFailed) {
+                    val vf = com.example.util.VideoThumbnailCache.getOrExtract(context, pin)
+                    if (vf == null) videoThumbFailed = true else extractedVideoThumb = vf
+                }
+            }
+            val effectiveModel: Any? = when {
+                pin.isVideo && pin.hasSeparateThumbnail -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
+                pin.isVideo -> extractedVideoThumb
+                else -> pin.imageUrl
             }
 
             Box(
@@ -265,9 +282,10 @@ fun FullscreenGalleryViewer(
                 contentAlignment = Alignment.Center
             ) {
                 val pageRefreshKey = refreshCounters[pin.id] ?: 0
+                if (effectiveModel != null) {
                 AsyncImage(
                     model = ImageRequest.Builder(context)
-                        .data(pin.imageUrl)
+                        .data(effectiveModel)
                         .apply {
                             if (pageRefreshKey > 0) {
                                 memoryCacheKey("pin-full:${pin.id}:r$pageRefreshKey")
@@ -287,6 +305,46 @@ fun FullscreenGalleryViewer(
                             translationY = offsetY
                         }
                 )
+                } else if (pin.isVideo) {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier.fillMaxSize(),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = "Preparing video preview…",
+                            color = Color.White,
+                            fontSize = 13.sp
+                        )
+                    }
+                }
+
+                // Centered play button — no autoplay
+                if (pin.isVideo) {
+                    androidx.compose.foundation.layout.Box(
+                        modifier = Modifier
+                            .align(Alignment.Center)
+                            .size(96.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Surface(
+                            shape = CircleShape,
+                            color = Color.Black.copy(alpha = 0.6f),
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .clickable { onPlayVideo(pin) }
+                                .testTag("fullscreen_play_video_${pin.id}")
+                        ) {
+                            androidx.compose.foundation.layout.Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.PlayArrow,
+                                    contentDescription = "Play video",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(56.dp)
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
 

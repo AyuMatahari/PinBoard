@@ -84,8 +84,11 @@ object ImageLinkResolver {
         var fileSizeKb = 250L
         var isBroken = false
         var imageWidth = 1080
-        var imageHeight = 1350
+        var imageHeight = 1920
         val sourceWebpageUrl = cleanUrl
+        var detectedVideoUrl: String? = null
+        var detectedVideoMime: String = ""
+        var hasSeparateThumb: Boolean = false
 
         try {
             val request = Request.Builder()
@@ -107,8 +110,18 @@ object ImageLinkResolver {
                     }
 
                     val isDirectImage = contentType.startsWith("image/")
+                    val isDirectVideo = contentType.startsWith("video/") ||
+                        ImageMimeUtils.isVideoUrl(effectiveUrl)
 
-                    if (isDirectImage) {
+                    if (isDirectVideo) {
+                        detectedVideoUrl = effectiveUrl
+                        detectedVideoMime = contentType.substringBefore(";").ifBlank {
+                            ImageMimeUtils.videoMimeFromUrl(effectiveUrl) ?: "video/mp4"
+                        }
+                        finalImageUrl = effectiveUrl
+                        mimeType = ""
+                        hasSeparateThumb = false
+                    } else if (isDirectImage) {
                         // Directly an image link
                         mimeType = contentType.substringBefore(";")
                         finalImageUrl = effectiveUrl
@@ -132,6 +145,14 @@ object ImageLinkResolver {
                         val extractedTitle = extractTitleFromHtml(htmlBody)
                         if (extractedTitle.isNotBlank()) {
                             finalTitle = extractedTitle
+                        }
+
+                        // Look for video in the page
+                        val videoMatch = extractMainVideo(htmlBody, effectiveUrl)
+                        if (videoMatch != null) {
+                            detectedVideoUrl = videoMatch.first
+                            detectedVideoMime = videoMatch.second
+                            hasSeparateThumb = true
                         }
 
                         // Run browserless two-pass main image extractor
@@ -176,12 +197,14 @@ object ImageLinkResolver {
             isBroken = true
         }
 
+        val isVid = detectedVideoUrl != null
+        val imgForDisplay = if (isVid && !hasSeparateThumb) detectedVideoUrl!! else finalImageUrl
         PinItem(
             id = uniqueId,
             title = finalTitle,
-            description = if (sourceWebpageUrl != finalImageUrl) "Imported from $domain" else "",
-            imageUrl = finalImageUrl,
-            thumbnailUrl = finalImageUrl,
+            description = if (sourceWebpageUrl != imgForDisplay) "Imported from $domain" else "",
+            imageUrl = imgForDisplay,
+            thumbnailUrl = imgForDisplay,
             author = domain.ifBlank { "Web Source" },
             boardName = boardName,
             sourceUrl = sourceWebpageUrl,
@@ -192,7 +215,11 @@ object ImageLinkResolver {
             fileSizeKb = fileSizeKb,
             mimeType = mimeType,
             sourceDomain = domain,
-            isBrokenOrUnreachable = isBroken
+            isBrokenOrUnreachable = isBroken,
+            videoUrl = detectedVideoUrl,
+            isVideo = isVid,
+            hasSeparateThumbnail = hasSeparateThumb && isVid,
+            videoMimeType = detectedVideoMime
         )
     }
 
@@ -1004,6 +1031,58 @@ object ImageLinkResolver {
             attrs[name] = cleanHtmlEntities(value)
         }
         return attrs
+    }
+
+    /**
+     * Returns (videoUrl, videoMime) from og:video, <video src>, <source src>, twitter:player:stream.
+     */
+    fun extractMainVideo(html: String, baseUrl: String): Pair<String, String>? {
+        META_TAG_REGEX.findAll(html).forEach { match ->
+            val attrs = parseTagAttributes(match.value)
+            val prop = (attrs["property"] ?: attrs["name"] ?: "").lowercase(Locale.ROOT).trim()
+            val content = attrs["content"]?.trim() ?: ""
+            if (content.isNotBlank() && prop in setOf(
+                    "og:video", "og:video:url", "og:video:secure_url",
+                    "twitter:player:stream"
+                )) {
+                val url = resolveAbsoluteUrl(baseUrl, content)
+                val mime = when {
+                    url.contains(".m3u8") -> "application/vnd.apple.mpegurl"
+                    url.contains(".webm") -> "video/webm"
+                    url.contains(".mov") -> "video/quicktime"
+                    url.contains(".ogv") -> "video/ogg"
+                    else -> "video/mp4"
+                }
+                return url to mime
+            }
+        }
+        val videoSrcRegex = Regex("""<video\b[^>]*\bsrc=["']([^"']+)["']""", RegexOption.IGNORE_CASE)
+        videoSrcRegex.find(html)?.let { m ->
+            val url = resolveAbsoluteUrl(baseUrl, m.groupValues[1])
+            val mime = when {
+                url.contains(".m3u8") -> "application/vnd.apple.mpegurl"
+                url.contains(".webm") -> "video/webm"
+                url.contains(".mov") -> "video/quicktime"
+                else -> "video/mp4"
+            }
+            return url to mime
+        }
+        val sourceRegex = Regex(
+            """<source\b[^>]*\bsrc=["']([^"']+\.(?:mp4|webm|m3u8|mov|ogv)(?:\?[^"']*)?)["']""",
+            RegexOption.IGNORE_CASE
+        )
+        sourceRegex.find(html)?.let { m ->
+            val url = resolveAbsoluteUrl(baseUrl, m.groupValues[1])
+            val mime = when {
+                url.contains(".m3u8") -> "application/vnd.apple.mpegurl"
+                url.contains(".webm") -> "video/webm"
+                url.contains(".mov") -> "video/quicktime"
+                url.contains(".ogv") -> "video/ogg"
+                else -> "video/mp4"
+            }
+            return url to mime
+        }
+        return null
     }
 
     fun extractTitleFromHtml(html: String): String {

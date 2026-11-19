@@ -73,6 +73,33 @@ object ImageMimeUtils {
             if (head.startsWith("<svg", ignoreCase = true)) return "image/svg+xml"
         }
 
+        // ---- Video containers ----
+        // MP4 / MOV / M4V / 3GP: bytes 4..7 == "ftyp", brand at 8..11
+        if (length >= 12 && b(4) == 0x66 && b(5) == 0x74 && b(6) == 0x79 && b(7) == 0x70) {
+            val brand = String(bytes, 8, 4, Charsets.US_ASCII)
+            when {
+                brand.startsWith("qt") -> return "video/quicktime"
+                brand.startsWith("3gp") || brand.startsWith("3gg") -> return "video/3gpp"
+                brand.startsWith("avif") || brand.startsWith("avis") -> return "image/avif"
+                brand.startsWith("heic") || brand.startsWith("heix") || brand.startsWith("mif1") -> return "image/heic"
+                brand.startsWith("M4A") -> return "audio/mp4"
+                else -> return "video/mp4"
+            }
+        }
+        // WebM / Matroska: 1A 45 DF A3 (EBML)
+        if (length >= 4 && b(0) == 0x1A && b(1) == 0x45 && b(2) == 0xDF && b(3) == 0xA3) {
+            return "video/webm"
+        }
+        // AVI: "RIFF" .... "AVI "
+        if (length >= 12 && b(0) == 0x52 && b(1) == 0x49 && b(2) == 0x46 && b(3) == 0x46
+            && b(8) == 0x41 && b(9) == 0x56 && b(10) == 0x49 && b(11) == 0x20) {
+            return "video/x-msvideo"
+        }
+        // FLV: "FLV"
+        if (length >= 3 && b(0) == 0x46 && b(1) == 0x4C && b(2) == 0x56) {
+            return "video/x-flv"
+        }
+
         return null
     }
 
@@ -107,5 +134,33 @@ object ImageMimeUtils {
         if (mime.lowercase().contains("gif")) return true
         val lower = url.lowercase().substringBefore('?').substringBefore('#')
         return lower.endsWith(".gif")
+    }
+
+    // ---------- Video support ----------
+
+    fun isVideoMime(mime: String): Boolean =
+        mime.lowercase().substringBefore(";").trim().startsWith("video/")
+
+    fun isVideoUrl(url: String): Boolean = videoMimeFromUrl(url) != null
+
+    fun videoMimeFromUrl(url: String): String? {
+        if (url.isBlank()) return null
+        val lower = url.lowercase().substringBefore('?').substringBefore('#')
+        return when {
+            lower.endsWith(".mp4") -> "video/mp4"
+            lower.endsWith(".m4v") -> "video/mp4"
+            lower.endsWith(".webm") -> "video/webm"
+            lower.endsWith(".mov") -> "video/quicktime"
+            lower.endsWith(".mkv") -> "video/x-matroska"
+            lower.endsWith(".avi") -> "video/x-msvideo"
+            lower.endsWith(".ogv") -> "video/ogg"
+            lower.endsWith(".3gp") -> "video/3gpp"
+            lower.endsWith(".flv") -> "video/x-flv"
+            lower.endsWith(".wmv") -> "video/x-ms-wmv"
+            lower.endsWith(".mpg") || lower.endsWith(".mpeg") -> "video/mpeg"
+            lower.endsWith(".ts") -> "video/mp2t"
+            lower.contains(".m3u8") -> "application/vnd.apple.mpegurl"
+            else -> null
+        }
     }
 }

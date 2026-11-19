@@ -42,7 +42,11 @@ data class PinEntity(
     val mimeType: String = "image/jpeg",
     val sourceDomain: String = "",
     val isBrokenOrUnreachable: Boolean = false,
-    val albumId: String? = null
+    val albumId: String? = null,
+    val videoUrl: String? = null,
+    val isVideo: Boolean = false,
+    val hasSeparateThumbnail: Boolean = false,
+    val videoMimeType: String = ""
 ) {
     fun toPinItem(): PinItem = PinItem(
         id = id,
@@ -69,7 +73,11 @@ data class PinEntity(
         mimeType = mimeType,
         sourceDomain = sourceDomain,
         isBrokenOrUnreachable = isBrokenOrUnreachable,
-        albumId = albumId
+        albumId = albumId,
+        videoUrl = videoUrl,
+        isVideo = isVideo,
+        hasSeparateThumbnail = hasSeparateThumbnail,
+        videoMimeType = videoMimeType
     )
 
     companion object {
@@ -100,7 +108,11 @@ data class PinEntity(
             mimeType = item.mimeType,
             sourceDomain = item.sourceDomain,
             isBrokenOrUnreachable = item.isBrokenOrUnreachable,
-            albumId = item.albumId
+            albumId = item.albumId,
+            videoUrl = item.videoUrl,
+            isVideo = item.isVideo,
+            hasSeparateThumbnail = item.hasSeparateThumbnail,
+            videoMimeType = item.videoMimeType
         )
     }
 }

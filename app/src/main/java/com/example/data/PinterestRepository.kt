@@ -620,12 +620,44 @@ class PinterestRepository {
         val pinAuthor = cleanSpecialText(extractOriginalUploader(pObj, ownerName.ifBlank { username }))
         val pinDate = extractPinTimestamp(pObj, currentCount)
 
+        // Pinterest video detection
+        var detectedVideoUrl: String? = null
+        var detectedVideoMime = ""
+        val videosObj = pObj.optJSONObject("videos")
+        if (videosObj != null) {
+            val vlist = videosObj.optJSONObject("video_list")
+            if (vlist != null) {
+                for (pref in listOf("V_720P", "V_540P", "V_HLSV4", "V_HLSV3_MOBILE")) {
+                    val vu = vlist.optJSONObject(pref)?.optString("url", "") ?: continue
+                    if (vu.isNotBlank()) {
+                        detectedVideoUrl = vu
+                        detectedVideoMime = if (vu.contains(".m3u8")) "application/vnd.apple.mpegurl" else "video/mp4"
+                        break
+                    }
+                }
+                if (detectedVideoUrl == null) {
+                    val vk = vlist.keys()
+                    while (vk.hasNext()) {
+                        val vu = vlist.optJSONObject(vk.next())?.optString("url", "") ?: continue
+                        if (vu.isNotBlank()) {
+                            detectedVideoUrl = vu
+                            detectedVideoMime = if (vu.contains(".m3u8")) "application/vnd.apple.mpegurl" else "video/mp4"
+                            break
+                        }
+                    }
+                }
+            }
+        }
+        val pinIsVideo = detectedVideoUrl != null
+        val thumbUrlForPin = if (pinIsVideo && highResUrl.isNotBlank()) highResUrl else highResUrl
+        val hasSeparateThumbForPin = pinIsVideo && highResUrl.isNotBlank()
+
         return PinItem(
             id = pinId,
             title = pTitle,
             description = pDesc,
-            imageUrl = highResUrl,
-            thumbnailUrl = thumbUrl,
+            imageUrl = thumbUrlForPin,
+            thumbnailUrl = thumbUrlForPin,
             author = pinAuthor,
             boardName = boardTitle,
             sourceUrl = pLink,
@@ -636,7 +668,11 @@ class PinterestRepository {
             likesCount = (saves * 0.4).toInt().coerceAtLeast(0),
             fileSizeKb = (200..1200).random().toLong(),
             mimeType = com.example.util.ImageLinkResolver.guessMimeType(highResUrl),
-            boardPosition = currentCount
+            boardPosition = currentCount,
+            videoUrl = detectedVideoUrl,
+            isVideo = pinIsVideo,
+            hasSeparateThumbnail = hasSeparateThumbForPin,
+            videoMimeType = detectedVideoMime
         )
     }
 

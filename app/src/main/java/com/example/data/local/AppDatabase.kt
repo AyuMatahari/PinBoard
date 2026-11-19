@@ -14,7 +14,7 @@ import androidx.room.RoomDatabase
         PinEventEntity::class,
         CustomAlbumEntity::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -86,17 +86,44 @@ abstract class AppDatabase : RoomDatabase() {
             db.execSQL("CREATE INDEX IF NOT EXISTS `index_custom_albums_dateAddedMillis` ON `custom_albums` (`dateAddedMillis`)")
         }
 
-        val MIGRATION_1_5 = object : androidx.room.migration.Migration(1, 5) {
-            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion5(db)
+        private fun migrateToVersion6(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+            // Ensure v5 schema exists first (idempotent)
+            migrateToVersion5(db)
+            // Add v6 columns, checking existing first (idempotent)
+            val existingCols = mutableSetOf<String>()
+            try {
+                val cursor = db.query("PRAGMA table_info(pins)")
+                while (cursor.moveToNext()) existingCols.add(cursor.getString(1).lowercase())
+                cursor.close()
+            } catch (_: Throwable) {}
+            if (!existingCols.contains("videourl")) {
+                try { db.execSQL("ALTER TABLE `pins` ADD COLUMN `videoUrl` TEXT DEFAULT NULL") } catch (_: Throwable) {}
+            }
+            if (!existingCols.contains("isvideo")) {
+                try { db.execSQL("ALTER TABLE `pins` ADD COLUMN `isVideo` INTEGER NOT NULL DEFAULT 0") } catch (_: Throwable) {}
+            }
+            if (!existingCols.contains("hasseparatethumbnail")) {
+                try { db.execSQL("ALTER TABLE `pins` ADD COLUMN `hasSeparateThumbnail` INTEGER NOT NULL DEFAULT 0") } catch (_: Throwable) {}
+            }
+            if (!existingCols.contains("videomimetype")) {
+                try { db.execSQL("ALTER TABLE `pins` ADD COLUMN `videoMimeType` TEXT NOT NULL DEFAULT ''") } catch (_: Throwable) {}
+            }
         }
-        val MIGRATION_2_5 = object : androidx.room.migration.Migration(2, 5) {
-            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion5(db)
+
+        val MIGRATION_1_6 = object : androidx.room.migration.Migration(1, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion6(db)
         }
-        val MIGRATION_3_5 = object : androidx.room.migration.Migration(3, 5) {
-            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion5(db)
+        val MIGRATION_2_6 = object : androidx.room.migration.Migration(2, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion6(db)
         }
-        val MIGRATION_4_5 = object : androidx.room.migration.Migration(4, 5) {
-            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion5(db)
+        val MIGRATION_3_6 = object : androidx.room.migration.Migration(3, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion6(db)
+        }
+        val MIGRATION_4_6 = object : androidx.room.migration.Migration(4, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion6(db)
+        }
+        val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) = migrateToVersion6(db)
         }
 
         fun getDatabase(context: Context): AppDatabase {
@@ -106,7 +133,7 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "pinboard_gallery_database"
                 )
-                    .addMigrations(MIGRATION_1_5, MIGRATION_2_5, MIGRATION_3_5, MIGRATION_4_5)
+                    .addMigrations(MIGRATION_1_6, MIGRATION_2_6, MIGRATION_3_6, MIGRATION_4_6, MIGRATION_5_6)
                     .fallbackToDestructiveMigration(dropAllTables = true)
                     .fallbackToDestructiveMigrationOnDowngrade(dropAllTables = true)
 

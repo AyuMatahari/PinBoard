@@ -1366,6 +1366,7 @@ fun PinBoardGalleryScreen(
                     onDeleteSingle = { pin -> viewModel.deleteSinglePin(pin) },
                     onClose = { viewModel.closeFullscreen() },
                     onDownloadSingle = { pin -> viewModel.downloadSingle(context, pin) }
+                    onPlayVideo = { p -> viewModel.playVideo(context, p) }
                 )
             }
 

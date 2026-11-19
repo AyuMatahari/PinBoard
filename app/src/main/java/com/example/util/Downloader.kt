@@ -57,6 +57,7 @@ object Downloader {
         withContext(Dispatchers.IO) { downloadSinglePinInternal(context, pin) }
 
     private fun downloadSinglePinInternal(context: Context, pin: PinItem): Boolean {
+        if (pin.isVideo) return downloadVideoInternal(context, pin)
         try {
             val candidateUrls = listOf(pin.imageUrl, pin.thumbnailUrl).filter { it.isNotBlank() }.distinct()
             var responseBody: okhttp3.ResponseBody? = null
@@ -134,4 +135,67 @@ object Downloader {
             return false
         }
     }
+    private fun downloadVideoInternal(context: Context, pin: PinItem): Boolean {
+        try {
+            val videoUrl = pin.videoUrl ?: pin.imageUrl
+            if (videoUrl.isBlank()) return false
+            val mime = pin.videoMimeType.ifBlank {
+                ImageMimeUtils.videoMimeFromUrl(videoUrl) ?: "video/mp4"
+            }
+            val ext = when {
+                mime.contains("webm") -> "webm"
+                mime.contains("quicktime") || mime.contains("mov") -> "mov"
+                mime.contains("matroska") -> "mkv"
+                mime.contains("avi") -> "avi"
+                mime.contains("ogg") -> "ogv"
+                mime.contains("3gpp") -> "3gp"
+                mime.contains("mp2t") || videoUrl.contains(".ts") -> "ts"
+                else -> "mp4"
+            }
+            val sanitizedTitle = pin.title.take(30)
+                .replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                .trim('_')
+                .ifBlank { "video" }
+            val fileName = "Pinterest_${sanitizedTitle}_${pin.id}.$ext"
+            val request = Request.Builder()
+                .url(videoUrl)
+                .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:109.0)")
+                .build()
+            val response = client.newCall(request).execute()
+            if (!response.isSuccessful || response.body == null) return false
+            val input = response.body!!.byteStream()
+            return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                    put(MediaStore.MediaColumns.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_DOWNLOADS}/$FOLDER_NAME")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+                val resolver = context.contentResolver
+                val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                    ?: resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    resolver.openOutputStream(uri)?.use { out: OutputStream -> input.copyTo(out) }
+                    values.clear()
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(uri, values, null, null)
+                    true
+                } else false
+            } else {
+                val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val targetDir = File(downloadsDir, FOLDER_NAME)
+                if (!targetDir.exists()) targetDir.mkdirs()
+                val outputFile = File(targetDir, fileName)
+                FileOutputStream(outputFile).use { out -> input.copyTo(out) }
+                MediaScannerConnection.scanFile(context,
+                    arrayOf(outputFile.absolutePath), arrayOf(mime), null)
+                true
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return false
+        }
+    }
+
 }

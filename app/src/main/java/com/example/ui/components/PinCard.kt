@@ -22,12 +22,17 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BrokenImage
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -92,9 +97,25 @@ fun PinCard(
             }
         }
 
-        val isAnimatedGif = com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)
-        val cardImageUrl = if (isAnimatedGif) pin.imageUrl.ifBlank { pin.thumbnailUrl }
-                           else pin.thumbnailUrl.ifBlank { pin.imageUrl }
+        // Video thumbnail state
+        var extractedVideoThumb by remember(pin.id) { mutableStateOf<java.io.File?>(null) }
+        var videoThumbFailed by remember(pin.id) { mutableStateOf(false) }
+        LaunchedEffect(pin.id, pin.isVideo, pin.hasSeparateThumbnail) {
+            if (pin.isVideo && !pin.hasSeparateThumbnail && extractedVideoThumb == null && !videoThumbFailed) {
+                val f = com.example.util.VideoThumbnailCache.getOrExtract(context, pin)
+                if (f == null) videoThumbFailed = true else extractedVideoThumb = f
+            }
+        }
+
+        // Choose effective image model
+        val effectiveImageModel: Any? = when {
+            pin.isVideo && pin.hasSeparateThumbnail -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
+            pin.isVideo -> extractedVideoThumb
+            else -> {
+                val isG = com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)
+                if (isG) pin.imageUrl.ifBlank { pin.thumbnailUrl } else pin.thumbnailUrl.ifBlank { pin.imageUrl }
+            }
+        }
 
         // Image Container with safe aspect ratio
         Box(
@@ -121,6 +142,44 @@ fun PinCard(
                     .matchParentSize()
                     .clip(cardShape)
             )
+            } else {
+                // Video without thumbnail — placeholder
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(PinterestPillGray),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "Video",
+                        tint = PinterestTextSecondary,
+                        modifier = Modifier.size(36.dp)
+                    )
+                }
+            }
+
+            // Video play icon (top-left, masonry indicator, not a button)
+            if (pin.isVideo && !isSelectionMode) {
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(6.dp)
+                        .size(28.dp)
+                        .clip(CircleShape)
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .border(1.5.dp, Color.White, CircleShape)
+                        .testTag("pin_video_badge_${pin.id}"),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.PlayArrow,
+                        contentDescription = "Video",
+                        tint = Color.White,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+            }
 
             // Selection indicator badge
             if (isSelectionMode) {

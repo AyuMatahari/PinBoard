@@ -2674,6 +2674,38 @@ class PinBoardViewModel(
         }
     }
 
+    fun playVideo(context: Context, pin: PinItem) {
+        if (!pin.isVideo) return
+        viewModelScope.launch {
+            _snackbarMessage.value = "Downloading video..."
+            val file = com.example.util.VideoThumbnailCache.downloadVideo(context, pin)
+            if (file == null) {
+                _snackbarMessage.value = "Failed to download video"
+                return@launch
+            }
+            try {
+                val uri = androidx.core.content.FileProvider.getUriForFile(
+                    context,
+                    "${context.packageName}.fileprovider",
+                    file
+                )
+                val mime = pin.videoMimeType.ifBlank {
+                    com.example.util.ImageMimeUtils.videoMimeFromUrl(pin.videoUrl ?: pin.imageUrl)
+                        ?: "video/*"
+                }
+                val intent = android.content.Intent(android.content.Intent.ACTION_VIEW).apply {
+                    setDataAndType(uri, mime)
+                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                context.startActivity(android.content.Intent.createChooser(intent, "Play video"))
+                _snackbarMessage.value = null
+            } catch (e: Exception) {
+                _snackbarMessage.value = "No app installed to play this video"
+            }
+        }
+    }
+
     fun downloadSingle(context: Context, pin: PinItem) {
         viewModelScope.launch {
             _snackbarMessage.value = "Saving image to PinterestViewerDownloads..."

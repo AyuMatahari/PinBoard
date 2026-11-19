@@ -27,7 +27,12 @@ data class PinItem(
     val mimeType: String = "image/jpeg",
     val sourceDomain: String = "",
     val isBrokenOrUnreachable: Boolean = false,
-    val albumId: String? = null
+    val albumId: String? = null,
+    // Video support
+    val videoUrl: String? = null,
+    val isVideo: Boolean = false,
+    val hasSeparateThumbnail: Boolean = false,
+    val videoMimeType: String = ""
 ) {
     val aspectRatio: Float
         get() = if (height > 0 && width > 0) {
