@@ -510,17 +510,22 @@ private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Pair<Uri
             .url(pin.imageUrl)
             .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:109.0)")
             .build()
-        val response = client.newCall(request).execute()
-        response.use { resp ->
+        client.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful || resp.body == null) return@withContext null
             val contentTypeHeader = resp.header("Content-Type")
-            val mime = com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, contentTypeHeader)
+            val raw = resp.body!!.byteStream()
+            val pushback = java.io.PushbackInputStream(raw, 32)
+            val hdr = ByteArray(16)
+            val n = try { pushback.read(hdr, 0, 16) } catch (_: Exception) { -1 }
+            if (n > 0) { try { pushback.unread(hdr, 0, n) } catch (_: Exception) {} }
+            val mime = com.example.util.ImageMimeUtils.resolveMime(
+                pin.mimeType, pin.imageUrl, contentTypeHeader,
+                if (n > 0) hdr else null, if (n > 0) n else 0
+            )
             val ext = com.example.util.ImageMimeUtils.extensionFor(mime)
             val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
             val file = File(cacheDir, "share_${pin.id.take(20)}.$ext")
-            resp.body!!.byteStream().use { input ->
-                FileOutputStream(file).use { out -> input.copyTo(out) }
-            }
+            FileOutputStream(file).use { out -> pushback.copyTo(out) }
             FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file) to mime
         }
     } catch (_: Exception) {

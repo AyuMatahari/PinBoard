@@ -34,10 +34,12 @@ object ImageCacheManager {
         val imageLoader = ImageLoader.Builder(context)
             .components {
                 try {
-                    add(coil.gif.GifDecoder.Factory())
-                } catch (_: Throwable) {
-                    // coil-gif unavailable — static decoding only
-                }
+                    if (android.os.Build.VERSION.SDK_INT >= 28) {
+                        add(coil.decode.ImageDecoderDecoder.Factory())
+                    } else {
+                        add(coil.decode.GifDecoder.Factory())
+                    }
+                } catch (_: Throwable) {}
             }
             .diskCache {
                 DiskCache.Builder()

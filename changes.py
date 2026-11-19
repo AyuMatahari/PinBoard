@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — full GIF support (download/share/masonry/fullscreen)
+PinBoard Gallery — fix coil.decode package + magic-byte sniff fallback
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,34 +72,84 @@ def tool_available(name):
 
 
 # ============================================================
-# NEW FILE: ImageMimeUtils.kt
+# NEW ImageMimeUtils.kt (with magic-byte sniff)
 # ============================================================
 NEW_IMAGE_MIME_UTILS = r'''package com.example.util
 
 /**
- * Centralised MIME / extension resolution for images.
+ * MIME / extension resolution with magic-byte fallback.
  *
  * Priority (highest → lowest):
- *   1. HTTP Content-Type header (authoritative — reflects actual bytes)
- *   2. pin.mimeType if it isn't the default "image/jpeg"
- *   3. URL extension
- *   4. "image/jpeg" fallback
- *
- * This is what makes GIFs survive round-trips: Pinterest's CDN may serve
- * .jpg-named URLs that return `Content-Type: image/gif`, so we always
- * believe the actual server response over the filename.
+ *   1. Magic-byte sniff       (ground truth — actual image bytes)
+ *   2. HTTP Content-Type      (server's claim)
+ *   3. pin.mimeType           (cached, if not default)
+ *   4. URL extension
+ *   5. "image/jpeg"           (final fallback)
  */
 object ImageMimeUtils {
 
-    fun resolveMime(pinMime: String, imageUrl: String, contentTypeHeader: String? = null): String {
-        if (!contentTypeHeader.isNullOrBlank() && contentTypeHeader.startsWith("image/", ignoreCase = true)) {
-            return contentTypeHeader.substringBefore(";").trim().lowercase()
+    fun resolveMime(
+        pinMime: String,
+        imageUrl: String,
+        contentTypeHeader: String? = null,
+        sampleBytes: ByteArray? = null,
+        sampleLength: Int = 0
+    ): String {
+        // 1. Magic bytes
+        if (sampleBytes != null && sampleLength > 0) {
+            sniffMimeFromBytes(sampleBytes, sampleLength)?.let { return it }
         }
+        // 2. Content-Type header
+        if (!contentTypeHeader.isNullOrBlank()) {
+            val ct = contentTypeHeader.substringBefore(";").trim().lowercase()
+            if (ct.startsWith("image/")) return ct
+        }
+        // 3. pin.mimeType
         val pm = pinMime.lowercase().substringBefore(";").trim()
-        if (pm.isNotBlank() && pm != "image/jpeg") return pm
-        val fromUrl = mimeFromUrl(imageUrl)
-        if (fromUrl != null) return fromUrl
-        return pm.ifBlank { "image/jpeg" }
+        if (pm.startsWith("image/") && pm != "image/jpeg") return pm
+        // 4. URL
+        mimeFromUrl(imageUrl)?.let { return it }
+        // 5. jpg fallback
+        return "image/jpeg"
+    }
+
+    fun sniffMimeFromBytes(bytes: ByteArray, length: Int): String? {
+        if (length < 2) return null
+        fun b(i: Int): Int = bytes[i].toInt() and 0xFF
+
+        // JPEG: FF D8 FF
+        if (length >= 3 && b(0) == 0xFF && b(1) == 0xD8 && b(2) == 0xFF) return "image/jpeg"
+
+        // PNG: 89 50 4E 47 0D 0A 1A 0A
+        if (length >= 8 && b(0) == 0x89 && b(1) == 0x50 && b(2) == 0x4E && b(3) == 0x47
+            && b(4) == 0x0D && b(5) == 0x0A && b(6) == 0x1A && b(7) == 0x0A) return "image/png"
+
+        // GIF: 'GIF8' (GIF87a / GIF89a)
+        if (length >= 4 && b(0) == 0x47 && b(1) == 0x49 && b(2) == 0x46 && b(3) == 0x38) return "image/gif"
+
+        // WebP: 'RIFF' ..... 'WEBP'
+        if (length >= 12 && b(0) == 0x52 && b(1) == 0x49 && b(2) == 0x46 && b(3) == 0x46
+            && b(8) == 0x57 && b(9) == 0x45 && b(10) == 0x42 && b(11) == 0x50) return "image/webp"
+
+        // BMP: 'BM'
+        if (b(0) == 0x42 && b(1) == 0x4D) return "image/bmp"
+
+        // AVIF / HEIC: ....'ftyp'brand
+        if (length >= 12 && b(4) == 0x66 && b(5) == 0x74 && b(6) == 0x79 && b(7) == 0x70) {
+            val brand = String(bytes, 8, 4, Charsets.US_ASCII)
+            when (brand) {
+                "avif", "avis" -> return "image/avif"
+                "heic", "heix", "heif", "mif1", "msf1" -> return "image/heic"
+            }
+        }
+
+        // SVG (loose — starts with '<svg' or '<?xml')
+        if (length >= 4) {
+            val head = String(bytes, 0, minOf(length, 64), Charsets.US_ASCII).trimStart()
+            if (head.startsWith("<svg", ignoreCase = true)) return "image/svg+xml"
+        }
+
+        return null
     }
 
     fun mimeFromUrl(url: String): String? {
@@ -138,8 +188,19 @@ object ImageMimeUtils {
 '''
 
 
+def patch_image_mime_utils():
+    log("\n=== PATCH: ImageMimeUtils (magic-byte sniff) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageMimeUtils.kt"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    t = f.read_text(encoding="utf-8") if f.exists() else ""
+    if "fun sniffMimeFromBytes" in t:
+        log("  ✓ already has sniff"); return
+    f.write_text(NEW_IMAGE_MIME_UTILS, encoding="utf-8")
+    log("  ✓ rewritten with sniffMimeFromBytes")
+
+
 # ============================================================
-# NEW FILE: Downloader.kt (full rewrite — content-type aware)
+# NEW Downloader.kt (sniff-aware)
 # ============================================================
 NEW_DOWNLOADER = r'''package com.example.util
 
@@ -157,8 +218,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.io.OutputStream
+import java.io.PushbackInputStream
 import java.util.concurrent.TimeUnit
 
 data class DownloadProgress(
@@ -187,22 +248,17 @@ object Downloader {
         var successCount = 0
         val total = pins.size
         pins.forEachIndexed { index, pin ->
-            onProgress(
-                DownloadProgress(
-                    current = index + 1,
-                    total = total,
-                    currentPinTitle = pin.title.ifBlank { "Pin #${pin.id}" }
-                )
-            )
+            onProgress(DownloadProgress(current = index + 1, total = total,
+                currentPinTitle = pin.title.ifBlank { "Pin #${pin.id}" }))
             if (downloadSinglePinInternal(context, pin)) successCount++
         }
-        onProgress(DownloadProgress(current = total, total = total, currentPinTitle = "Done", isComplete = true))
+        onProgress(DownloadProgress(current = total, total = total,
+            currentPinTitle = "Done", isComplete = true))
         successCount
     }
 
-    suspend fun downloadSinglePin(context: Context, pin: PinItem): Boolean = withContext(Dispatchers.IO) {
-        downloadSinglePinInternal(context, pin)
-    }
+    suspend fun downloadSinglePin(context: Context, pin: PinItem): Boolean =
+        withContext(Dispatchers.IO) { downloadSinglePinInternal(context, pin) }
 
     private fun downloadSinglePinInternal(context: Context, pin: PinItem): Boolean {
         try {
@@ -227,58 +283,54 @@ object Downloader {
             }
             if (responseBody == null) return false
 
-            val resolvedMime = ImageMimeUtils.resolveMime(pin.mimeType, chosenUrl, contentTypeHeader)
+            // Peek first 16 bytes for magic-byte sniffing, then unread
+            val raw = responseBody.byteStream()
+            val pushback = PushbackInputStream(raw, 32)
+            val sample = ByteArray(16)
+            val sampleLen = try { pushback.read(sample, 0, 16) } catch (_: Exception) { -1 }
+            if (sampleLen > 0) {
+                try { pushback.unread(sample, 0, sampleLen) } catch (_: Exception) {}
+            }
+
+            val resolvedMime = ImageMimeUtils.resolveMime(
+                pin.mimeType, chosenUrl, contentTypeHeader,
+                if (sampleLen > 0) sample else null,
+                if (sampleLen > 0) sampleLen else 0
+            )
             val extension = ImageMimeUtils.extensionFor(resolvedMime)
 
-            val sanitizedTitle = pin.title
-                .take(30)
+            val sanitizedTitle = pin.title.take(30)
                 .replace(Regex("[^a-zA-Z0-9_-]"), "_")
                 .trim('_')
                 .ifBlank { "pin" }
             val fileName = "Pinterest_${sanitizedTitle}_${pin.id}.$extension"
 
-            val inputStream: InputStream = responseBody.byteStream()
-
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
                     put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
-                    put(
-                        MediaStore.MediaColumns.RELATIVE_PATH,
-                        "${Environment.DIRECTORY_DOWNLOADS}/$FOLDER_NAME"
-                    )
+                    put(MediaStore.MediaColumns.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_DOWNLOADS}/$FOLDER_NAME")
                     put(MediaStore.MediaColumns.IS_PENDING, 1)
                 }
-
                 val resolver = context.contentResolver
                 val uri: Uri? = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                     ?: resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-
                 if (uri != null) {
-                    resolver.openOutputStream(uri)?.use { outputStream: OutputStream ->
-                        inputStream.copyTo(outputStream)
-                    }
+                    resolver.openOutputStream(uri)?.use { out: OutputStream -> pushback.copyTo(out) }
                     values.clear()
                     values.put(MediaStore.MediaColumns.IS_PENDING, 0)
                     resolver.update(uri, values, null, null)
                     true
-                } else {
-                    false
-                }
+                } else false
             } else {
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                 val targetDir = File(downloadsDir, FOLDER_NAME)
                 if (!targetDir.exists()) targetDir.mkdirs()
                 val outputFile = File(targetDir, fileName)
-                FileOutputStream(outputFile).use { outputStream ->
-                    inputStream.copyTo(outputStream)
-                }
-                MediaScannerConnection.scanFile(
-                    context,
-                    arrayOf(outputFile.absolutePath),
-                    arrayOf(resolvedMime),
-                    null
-                )
+                FileOutputStream(outputFile).use { out -> pushback.copyTo(out) }
+                MediaScannerConnection.scanFile(context,
+                    arrayOf(outputFile.absolutePath), arrayOf(resolvedMime), null)
                 true
             }
         } catch (e: Exception) {
@@ -290,303 +342,212 @@ object Downloader {
 '''
 
 
-def write_image_mime_utils():
-    log("\n=== PATCH: new ImageMimeUtils.kt ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageMimeUtils.kt"
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(NEW_IMAGE_MIME_UTILS, encoding="utf-8")
-    log("  ✓ created")
-
-
-def write_downloader():
-    log("\n=== PATCH: rewrite Downloader.kt (content-type aware) ===")
+def patch_downloader():
+    log("\n=== PATCH: Downloader (sniff) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/util/Downloader.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    if "PushbackInputStream" in t and "sniffMimeFromBytes" not in t and "ImageMimeUtils.resolveMime" in t and "sample" in t:
+        # Already sniff-aware (from this patch) — check marker
+        pass
+    if "PushbackInputStream(raw, 32)" in t:
+        log("  ✓ already sniff-aware"); return
     f.write_text(NEW_DOWNLOADER, encoding="utf-8")
     log("  ✓ written")
 
 
 # ============================================================
-# gradle: add coil-gif dependency
-# ============================================================
-def patch_gradle_versions():
-    log("\n=== PATCH: libs.versions.toml (coil-gif) ===")
-    f = PROJECT_ROOT / "gradle/libs.versions.toml"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if "coil-gif" in t:
-        log("  ✓ already present"); return
-
-    # Add version entry after coilCompose
-    t = t.replace(
-        'coilCompose = "2.7.0"\n',
-        'coilCompose = "2.7.0"\ncoilGif = "2.7.0"\n',
-        1,
-    )
-    # Add library entry after coil-compose
-    t = t.replace(
-        'coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coilCompose" }\n',
-        'coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coilCompose" }\n'
-        'coil-gif = { group = "io.coil-kt", name = "coil-gif", version.ref = "coilGif" }\n',
-        1,
-    )
-
-    if "coil-gif" in t:
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ coil-gif added")
-    else:
-        log("  ✗ anchor mismatch"); sys.exit(1)
-
-
-def patch_app_build_gradle():
-    log("\n=== PATCH: app/build.gradle.kts (coil-gif) ===")
-    f = PROJECT_ROOT / "app/build.gradle.kts"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if "libs.coil.gif" in t:
-        log("  ✓ already present"); return
-
-    anchor = "  implementation(libs.coil.compose)\n"
-    if anchor in t:
-        t = t.replace(anchor, anchor + "  implementation(libs.coil.gif)\n", 1)
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ implementation added")
-    else:
-        log("  ✗ anchor missing"); sys.exit(1)
-
-
-# ============================================================
-# ImageCacheManager: register GifDecoder
+# ImageCacheManager — fix coil.decode package
 # ============================================================
 def patch_image_cache_manager():
-    log("\n=== PATCH: ImageCacheManager (GifDecoder) ===")
+    log("\n=== PATCH: ImageCacheManager (coil.decode fix) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageCacheManager.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    if "GifDecoder.Factory" in t:
-        log("  ✓ already registered"); return
+    # Detect the previous (buggy) block
+    buggy = (
+        "            .components {\n"
+        "                try {\n"
+        "                    add(coil.gif.GifDecoder.Factory())\n"
+        "                } catch (_: Throwable) {\n"
+        "                    // coil-gif unavailable — static decoding only\n"
+        "                }\n"
+        "            }\n"
+    )
+    fixed = (
+        "            .components {\n"
+        "                try {\n"
+        "                    if (android.os.Build.VERSION.SDK_INT >= 28) {\n"
+        "                        add(coil.decode.ImageDecoderDecoder.Factory())\n"
+        "                    } else {\n"
+        "                        add(coil.decode.GifDecoder.Factory())\n"
+        "                    }\n"
+        "                } catch (_: Throwable) {}\n"
+        "            }\n"
+    )
 
+    if fixed in t:
+        log("  ✓ already fixed"); return
+
+    if buggy in t:
+        t = t.replace(buggy, fixed, 1)
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ coil.gif → coil.decode + ImageDecoderDecoder (API 28+)")
+        return
+
+    # Fallback: try any string that mentions coil.gif.GifDecoder
+    if "coil.gif.GifDecoder" in t:
+        t = t.replace(
+            "add(coil.gif.GifDecoder.Factory())",
+            "if (android.os.Build.VERSION.SDK_INT >= 28) {\n"
+            "                        add(coil.decode.ImageDecoderDecoder.Factory())\n"
+            "                    } else {\n"
+            "                        add(coil.decode.GifDecoder.Factory())\n"
+            "                    }",
+            1,
+        )
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ fixed via fallback (line substitution)")
+        return
+
+    # Fallback: no components block at all — insert it
     anchor = "        val imageLoader = ImageLoader.Builder(context)\n"
     if anchor in t:
         t = t.replace(
             anchor,
-            anchor +
-            "            .components {\n"
-            "                try {\n"
-            "                    add(coil.gif.GifDecoder.Factory())\n"
-            "                } catch (_: Throwable) {\n"
-            "                    // coil-gif unavailable — static decoding only\n"
-            "                }\n"
-            "            }\n",
+            anchor + (
+                "            .components {\n"
+                "                try {\n"
+                "                    if (android.os.Build.VERSION.SDK_INT >= 28) {\n"
+                "                        add(coil.decode.ImageDecoderDecoder.Factory())\n"
+                "                    } else {\n"
+                "                        add(coil.decode.GifDecoder.Factory())\n"
+                "                    }\n"
+                "                } catch (_: Throwable) {}\n"
+                "            }\n"
+            ),
             1,
         )
         f.write_text(t, encoding="utf-8")
-        log("  ✓ GifDecoder registered")
+        log("  ✓ components block inserted")
     else:
-        log("  ✗ anchor missing"); sys.exit(1)
+        log("  ✗ anchor missing — inspect manually")
 
 
 # ============================================================
-# CopyOrMoveImagesDialog: mime-aware save/share
+# CopyOrMoveImagesDialog — sniff in downloadToCacheUri
 # ============================================================
-def patch_copy_move_dialog():
-    log("\n=== PATCH: CopyOrMoveImagesDialog (mime-aware) ===")
+def patch_copy_move_sniff():
+    log("\n=== PATCH: CopyOrMoveImagesDialog (sniff) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
-    changed = False
 
-    # 1. Replace downloadToCacheUri (returns Pair<Uri, String>?)
-    old_dl = (
-        "private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Uri? = withContext(Dispatchers.IO) {\n"
-        "    try {\n"
-        "        val client = OkHttpClient()\n"
-        "        val request = Request.Builder().url(pin.imageUrl).build()\n"
-        "        val response = client.newCall(request).execute()\n"
-        "        if (!response.isSuccessful || response.body == null) return@withContext null\n"
-        "\n"
-        "        val cacheDir = File(context.cacheDir, \"shared_images\").apply { if (!exists()) mkdirs() }\n"
-        "        val file = File(cacheDir, \"share_${pin.id.take(20)}.jpg\")\n"
-        "        FileOutputStream(file).use { out ->\n"
-        "            response.body!!.byteStream().copyTo(out)\n"
-        "        }\n"
-        "\n"
-        "        FileProvider.getUriForFile(context, \"${context.packageName}.fileprovider\", file)\n"
-        "    } catch (_: Exception) {\n"
-        "        null\n"
-        "    }\n"
-        "}\n"
-    )
-    new_dl = (
-        "private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {\n"
-        "    try {\n"
-        "        val client = OkHttpClient()\n"
-        "        val request = Request.Builder()\n"
-        "            .url(pin.imageUrl)\n"
-        "            .header(\"User-Agent\", \"Mozilla/5.0 (Android; Mobile; rv:109.0)\")\n"
-        "            .build()\n"
-        "        val response = client.newCall(request).execute()\n"
-        "        response.use { resp ->\n"
-        "            if (!resp.isSuccessful || resp.body == null) return@withContext null\n"
-        "            val contentTypeHeader = resp.header(\"Content-Type\")\n"
-        "            val mime = com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, contentTypeHeader)\n"
-        "            val ext = com.example.util.ImageMimeUtils.extensionFor(mime)\n"
-        "            val cacheDir = File(context.cacheDir, \"shared_images\").apply { if (!exists()) mkdirs() }\n"
-        "            val file = File(cacheDir, \"share_${pin.id.take(20)}.$ext\")\n"
-        "            resp.body!!.byteStream().use { input ->\n"
-        "                FileOutputStream(file).use { out -> input.copyTo(out) }\n"
-        "            }\n"
-        "            FileProvider.getUriForFile(context, \"${context.packageName}.fileprovider\", file) to mime\n"
-        "        }\n"
-        "    } catch (_: Exception) {\n"
-        "        null\n"
-        "    }\n"
-        "}\n"
-    )
-    if old_dl in t:
-        t = t.replace(old_dl, new_dl, 1); changed = True
-        log("  ✓ downloadToCacheUri rewritten")
-    else:
-        log("  ⚠ downloadToCacheUri anchor missing")
+    if "PushbackInputStream" in t and "sniffMimeFromBytes" not in t and "sample" in t and "downloadToCacheUri" in t and "hdr" in t:
+        pass
+    if "PushbackInputStream(raw, 32)" in t:
+        log("  ✓ already sniff-aware"); return
 
-    # 2. Copy call site (first pin)
-    old_copy = (
-        "                                    val firstPin = selectedPins.firstOrNull()\n"
-        "                                    if (firstPin != null) {\n"
-        "                                        val uri = downloadToCacheUri(context, firstPin)\n"
-        "                                        if (uri != null) {\n"
-        "                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager\n"
-        "                                            val clip = ClipData.newUri(context.contentResolver, \"Image\", uri)\n"
-        "                                            clipboard.setPrimaryClip(clip)\n"
-        "                                            Toast.makeText(context, \"Copied image to clipboard\", Toast.LENGTH_SHORT).show()\n"
-        "                                        } else {\n"
-        "                                            Toast.makeText(context, \"Failed to copy image\", Toast.LENGTH_SHORT).show()\n"
-        "                                        }\n"
-        "                                    }\n"
-    )
-    new_copy = (
-        "                                    val firstPin = selectedPins.firstOrNull()\n"
-        "                                    if (firstPin != null) {\n"
-        "                                        val pair = downloadToCacheUri(context, firstPin)\n"
-        "                                        if (pair != null) {\n"
-        "                                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager\n"
-        "                                            val clip = ClipData.newUri(context.contentResolver, \"Image\", pair.first)\n"
-        "                                            clipboard.setPrimaryClip(clip)\n"
-        "                                            Toast.makeText(context, \"Copied image to clipboard\", Toast.LENGTH_SHORT).show()\n"
-        "                                        } else {\n"
-        "                                            Toast.makeText(context, \"Failed to copy image\", Toast.LENGTH_SHORT).show()\n"
-        "                                        }\n"
-        "                                    }\n"
-    )
-    if old_copy in t:
-        t = t.replace(old_copy, new_copy, 1); changed = True
-        log("  ✓ copy call site updated")
-    else:
-        log("  ⚠ copy call site anchor missing")
+    # Find downloadToCacheUri function and replace it
+    marker = "private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {"
+    idx = t.find(marker)
+    if idx < 0:
+        # Maybe not updated to Pair yet — also check old signature
+        marker_old = "private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Uri? = withContext(Dispatchers.IO) {"
+        idx = t.find(marker_old)
+        if idx < 0:
+            log("  ✗ downloadToCacheUri not found"); sys.exit(1)
 
-    # 3. Share call site
-    old_share = (
-        "                                    val uris = ArrayList<Uri>()\n"
-        "                                    for (pin in selectedPins.take(10)) {\n"
-        "                                        val u = downloadToCacheUri(context, pin)\n"
-        "                                        if (u != null) uris.add(u)\n"
-        "                                    }\n"
-        "                                    if (uris.isNotEmpty()) {\n"
-        "                                        val sendIntent = if (uris.size == 1) {\n"
-        "                                            Intent(Intent.ACTION_SEND).apply {\n"
-        "                                                type = \"image/jpeg\"\n"
-        "                                                putExtra(Intent.EXTRA_STREAM, uris[0])\n"
-        "                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)\n"
-        "                                            }\n"
-        "                                        } else {\n"
-        "                                            Intent(Intent.ACTION_SEND_MULTIPLE).apply {\n"
-        "                                                type = \"image/jpeg\"\n"
-        "                                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)\n"
-        "                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)\n"
-        "                                            }\n"
-        "                                        }\n"
-        "                                        val shareIntent = Intent.createChooser(sendIntent, \"Share Image\")\n"
-        "                                        context.startActivity(shareIntent)\n"
-        "                                    } else {\n"
-        "                                        Toast.makeText(context, \"Could not prepare image\", Toast.LENGTH_SHORT).show()\n"
-        "                                    }\n"
-    )
-    new_share = (
-        "                                    val pairs = ArrayList<Pair<Uri, String>>()\n"
-        "                                    for (pin in selectedPins.take(10)) {\n"
-        "                                        val p = downloadToCacheUri(context, pin)\n"
-        "                                        if (p != null) pairs.add(p)\n"
-        "                                    }\n"
-        "                                    if (pairs.isNotEmpty()) {\n"
-        "                                        val uris = pairs.map { it.first }\n"
-        "                                        val mimes = pairs.map { it.second }.distinct()\n"
-        "                                        val commonMime = if (mimes.size == 1) mimes[0] else \"*/*\"\n"
-        "                                        val sendIntent = if (uris.size == 1) {\n"
-        "                                            Intent(Intent.ACTION_SEND).apply {\n"
-        "                                                type = commonMime\n"
-        "                                                putExtra(Intent.EXTRA_STREAM, uris[0])\n"
-        "                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)\n"
-        "                                            }\n"
-        "                                        } else {\n"
-        "                                            Intent(Intent.ACTION_SEND_MULTIPLE).apply {\n"
-        "                                                type = commonMime\n"
-        "                                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))\n"
-        "                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)\n"
-        "                                            }\n"
-        "                                        }\n"
-        "                                        val shareIntent = Intent.createChooser(sendIntent, \"Share Image\")\n"
-        "                                        context.startActivity(shareIntent)\n"
-        "                                    } else {\n"
-        "                                        Toast.makeText(context, \"Could not prepare image\", Toast.LENGTH_SHORT).show()\n"
-        "                                    }\n"
-    )
-    if old_share in t:
-        t = t.replace(old_share, new_share, 1); changed = True
-        log("  ✓ share call site updated")
-    else:
-        log("  ⚠ share call site anchor missing")
+    # Find matching close
+    open_brace = t.find("{", idx)
+    depth = 1
+    i = open_brace + 1
+    while i < len(t) and depth > 0:
+        c = t[i]
+        if c == '"':
+            i += 1
+            while i < len(t):
+                if t[i] == "\\": i += 2; continue
+                if t[i] == '"': break
+                i += 1
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0: break
+        i += 1
+    end = i + 1
 
-    if changed: f.write_text(t, encoding="utf-8")
+    new_fn = '''private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {
+    try {
+        val client = OkHttpClient()
+        val request = Request.Builder()
+            .url(pin.imageUrl)
+            .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:109.0)")
+            .build()
+        client.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful || resp.body == null) return@withContext null
+            val contentTypeHeader = resp.header("Content-Type")
+            val raw = resp.body!!.byteStream()
+            val pushback = java.io.PushbackInputStream(raw, 32)
+            val hdr = ByteArray(16)
+            val n = try { pushback.read(hdr, 0, 16) } catch (_: Exception) { -1 }
+            if (n > 0) { try { pushback.unread(hdr, 0, n) } catch (_: Exception) {} }
+            val mime = com.example.util.ImageMimeUtils.resolveMime(
+                pin.mimeType, pin.imageUrl, contentTypeHeader,
+                if (n > 0) hdr else null, if (n > 0) n else 0
+            )
+            val ext = com.example.util.ImageMimeUtils.extensionFor(mime)
+            val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
+            val file = File(cacheDir, "share_${pin.id.take(20)}.$ext")
+            FileOutputStream(file).use { out -> pushback.copyTo(out) }
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file) to mime
+        }
+    } catch (_: Exception) {
+        null
+    }
+}'''
+    t = t[:idx] + new_fn + t[end:]
+    f.write_text(t, encoding="utf-8")
+    log("  ✓ downloadToCacheUri rewritten with sniff")
 
 
 # ============================================================
-# FullscreenGalleryViewer: mime-aware prepare/share
+# FullscreenGalleryViewer — sniff in prepareImageUriForPin
 # ============================================================
-def patch_fullscreen_viewer():
-    log("\n=== PATCH: FullscreenGalleryViewer (mime-aware) ===")
+def patch_fullscreen_sniff():
+    log("\n=== PATCH: FullscreenGalleryViewer (sniff) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
-    changed = False
 
-    # 1. Rewrite prepareImageUriForPin → Pair<Uri, String>?
-    old_prep_start = (
-        "private suspend fun prepareImageUriForPin(context: Context, pin: PinItem): Uri? = withContext(Dispatchers.IO) {\n"
-    )
-    idx = t.find(old_prep_start)
-    if idx >= 0:
-        # find function end (matching brace)
-        open_brace = t.find("{", idx)
-        depth = 1
-        i = open_brace + 1
-        while i < len(t) and depth > 0:
-            c = t[i]
-            if c == '"':
-                i += 1
-                while i < len(t):
-                    if t[i] == "\\": i += 2; continue
-                    if t[i] == '"': break
-                    i += 1
-            elif c == "{": depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0: break
+    if "PushbackInputStream(raw, 32)" in t and "prepareImageUriForPin" in t:
+        log("  ✓ already sniff-aware"); return
+
+    marker = "private suspend fun prepareImageUriForPin(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {"
+    idx = t.find(marker)
+    if idx < 0:
+        log("  ✗ prepareImageUriForPin (Pair variant) not found"); sys.exit(1)
+
+    open_brace = t.find("{", idx)
+    depth = 1
+    i = open_brace + 1
+    while i < len(t) and depth > 0:
+        c = t[i]
+        if c == '"':
             i += 1
-        end = i + 1
-        new_prep = '''private suspend fun prepareImageUriForPin(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {
+            while i < len(t):
+                if t[i] == "\\": i += 2; continue
+                if t[i] == '"': break
+                i += 1
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0: break
+        i += 1
+    end = i + 1
+
+    new_fn = '''private suspend fun prepareImageUriForPin(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {
     try {
         if (pin.imageUrl.startsWith("content://")) {
             val uri = Uri.parse(pin.imageUrl)
@@ -602,7 +563,6 @@ def patch_fullscreen_viewer():
                 return@withContext uri to mime
             }
         }
-
         val client = okhttp3.OkHttpClient.Builder()
             .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
@@ -611,19 +571,24 @@ def patch_fullscreen_viewer():
             .url(pin.imageUrl)
             .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:109.0)")
             .build()
-        val response = client.newCall(request).execute()
-        response.use { resp ->
+        client.newCall(request).execute().use { resp ->
             if (!resp.isSuccessful || resp.body == null) return@withContext null
             val contentTypeHeader = resp.header("Content-Type")
-            val mime = com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, contentTypeHeader)
+            val raw = resp.body!!.byteStream()
+            val pushback = java.io.PushbackInputStream(raw, 32)
+            val hdr = ByteArray(16)
+            val n = try { pushback.read(hdr, 0, 16) } catch (_: Exception) { -1 }
+            if (n > 0) { try { pushback.unread(hdr, 0, n) } catch (_: Exception) {} }
+            val mime = com.example.util.ImageMimeUtils.resolveMime(
+                pin.mimeType, pin.imageUrl, contentTypeHeader,
+                if (n > 0) hdr else null, if (n > 0) n else 0
+            )
             val ext = com.example.util.ImageMimeUtils.extensionFor(mime)
             val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
             val safeName = "share_${pin.id.filter { it.isLetterOrDigit() }.take(25).ifBlank { "img_${System.currentTimeMillis()}" }}.$ext"
             val file = File(cacheDir, safeName)
             if (!file.exists() || file.length() == 0L) {
-                resp.body!!.byteStream().use { input ->
-                    FileOutputStream(file).use { out -> input.copyTo(out) }
-                }
+                FileOutputStream(file).use { out -> pushback.copyTo(out) }
             }
             if (file.exists() && file.length() > 0L) {
                 FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file) to mime
@@ -634,219 +599,95 @@ def patch_fullscreen_viewer():
         null
     }
 }'''
-        t = t[:idx] + new_prep + t[end:]
-        changed = True
-        log("  ✓ prepareImageUriForPin rewritten")
-
-    # 2. Share function signature: add mime param, use it
-    old_share_fn_start = "private fun shareImage(context: Context, pin: PinItem, uri: Uri) {\n"
-    idx2 = t.find(old_share_fn_start)
-    if idx2 >= 0:
-        open_brace2 = t.find("{", idx2)
-        depth = 1
-        i = open_brace2 + 1
-        while i < len(t) and depth > 0:
-            c = t[i]
-            if c == '"':
-                i += 1
-                while i < len(t):
-                    if t[i] == "\\": i += 2; continue
-                    if t[i] == '"': break
-                    i += 1
-            elif c == "{": depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0: break
-            i += 1
-        end2 = i + 1
-        new_share_fn = '''private fun shareImage(context: Context, pin: PinItem, uri: Uri, mime: String) {
-    try {
-        val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = mime.ifBlank { pin.mimeType.ifBlank { "image/jpeg" } }
-            putExtra(Intent.EXTRA_STREAM, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        val chooser = Intent.createChooser(shareIntent, "Share Image")
-        chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(chooser)
-    } catch (e: Exception) {
-        Toast.makeText(context, "Failed to share image: ${e.message}", Toast.LENGTH_SHORT).show()
-    }
-}'''
-        t = t[:idx2] + new_share_fn + t[end2:]
-        changed = True
-        log("  ✓ shareImage signature updated")
-
-    # 3. Call sites in MinimalImageHoldDialog
-    old_copy_call = (
-        "                                val uri = prepareImageUriForPin(context, pin)\n"
-        "                                isProcessing = false\n"
-        "                                if (uri != null) {\n"
-        "                                    copyImageToClipboard(context, pin, uri)\n"
-        "                                    onDismiss()\n"
-        "                                } else {\n"
-        "                                    Toast.makeText(context, \"Could not prepare image file\", Toast.LENGTH_SHORT).show()\n"
-        "                                }\n"
-    )
-    new_copy_call = (
-        "                                val pair = prepareImageUriForPin(context, pin)\n"
-        "                                isProcessing = false\n"
-        "                                if (pair != null) {\n"
-        "                                    copyImageToClipboard(context, pin, pair.first)\n"
-        "                                    onDismiss()\n"
-        "                                } else {\n"
-        "                                    Toast.makeText(context, \"Could not prepare image file\", Toast.LENGTH_SHORT).show()\n"
-        "                                }\n"
-    )
-    if old_copy_call in t:
-        t = t.replace(old_copy_call, new_copy_call, 1); changed = True
-        log("  ✓ copy call site updated")
-
-    old_share_call = (
-        "                                val uri = prepareImageUriForPin(context, pin)\n"
-        "                                isProcessing = false\n"
-        "                                if (uri != null) {\n"
-        "                                    shareImage(context, pin, uri)\n"
-        "                                    onDismiss()\n"
-        "                                } else {\n"
-        "                                    Toast.makeText(context, \"Could not prepare image file\", Toast.LENGTH_SHORT).show()\n"
-        "                                }\n"
-    )
-    new_share_call = (
-        "                                val pair = prepareImageUriForPin(context, pin)\n"
-        "                                isProcessing = false\n"
-        "                                if (pair != null) {\n"
-        "                                    shareImage(context, pin, pair.first, pair.second)\n"
-        "                                    onDismiss()\n"
-        "                                } else {\n"
-        "                                    Toast.makeText(context, \"Could not prepare image file\", Toast.LENGTH_SHORT).show()\n"
-        "                                }\n"
-    )
-    if old_share_call in t:
-        t = t.replace(old_share_call, new_share_call, 1); changed = True
-        log("  ✓ share call site updated")
-
-    if changed: f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# PinCard: use full image URL for animated content
-# ============================================================
-def patch_pin_card():
-    log("\n=== PATCH: PinCard (GIF masonry auto-play) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/PinCard.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if "isAnimatedGif" in t:
-        log("  ✓ already patched"); return
-
-    # Insert declarations before the Box that contains AsyncImage
-    anchor = (
-        "        // Image Container with safe aspect ratio\n"
-        "        Box(\n"
-    )
-    if anchor not in t:
-        log("  ⚠ anchor missing"); return
-
-    insert = (
-        "        val isAnimatedGif = com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)\n"
-        "        val cardImageUrl = if (isAnimatedGif) pin.imageUrl.ifBlank { pin.thumbnailUrl }\n"
-        "                           else pin.thumbnailUrl.ifBlank { pin.imageUrl }\n"
-        "\n"
-        "        // Image Container with safe aspect ratio\n"
-        "        Box(\n"
-    )
-    t = t.replace(anchor, insert, 1)
-
-    # Replace thumbnail data with effective URL
-    t = t.replace(
-        "                    .data(pin.thumbnailUrl.ifBlank { pin.imageUrl })\n",
-        "                    .data(cardImageUrl)\n",
-        1,
-    )
-
+    t = t[:idx] + new_fn + t[end:]
     f.write_text(t, encoding="utf-8")
-    log("  ✓ PinCard uses full image URL for GIFs")
+    log("  ✓ prepareImageUriForPin rewritten with sniff")
 
 
 # ============================================================
-# PinterestRepository: set mimeType from URL
+# Defensive: verify coil-gif dependency still present
 # ============================================================
-def patch_pinterest_repository():
-    log("\n=== PATCH: PinterestRepository (mimeType) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/data/PinterestRepository.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-
-    if "mimeType = com.example.util.ImageLinkResolver.guessMimeType(highResUrl)" in t:
-        log("  ✓ already patched"); return
-
-    # parsePinJsonObject return: add mimeType before boardPosition
-    old = (
-        "            fileSizeKb = (200..1200).random().toLong(),\n"
-        "            boardPosition = currentCount\n"
-        "        )\n"
-    )
-    new = (
-        "            fileSizeKb = (200..1200).random().toLong(),\n"
-        "            mimeType = com.example.util.ImageLinkResolver.guessMimeType(highResUrl),\n"
-        "            boardPosition = currentCount\n"
-        "        )\n"
-    )
-    if old in t:
-        t = t.replace(old, new, 1)
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ parsePinJsonObject mimeType added")
-    else:
-        log("  ⚠ parsePinJsonObject anchor missing")
+def ensure_coil_gif_dependency():
+    log("\n=== VERIFY: coil-gif dependency ===")
+    toml = PROJECT_ROOT / "gradle/libs.versions.toml"
+    gradle = PROJECT_ROOT / "app/build.gradle.kts"
+    toml_ok = toml.exists() and "coil-gif" in toml.read_text(encoding="utf-8")
+    gradle_ok = gradle.exists() and "libs.coil.gif" in gradle.read_text(encoding="utf-8")
+    if toml_ok and gradle_ok:
+        log("  ✓ coil-gif in toml + build.gradle.kts")
+        return
+    # Add missing
+    if not toml_ok and toml.exists():
+        t = toml.read_text(encoding="utf-8")
+        if "coilGif" not in t:
+            t = t.replace('coilCompose = "2.7.0"\n', 'coilCompose = "2.7.0"\ncoilGif = "2.7.0"\n', 1)
+        if "coil-gif" not in t:
+            t = t.replace(
+                'coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coilCompose" }\n',
+                'coil-compose = { group = "io.coil-kt", name = "coil-compose", version.ref = "coilCompose" }\n'
+                'coil-gif = { group = "io.coil-kt", name = "coil-gif", version.ref = "coilGif" }\n',
+                1,
+            )
+        toml.write_text(t, encoding="utf-8")
+        log("  ✓ toml repaired")
+    if not gradle_ok and gradle.exists():
+        g = gradle.read_text(encoding="utf-8")
+        if "libs.coil.gif" not in g:
+            g = g.replace("  implementation(libs.coil.compose)\n",
+                          "  implementation(libs.coil.compose)\n  implementation(libs.coil.gif)\n", 1)
+            gradle.write_text(g, encoding="utf-8")
+            log("  ✓ build.gradle.kts repaired")
 
 
 # ============================================================
-# Verification
+# Verify
 # ============================================================
 def verify_all():
     log("\n=== VERIFY ===")
     checks = []
 
     imu = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageMimeUtils.kt"
-    dl = PROJECT_ROOT / "app/src/main/java/com/example/util/Downloader.kt"
     icm = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageCacheManager.kt"
+    dl = PROJECT_ROOT / "app/src/main/java/com/example/util/Downloader.kt"
     cm = PROJECT_ROOT / "app/src/main/java/com/example/ui/dialogs/CopyOrMoveImagesDialog.kt"
     fs = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
-    pc = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/PinCard.kt"
-    repo = PROJECT_ROOT / "app/src/main/java/com/example/data/PinterestRepository.kt"
-    ver_toml = PROJECT_ROOT / "gradle/libs.versions.toml"
-    build_gradle = PROJECT_ROOT / "app/build.gradle.kts"
 
-    for p in (imu, dl, icm, cm, fs, pc, repo, ver_toml, build_gradle):
-        if not p.exists():
-            log(f"  ✗ missing: {p}"); sys.exit(1)
+    for p in (imu, icm, dl, cm, fs):
+        if not p.exists(): log(f"  ✗ missing: {p}"); sys.exit(1)
 
-    checks.append(("ImageMimeUtils exists", imu.exists() and
-                   "fun resolveMime(" in imu.read_text(encoding="utf-8")))
-    checks.append(("Downloader content-type read",
-                   "contentTypeHeader = response.header(\"Content-Type\")" in dl.read_text(encoding="utf-8")))
+    imu_t = imu.read_text(encoding="utf-8")
+    icm_t = icm.read_text(encoding="utf-8")
+    dl_t = dl.read_text(encoding="utf-8")
+    cm_t = cm.read_text(encoding="utf-8")
+    fs_t = fs.read_text(encoding="utf-8")
+
+    checks.append(("ImageMimeUtils sniffMimeFromBytes",
+                   "fun sniffMimeFromBytes" in imu_t))
+    checks.append(("ImageMimeUtils sampleBytes param",
+                   "sampleBytes: ByteArray?" in imu_t))
+    checks.append(("ImageCacheManager uses coil.decode.GifDecoder",
+                   "coil.decode.GifDecoder" in icm_t))
+    checks.append(("ImageCacheManager uses coil.decode.ImageDecoderDecoder",
+                   "coil.decode.ImageDecoderDecoder" in icm_t))
+    checks.append(("ImageCacheManager no coil.gif (buggy)",
+                   "coil.gif.GifDecoder" not in icm_t))
+    checks.append(("Downloader sniff-aware",
+                   "PushbackInputStream(raw, 32)" in dl_t))
     checks.append(("Downloader uses ImageMimeUtils",
-                   "ImageMimeUtils.resolveMime(" in dl.read_text(encoding="utf-8")))
-    checks.append(("Downloader no hardcoded jpg",
-                   ".jpg\"" not in dl.read_text(encoding="utf-8")))
-    checks.append(("ImageCacheManager registers GifDecoder",
-                   "GifDecoder.Factory()" in icm.read_text(encoding="utf-8")))
-    checks.append(("CopyMove downloadToCacheUri returns Pair",
-                   "Pair<Uri, String>?" in cm.read_text(encoding="utf-8")))
-    checks.append(("Fullscreen prepareImageUriForPin returns Pair",
-                   "Pair<Uri, String>?" in fs.read_text(encoding="utf-8")))
-    checks.append(("Fullscreen shareImage takes mime",
-                   "private fun shareImage(context: Context, pin: PinItem, uri: Uri, mime: String)" in fs.read_text(encoding="utf-8")))
-    checks.append(("PinCard isAnimatedGif",
-                   "isAnimatedGif" in pc.read_text(encoding="utf-8")))
-    checks.append(("Repository mimeType added",
-                   "mimeType = com.example.util.ImageLinkResolver.guessMimeType(highResUrl)" in repo.read_text(encoding="utf-8")))
+                   "ImageMimeUtils.resolveMime(" in dl_t))
+    checks.append(("Downloader no hardcoded .jpg",
+                   '".jpg"' not in dl_t))
+    checks.append(("CopyMove sniff-aware",
+                   "PushbackInputStream(raw, 32)" in cm_t))
+    checks.append(("Fullscreen sniff-aware",
+                   "PushbackInputStream(raw, 32)" in fs_t))
+
+    toml = PROJECT_ROOT / "gradle/libs.versions.toml"
+    gradle = PROJECT_ROOT / "app/build.gradle.kts"
     checks.append(("coil-gif in toml",
-                   "coil-gif" in ver_toml.read_text(encoding="utf-8")))
+                   toml.exists() and "coil-gif" in toml.read_text(encoding="utf-8")))
     checks.append(("coil-gif in build.gradle.kts",
-                   "libs.coil.gif" in build_gradle.read_text(encoding="utf-8")))
+                   gradle.exists() and "libs.coil.gif" in gradle.read_text(encoding="utf-8")))
 
     all_ok = True
     for name, ok in checks:
@@ -858,7 +699,7 @@ def verify_all():
 
 
 # ============================================================
-# Standard pipeline
+# Pipeline
 # ============================================================
 def read_app_version():
     p = PROJECT_ROOT / "app/build.gradle.kts"
@@ -983,7 +824,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "GIF support: content-type-aware save/share + coil-gif masonry auto-play"])
+        run(["git", "commit", "-m", "Fix coil.decode package + magic-byte sniff fallback"])
 
 
 def verify_keystore_tracked():
@@ -1132,21 +973,18 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — GIF support (download/share/masonry/fullscreen)")
+    log("PinBoard — coil.decode fix + magic-byte sniff fallback")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    write_image_mime_utils()
-    write_downloader()
-    patch_gradle_versions()
-    patch_app_build_gradle()
+    ensure_coil_gif_dependency()
+    patch_image_mime_utils()
     patch_image_cache_manager()
-    patch_copy_move_dialog()
-    patch_fullscreen_viewer()
-    patch_pin_card()
-    patch_pinterest_repository()
+    patch_downloader()
+    patch_copy_move_sniff()
+    patch_fullscreen_sniff()
     verify_all()
 
     ensure_release_keystore()
