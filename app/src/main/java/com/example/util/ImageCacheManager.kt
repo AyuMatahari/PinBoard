@@ -32,6 +32,13 @@ object ImageCacheManager {
     fun applyImageLoader(context: Context, maxMb: Int = getMaxDiskCacheMb(context)) {
         val cacheDirectory = context.cacheDir.resolve("image_cache")
         val imageLoader = ImageLoader.Builder(context)
+            .components {
+                try {
+                    add(coil.gif.GifDecoder.Factory())
+                } catch (_: Throwable) {
+                    // coil-gif unavailable — static decoding only
+                }
+            }
             .diskCache {
                 DiskCache.Builder()
                     .directory(cacheDirectory)

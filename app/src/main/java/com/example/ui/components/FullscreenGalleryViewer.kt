@@ -827,10 +827,10 @@ private fun MinimalImageHoldDialog(
                         .clickable(enabled = !isProcessing) {
                             isProcessing = true
                             coroutineScope.launch {
-                                val uri = prepareImageUriForPin(context, pin)
+                                val pair = prepareImageUriForPin(context, pin)
                                 isProcessing = false
-                                if (uri != null) {
-                                    copyImageToClipboard(context, pin, uri)
+                                if (pair != null) {
+                                    copyImageToClipboard(context, pin, pair.first)
                                     onDismiss()
                                 } else {
                                     Toast.makeText(context, "Could not prepare image file", Toast.LENGTH_SHORT).show()
@@ -871,10 +871,10 @@ private fun MinimalImageHoldDialog(
                         .clickable(enabled = !isProcessing) {
                             isProcessing = true
                             coroutineScope.launch {
-                                val uri = prepareImageUriForPin(context, pin)
+                                val pair = prepareImageUriForPin(context, pin)
                                 isProcessing = false
-                                if (uri != null) {
-                                    shareImage(context, pin, uri)
+                                if (pair != null) {
+                                    shareImage(context, pin, pair.first, pair.second)
                                     onDismiss()
                                 } else {
                                     Toast.makeText(context, "Could not prepare image file", Toast.LENGTH_SHORT).show()
@@ -943,40 +943,48 @@ private fun MinimalImageHoldDialog(
     }
 }
 
-private suspend fun prepareImageUriForPin(context: Context, pin: PinItem): Uri? = withContext(Dispatchers.IO) {
+private suspend fun prepareImageUriForPin(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {
     try {
         if (pin.imageUrl.startsWith("content://")) {
-            return@withContext Uri.parse(pin.imageUrl)
+            val uri = Uri.parse(pin.imageUrl)
+            val mime = context.contentResolver.getType(uri)
+                ?: com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, null)
+            return@withContext uri to mime
         }
         if (pin.imageUrl.startsWith("file://")) {
             val f = File(Uri.parse(pin.imageUrl).path ?: "")
             if (f.exists()) {
-                return@withContext FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
+                val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", f)
+                val mime = com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, null)
+                return@withContext uri to mime
             }
         }
 
-        val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
-        val safeName = "share_${pin.id.filter { it.isLetterOrDigit() }.take(25).ifBlank { "img_${System.currentTimeMillis()}" }}.jpg"
-        val file = File(cacheDir, safeName)
-
-        if (!file.exists() || file.length() == 0L) {
-            val client = okhttp3.OkHttpClient.Builder()
-                .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
-                .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-                .build()
-            val request = okhttp3.Request.Builder().url(pin.imageUrl).build()
-            val response = client.newCall(request).execute()
-            if (response.isSuccessful && response.body != null) {
-                FileOutputStream(file).use { out ->
-                    response.body!!.byteStream().copyTo(out)
+        val client = okhttp3.OkHttpClient.Builder()
+            .connectTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val request = okhttp3.Request.Builder()
+            .url(pin.imageUrl)
+            .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:109.0)")
+            .build()
+        val response = client.newCall(request).execute()
+        response.use { resp ->
+            if (!resp.isSuccessful || resp.body == null) return@withContext null
+            val contentTypeHeader = resp.header("Content-Type")
+            val mime = com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, contentTypeHeader)
+            val ext = com.example.util.ImageMimeUtils.extensionFor(mime)
+            val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
+            val safeName = "share_${pin.id.filter { it.isLetterOrDigit() }.take(25).ifBlank { "img_${System.currentTimeMillis()}" }}.$ext"
+            val file = File(cacheDir, safeName)
+            if (!file.exists() || file.length() == 0L) {
+                resp.body!!.byteStream().use { input ->
+                    FileOutputStream(file).use { out -> input.copyTo(out) }
                 }
             }
-        }
-
-        if (file.exists() && file.length() > 0L) {
-            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        } else {
-            null
+            if (file.exists() && file.length() > 0L) {
+                FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file) to mime
+            } else null
         }
     } catch (e: Exception) {
         android.util.Log.e("FullscreenGalleryViewer", "prepareImageUriForPin error", e)
@@ -995,10 +1003,10 @@ private fun copyImageToClipboard(context: Context, pin: PinItem, uri: Uri) {
     }
 }
 
-private fun shareImage(context: Context, pin: PinItem, uri: Uri) {
+private fun shareImage(context: Context, pin: PinItem, uri: Uri, mime: String) {
     try {
         val shareIntent = Intent(Intent.ACTION_SEND).apply {
-            type = pin.mimeType.ifBlank { "image/jpeg" }
+            type = mime.ifBlank { pin.mimeType.ifBlank { "image/jpeg" } }
             putExtra(Intent.EXTRA_STREAM, uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }

@@ -43,7 +43,6 @@ object Downloader {
     ): Int = withContext(Dispatchers.IO) {
         var successCount = 0
         val total = pins.size
-
         pins.forEachIndexed { index, pin ->
             onProgress(
                 DownloadProgress(
@@ -52,22 +51,9 @@ object Downloader {
                     currentPinTitle = pin.title.ifBlank { "Pin #${pin.id}" }
                 )
             )
-
-            val success = downloadSinglePinInternal(context, pin)
-            if (success) {
-                successCount++
-            }
+            if (downloadSinglePinInternal(context, pin)) successCount++
         }
-
-        onProgress(
-            DownloadProgress(
-                current = total,
-                total = total,
-                currentPinTitle = "Done",
-                isComplete = true
-            )
-        )
-
+        onProgress(DownloadProgress(current = total, total = total, currentPinTitle = "Done", isComplete = true))
         successCount
     }
 
@@ -77,16 +63,10 @@ object Downloader {
 
     private fun downloadSinglePinInternal(context: Context, pin: PinItem): Boolean {
         try {
-            val sanitizedTitle = pin.title
-                .take(30)
-                .replace(Regex("[^a-zA-Z0-9_-]"), "_")
-                .trim('_')
-                .ifBlank { "pin" }
-            val fileName = "Pinterest_${sanitizedTitle}_${pin.id}.jpg"
-            val mimeType = "image/jpeg"
-
             val candidateUrls = listOf(pin.imageUrl, pin.thumbnailUrl).filter { it.isNotBlank() }.distinct()
             var responseBody: okhttp3.ResponseBody? = null
+            var contentTypeHeader: String? = null
+            var chosenUrl: String = pin.imageUrl
             for (url in candidateUrls) {
                 try {
                     val request = Request.Builder()
@@ -96,19 +76,30 @@ object Downloader {
                     val response = client.newCall(request).execute()
                     if (response.isSuccessful && response.body != null) {
                         responseBody = response.body
+                        contentTypeHeader = response.header("Content-Type")
+                        chosenUrl = url
                         break
                     }
                 } catch (_: Exception) {}
             }
             if (responseBody == null) return false
 
+            val resolvedMime = ImageMimeUtils.resolveMime(pin.mimeType, chosenUrl, contentTypeHeader)
+            val extension = ImageMimeUtils.extensionFor(resolvedMime)
+
+            val sanitizedTitle = pin.title
+                .take(30)
+                .replace(Regex("[^a-zA-Z0-9_-]"), "_")
+                .trim('_')
+                .ifBlank { "pin" }
+            val fileName = "Pinterest_${sanitizedTitle}_${pin.id}.$extension"
+
             val inputStream: InputStream = responseBody.byteStream()
 
             return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                // Android 10+ MediaStore Downloads or Images
                 val values = ContentValues().apply {
                     put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-                    put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                    put(MediaStore.MediaColumns.MIME_TYPE, resolvedMime)
                     put(
                         MediaStore.MediaColumns.RELATIVE_PATH,
                         "${Environment.DIRECTORY_DOWNLOADS}/$FOLDER_NAME"
@@ -117,7 +108,6 @@ object Downloader {
                 }
 
                 val resolver = context.contentResolver
-                // Use MediaStore.Downloads on API 29+
                 val uri: Uri? = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
                     ?: resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
 
@@ -133,12 +123,9 @@ object Downloader {
                     false
                 }
             } else {
-                // Android 9 and below
                 val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
                 val targetDir = File(downloadsDir, FOLDER_NAME)
-                if (!targetDir.exists()) {
-                    targetDir.mkdirs()
-                }
+                if (!targetDir.exists()) targetDir.mkdirs()
                 val outputFile = File(targetDir, fileName)
                 FileOutputStream(outputFile).use { outputStream ->
                     inputStream.copyTo(outputStream)
@@ -146,7 +133,7 @@ object Downloader {
                 MediaScannerConnection.scanFile(
                     context,
                     arrayOf(outputFile.absolutePath),
-                    arrayOf(mimeType),
+                    arrayOf(resolvedMime),
                     null
                 )
                 true

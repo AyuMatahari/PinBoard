@@ -92,6 +92,10 @@ fun PinCard(
             }
         }
 
+        val isAnimatedGif = com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)
+        val cardImageUrl = if (isAnimatedGif) pin.imageUrl.ifBlank { pin.thumbnailUrl }
+                           else pin.thumbnailUrl.ifBlank { pin.imageUrl }
+
         // Image Container with safe aspect ratio
         Box(
             modifier = Modifier
@@ -102,7 +106,7 @@ fun PinCard(
         ) {
             AsyncImage(
                 model = ImageRequest.Builder(context)
-                    .data(pin.thumbnailUrl.ifBlank { pin.imageUrl })
+                    .data(cardImageUrl)
                     .apply {
                         if (refreshCounter > 0) {
                             memoryCacheKey("pin-thumb:${pin.id}:r$refreshCounter")

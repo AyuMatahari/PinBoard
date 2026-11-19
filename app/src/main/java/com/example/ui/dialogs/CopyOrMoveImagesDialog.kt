@@ -188,10 +188,10 @@ fun CopyOrMoveImagesDialog(
                                     Toast.makeText(context, "Copying image to clipboard...", Toast.LENGTH_SHORT).show()
                                     val firstPin = selectedPins.firstOrNull()
                                     if (firstPin != null) {
-                                        val uri = downloadToCacheUri(context, firstPin)
-                                        if (uri != null) {
+                                        val pair = downloadToCacheUri(context, firstPin)
+                                        if (pair != null) {
                                             val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                            val clip = ClipData.newUri(context.contentResolver, "Image", uri)
+                                            val clip = ClipData.newUri(context.contentResolver, "Image", pair.first)
                                             clipboard.setPrimaryClip(clip)
                                             Toast.makeText(context, "Copied image to clipboard", Toast.LENGTH_SHORT).show()
                                         } else {
@@ -277,22 +277,25 @@ fun CopyOrMoveImagesDialog(
                             .clickable {
                                 coroutineScope.launch {
                                     Toast.makeText(context, "Preparing images to share...", Toast.LENGTH_SHORT).show()
-                                    val uris = ArrayList<Uri>()
+                                    val pairs = ArrayList<Pair<Uri, String>>()
                                     for (pin in selectedPins.take(10)) {
-                                        val u = downloadToCacheUri(context, pin)
-                                        if (u != null) uris.add(u)
+                                        val p = downloadToCacheUri(context, pin)
+                                        if (p != null) pairs.add(p)
                                     }
-                                    if (uris.isNotEmpty()) {
+                                    if (pairs.isNotEmpty()) {
+                                        val uris = pairs.map { it.first }
+                                        val mimes = pairs.map { it.second }.distinct()
+                                        val commonMime = if (mimes.size == 1) mimes[0] else "*/*"
                                         val sendIntent = if (uris.size == 1) {
                                             Intent(Intent.ACTION_SEND).apply {
-                                                type = "image/jpeg"
+                                                type = commonMime
                                                 putExtra(Intent.EXTRA_STREAM, uris[0])
                                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                             }
                                         } else {
                                             Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-                                                type = "image/jpeg"
-                                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
+                                                type = commonMime
+                                                putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
                                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                                             }
                                         }
@@ -500,20 +503,26 @@ fun CopyOrMoveImagesDialog(
     )
 }
 
-private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Uri? = withContext(Dispatchers.IO) {
+private suspend fun downloadToCacheUri(context: Context, pin: PinItem): Pair<Uri, String>? = withContext(Dispatchers.IO) {
     try {
         val client = OkHttpClient()
-        val request = Request.Builder().url(pin.imageUrl).build()
+        val request = Request.Builder()
+            .url(pin.imageUrl)
+            .header("User-Agent", "Mozilla/5.0 (Android; Mobile; rv:109.0)")
+            .build()
         val response = client.newCall(request).execute()
-        if (!response.isSuccessful || response.body == null) return@withContext null
-
-        val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
-        val file = File(cacheDir, "share_${pin.id.take(20)}.jpg")
-        FileOutputStream(file).use { out ->
-            response.body!!.byteStream().copyTo(out)
+        response.use { resp ->
+            if (!resp.isSuccessful || resp.body == null) return@withContext null
+            val contentTypeHeader = resp.header("Content-Type")
+            val mime = com.example.util.ImageMimeUtils.resolveMime(pin.mimeType, pin.imageUrl, contentTypeHeader)
+            val ext = com.example.util.ImageMimeUtils.extensionFor(mime)
+            val cacheDir = File(context.cacheDir, "shared_images").apply { if (!exists()) mkdirs() }
+            val file = File(cacheDir, "share_${pin.id.take(20)}.$ext")
+            resp.body!!.byteStream().use { input ->
+                FileOutputStream(file).use { out -> input.copyTo(out) }
+            }
+            FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file) to mime
         }
-
-        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
     } catch (_: Exception) {
         null
     }

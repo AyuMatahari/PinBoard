@@ -635,6 +635,7 @@ class PinterestRepository {
             savesCount = saves,
             likesCount = (saves * 0.4).toInt().coerceAtLeast(0),
             fileSizeKb = (200..1200).random().toLong(),
+            mimeType = com.example.util.ImageLinkResolver.guessMimeType(highResUrl),
             boardPosition = currentCount
         )
     }
