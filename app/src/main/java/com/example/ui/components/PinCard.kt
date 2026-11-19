@@ -1,8 +1,7 @@
 package com.example.ui.components
 
-import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
+// v2-video
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
@@ -28,11 +27,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,8 +50,10 @@ import com.example.ui.theme.PinterestBlack
 import com.example.ui.theme.PinterestPillGray
 import com.example.ui.theme.PinterestRed
 import com.example.ui.theme.PinterestTextSecondary
+import java.io.File
 
-@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
+
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun PinCard(
     pin: PinItem,
@@ -69,6 +70,24 @@ fun PinCard(
 ) {
     val context = LocalContext.current
     val cardShape = RoundedCornerShape(16.dp)
+
+    // Video thumbnail extraction state
+    var extractedVideoThumb by remember(pin.id) { mutableStateOf<File?>(null) }
+    var videoThumbFailed by remember(pin.id) { mutableStateOf(false) }
+    LaunchedEffect(pin.id, pin.isVideo, pin.hasSeparateThumbnail) {
+        if (pin.isVideo && !pin.hasSeparateThumbnail && extractedVideoThumb == null && !videoThumbFailed) {
+            val f = com.example.util.VideoThumbnailCache.getOrExtract(context, pin)
+            if (f == null) videoThumbFailed = true else extractedVideoThumb = f
+        }
+    }
+
+    val isAnimatedGif = !pin.isVideo && com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)
+    val effectiveImageModel: Any? = when {
+        pin.isVideo && pin.hasSeparateThumbnail -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
+        pin.isVideo -> extractedVideoThumb
+        isAnimatedGif -> pin.imageUrl.ifBlank { pin.thumbnailUrl }
+        else -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
+    }
 
     Column(
         modifier = modifier
@@ -97,27 +116,6 @@ fun PinCard(
             }
         }
 
-        // Video thumbnail state
-        var extractedVideoThumb by remember(pin.id) { mutableStateOf<java.io.File?>(null) }
-        var videoThumbFailed by remember(pin.id) { mutableStateOf(false) }
-        LaunchedEffect(pin.id, pin.isVideo, pin.hasSeparateThumbnail) {
-            if (pin.isVideo && !pin.hasSeparateThumbnail && extractedVideoThumb == null && !videoThumbFailed) {
-                val f = com.example.util.VideoThumbnailCache.getOrExtract(context, pin)
-                if (f == null) videoThumbFailed = true else extractedVideoThumb = f
-            }
-        }
-
-        // Choose effective image model
-        val effectiveImageModel: Any? = when {
-            pin.isVideo && pin.hasSeparateThumbnail -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
-            pin.isVideo -> extractedVideoThumb
-            else -> {
-                val isG = com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)
-                if (isG) pin.imageUrl.ifBlank { pin.thumbnailUrl } else pin.thumbnailUrl.ifBlank { pin.imageUrl }
-            }
-        }
-
-        // Image Container with safe aspect ratio
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -125,25 +123,26 @@ fun PinCard(
                 .background(cardBg)
                 .aspectRatio(safeRatio)
         ) {
-            AsyncImage(
-                model = ImageRequest.Builder(context)
-                    .data(cardImageUrl)
-                    .apply {
-                        if (refreshCounter > 0) {
-                            memoryCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
-                            diskCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
+            if (effectiveImageModel != null) {
+                AsyncImage(
+                    model = ImageRequest.Builder(context)
+                        .data(effectiveImageModel)
+                        .apply {
+                            if (refreshCounter > 0) {
+                                memoryCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
+                                diskCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
+                            }
                         }
-                    }
-                    .crossfade(true)
-                    .build(),
-                contentDescription = pin.title,
-                contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .matchParentSize()
-                    .clip(cardShape)
-            )
+                        .crossfade(true)
+                        .build(),
+                    contentDescription = pin.title,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .matchParentSize()
+                        .clip(cardShape)
+                )
             } else {
-                // Video without thumbnail — placeholder
+                // Video without extractable thumbnail — placeholder
                 Box(
                     modifier = Modifier
                         .matchParentSize()
@@ -159,7 +158,7 @@ fun PinCard(
                 }
             }
 
-            // Video play icon (top-left, masonry indicator, not a button)
+            // Video play icon — top-left, masonry-only indicator
             if (pin.isVideo && !isSelectionMode) {
                 Box(
                     modifier = Modifier
@@ -181,7 +180,7 @@ fun PinCard(
                 }
             }
 
-            // Selection indicator badge
+            // Selection indicator
             if (isSelectionMode) {
                 Box(
                     modifier = Modifier
@@ -191,7 +190,6 @@ fun PinCard(
                             else Color.Black.copy(alpha = 0.15f)
                         )
                 )
-
                 Box(
                     modifier = Modifier
                         .align(Alignment.TopEnd)
@@ -199,14 +197,9 @@ fun PinCard(
                         .size(28.dp)
                         .clip(CircleShape)
                         .background(
-                            if (isSelected) PinterestRed
-                            else Color.Black.copy(alpha = 0.45f)
+                            if (isSelected) PinterestRed else Color.Black.copy(alpha = 0.45f)
                         )
-                        .border(
-                            width = 2.dp,
-                            color = Color.White,
-                            shape = CircleShape
-                        ),
+                        .border(width = 2.dp, color = Color.White, shape = CircleShape),
                     contentAlignment = Alignment.Center
                 ) {
                     if (isSelected) {
@@ -219,7 +212,6 @@ fun PinCard(
                     }
                 }
             } else {
-                // Red "love" heart badge for Favorites (User requirement)
                 if (isFavorite) {
                     Box(
                         modifier = Modifier
@@ -240,8 +232,6 @@ fun PinCard(
                         )
                     }
                 }
-
-                // "NEW" Badge Indicator
                 if (isNew) {
                     Surface(
                         color = PinterestRed,
@@ -264,7 +254,6 @@ fun PinCard(
                 }
             }
 
-            // Unreachable or Broken Link warning badge
             if (pin.isBrokenOrUnreachable) {
                 Surface(
                     color = Color.Black.copy(alpha = 0.7f),
@@ -295,7 +284,6 @@ fun PinCard(
             }
         }
 
-        // Caption & Metadata Footer
         if (!hideTitleAndAuthor && columnCount <= 3 && pin.title.isNotBlank()) {
             Spacer(modifier = Modifier.height(6.dp))
             Text(

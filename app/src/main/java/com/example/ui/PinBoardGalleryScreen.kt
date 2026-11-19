@@ -1354,9 +1354,10 @@ fun PinBoardGalleryScreen(
                     fullscreenPinIndex != null -> fullscreenPinIndex!!.coerceIn(0, (fullScreenPins.size - 1).coerceAtLeast(0))
                     else -> 0
                 }
-                FullscreenGalleryViewer(
+                                FullscreenGalleryViewer(
                     refreshCounters = imageRefreshCounters,
                     onRefreshImage = { p -> viewModel.refreshImage(p.id) },
+                    onPlayVideo = { p -> viewModel.playVideo(context, p) },
                     pins = fullScreenPins,
                     initialIndex = initialIndex,
                     disableArrowNavigation = disableArrowNavigation,
@@ -1366,7 +1367,6 @@ fun PinBoardGalleryScreen(
                     onDeleteSingle = { pin -> viewModel.deleteSinglePin(pin) },
                     onClose = { viewModel.closeFullscreen() },
                     onDownloadSingle = { pin -> viewModel.downloadSingle(context, pin) }
-                    onPlayVideo = { p -> viewModel.playVideo(context, p) }
                 )
             }
 
