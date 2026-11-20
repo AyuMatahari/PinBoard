@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.CleaningServices
 import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material3.AlertDialog
@@ -100,6 +101,13 @@ fun SettingsDialog(
     var textValue by remember { mutableStateOf(currentSavedMb.toString()) }
     var isInputError by remember { mutableStateOf(false) }
 
+    // Video cache state
+    val currentVideoSavedMb = remember { com.example.util.VideoPlayerManager.getMaxVideoCacheMb(context) }
+    var currentVideoCacheUsageBytes by remember { mutableLongStateOf(0L) }
+    var videoSliderValue by remember { mutableFloatStateOf(currentVideoSavedMb.toFloat()) }
+    var videoTextValue by remember { mutableStateOf(currentVideoSavedMb.toString()) }
+    var videoInputError by remember { mutableStateOf(false) }
+
     var isBackupEnabled by remember { mutableStateOf(com.example.util.BackupManager.isBackupEnabled(context)) }
     var backupIntervalMinutes by remember { mutableLongStateOf(com.example.util.BackupManager.getBackupIntervalMinutes(context)) }
     var showIntervalDropdown by remember { mutableStateOf(false) }
@@ -125,6 +133,9 @@ fun SettingsDialog(
 
     LaunchedEffect(isOpen) {
         currentCacheUsageBytes = ImageCacheManager.getDiskCacheUsageBytes(context)
+        currentVideoCacheUsageBytes = try {
+            com.example.util.VideoPlayerManager.getCacheSizeBytes(context)
+        } catch (_: Throwable) { 0L }
     }
 
     val presets = listOf(256, 512, 1024, 2048)
@@ -747,6 +758,192 @@ fun SettingsDialog(
                 HorizontalDivider(color = PinterestPillDarkGray.copy(alpha = 0.5f))
                 Spacer(modifier = Modifier.height(12.dp))
 
+                // Video cache usage card
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = PinterestPillGray),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.PlayArrow,
+                                contentDescription = null,
+                                tint = PinterestRed,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                Text(
+                                    text = "Current Video Cache",
+                                    fontSize = 12.sp,
+                                    color = PinterestTextSecondary,
+                                    fontWeight = FontWeight.Medium
+                                )
+                                Text(
+                                    text = ImageCacheManager.formatBytes(currentVideoCacheUsageBytes),
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = PinterestBlack
+                                )
+                            }
+                        }
+                        Button(
+                            onClick = {
+                                com.example.util.VideoPlayerManager.clearCache(context)
+                                currentVideoCacheUsageBytes = 0L
+                            },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.surface,
+                                contentColor = PinterestRed
+                            ),
+                            shape = RoundedCornerShape(16.dp),
+                            elevation = ButtonDefaults.buttonElevation(defaultElevation = 1.dp),
+                            modifier = Modifier.testTag("clear_video_cache_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.DeleteSweep,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Clear", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "MAX VIDEO CACHE SIZE",
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp,
+                        letterSpacing = 0.5.sp,
+                        color = PinterestTextSecondary
+                    )
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "Maximum disk space (MB) reserved for in-app video playback cache:",
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        fontSize = 12.sp,
+                        color = PinterestTextSecondary
+                    )
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+
+                OutlinedTextField(
+                    value = videoTextValue,
+                    onValueChange = { input ->
+                        val filtered = input.filter { it.isDigit() }
+                        videoTextValue = filtered
+                        val parsed = filtered.toIntOrNull()
+                        if (parsed != null && parsed in com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB..com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB) {
+                            videoInputError = false
+                            videoSliderValue = parsed.toFloat()
+                        } else {
+                            videoInputError = filtered.isNotEmpty()
+                        }
+                    },
+                    label = { Text("Video Cache Size (MB)") },
+                    suffix = { Text("MB", fontWeight = FontWeight.Bold) },
+                    singleLine = true,
+                    isError = videoInputError,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = PinterestRed,
+                        cursorColor = PinterestRed,
+                        focusedLabelColor = PinterestRed
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("video_cache_size_text_input")
+                )
+
+                if (videoInputError) {
+                    Text(
+                        text = "Enter a value between ${com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB} and ${com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB} MB",
+                        color = MaterialTheme.colorScheme.error,
+                        fontSize = 11.sp,
+                        modifier = Modifier.padding(start = 4.dp, top = 2.dp)
+                    )
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("${com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB} MB", fontSize = 11.sp, color = PinterestTextSecondary)
+                    Text("${videoSliderValue.toInt()} MB", fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, color = PinterestRed)
+                    Text("${com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB} MB", fontSize = 11.sp, color = PinterestTextSecondary)
+                }
+
+                Slider(
+                    value = videoSliderValue,
+                    onValueChange = { v ->
+                        videoSliderValue = v
+                        videoTextValue = v.toInt().toString()
+                        videoInputError = false
+                    },
+                    valueRange = com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB.toFloat()..com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB.toFloat(),
+                    colors = SliderDefaults.colors(
+                        thumbColor = PinterestRed,
+                        activeTrackColor = PinterestRed,
+                        inactiveTrackColor = PinterestPillGray
+                    ),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("video_cache_size_slider")
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    listOf(256, 512, 1024, 2048).forEach { presetMb ->
+                        val isSelected = videoSliderValue.toInt() == presetMb
+                        Surface(
+                            shape = RoundedCornerShape(16.dp),
+                            color = if (isSelected) PinterestBlack else PinterestPillGray,
+                            modifier = Modifier
+                                .weight(1f)
+                                .clickable {
+                                    videoSliderValue = presetMb.toFloat()
+                                    videoTextValue = presetMb.toString()
+                                    videoInputError = false
+                                }
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = if (presetMb >= 1024) "${presetMb / 1024} GB" else "${presetMb} M",
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                                    color = if (isSelected) Color.White else PinterestBlack
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(16.dp))
+                HorizontalDivider(color = PinterestPillDarkGray.copy(alpha = 0.5f))
+                Spacer(modifier = Modifier.height(12.dp))
+
                 // Crash & Error Diagnostics
                 Card(
                     shape = RoundedCornerShape(12.dp),
@@ -967,6 +1164,12 @@ fun SettingsDialog(
                     val finalMb = textValue.toIntOrNull() ?: sliderValue.toInt()
                     val clamped = finalMb.coerceIn(ImageCacheManager.MIN_CACHE_MB, ImageCacheManager.MAX_CACHE_MB)
                     ImageCacheManager.setMaxDiskCacheMb(context, clamped)
+                    val finalVideoMb = videoTextValue.toIntOrNull() ?: videoSliderValue.toInt()
+                    val videoClamped = finalVideoMb.coerceIn(
+                        com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB,
+                        com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB
+                    )
+                    com.example.util.VideoPlayerManager.setMaxVideoCacheMb(context, videoClamped)
                     onCacheSizeSaved(clamped)
 
                     onDismiss()

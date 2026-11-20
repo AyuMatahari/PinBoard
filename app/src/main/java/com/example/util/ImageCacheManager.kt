@@ -56,15 +56,12 @@ object ImageCacheManager {
             .build()
 
         Coil.setImageLoader(imageLoader)
-        try { com.example.util.VideoPlayerManager.invalidateCache() } catch (_: Throwable) {}
     }
 
-    /** Combined image + video cache size. Enforced as a single budget by CacheBudgetEnforcer. */
     fun getDiskCacheUsageBytes(context: Context): Long {
         val cacheDir = context.cacheDir.resolve("image_cache")
-        val imageBytes = if (!cacheDir.exists()) 0L else getDirSize(cacheDir)
-        val videoBytes = try { com.example.util.VideoPlayerManager.getCacheSizeBytes(context) } catch (_: Throwable) { 0L }
-        return imageBytes + videoBytes
+        if (!cacheDir.exists()) return 0L
+        return getDirSize(cacheDir)
     }
 
     fun formatBytes(bytes: Long): String {
@@ -95,7 +92,6 @@ object ImageCacheManager {
             if (cacheDir.exists()) {
                 cacheDir.deleteRecursively()
             }
-            try { com.example.util.VideoPlayerManager.clearCache(context) } catch (_: Throwable) {}
             cleanupNonPermanentUserData(context)
         } catch (e: Exception) {
             e.printStackTrace()

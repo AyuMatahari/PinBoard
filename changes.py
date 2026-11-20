@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — fix onClose anchor + unified cache budget
+PinBoard Gallery — rollback unified cache; separate video limit + clear in settings
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,213 +72,191 @@ def tool_available(name):
 
 
 # ============================================================
-# PATCH 1 — fix onClose anchor (regex, handles comma variants)
+# PATCH 1 — Delete CacheBudgetEnforcer + remove references
 # ============================================================
-def patch_onclose_release():
-    log("\n=== PATCH: onClose release (regex, comma-tolerant) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
+def rollback_cache_budget_enforcer():
+    log("\n=== PATCH: rollback CacheBudgetEnforcer ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/util/CacheBudgetEnforcer.kt"
+    if f.exists():
+        f.unlink()
+        log("  ✓ CacheBudgetEnforcer.kt deleted")
+    else:
+        log("  ✓ already absent")
 
-    if "com.example.util.VideoPlayerManager.release()" in t:
-        log("  ✓ already patched"); return
-
-    pattern = re.compile(r'([ \t]*)onClose = \{ viewModel\.closeFullscreen\(\) \}(,?)')
-
-    def repl(m):
-        indent = m.group(1)
-        inner = indent + "    "
-        return (
-            f"{indent}onClose = {{\n"
-            f"{inner}com.example.util.VideoPlayerManager.release()\n"
-            f"{inner}viewModel.closeFullscreen()\n"
-            f"{indent}}},"
-        )
-
-    t_new, n = pattern.subn(repl, t, count=1)
-    if n == 0:
-        log("  ✗ onClose not matched even with regex"); sys.exit(1)
-
-    f.write_text(t_new, encoding="utf-8")
-    log("  ✓ onClose now releases player (comma handled)")
+    pa = PROJECT_ROOT / "app/src/main/java/com/example/PinBoardApplication.kt"
+    if pa.exists():
+        t = pa.read_text(encoding="utf-8")
+        old = "        com.example.util.CacheBudgetEnforcer.init(this)\n"
+        if old in t:
+            t = t.replace(old, "", 1)
+            pa.write_text(t, encoding="utf-8")
+            log("  ✓ init removed from PinBoardApplication")
 
 
 # ============================================================
-# PATCH 2 — VideoPlayerManager: full limit + getSimpleCacheForEviction
+# PATCH 2 — Rewrite VideoPlayerManager (fix import, add limit prefs)
 # ============================================================
-def patch_video_player_manager():
-    log("\n=== PATCH: VideoPlayerManager (full limit + evict hook) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/util/VideoPlayerManager.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    changed = False
-
-    # 2a. Switch from 30% budget to full limit
-    old_budget = (
-        "        val budgetMb = maxOf(MIN_VIDEO_CACHE_MB,\n"
-        "            (maxMb * VIDEO_BUDGET_PERCENT) / 100L)\n"
-        "        val budgetBytes = budgetMb * 1024L * 1024L\n"
-    )
-    new_budget = (
-        "        // Use the FULL user limit. Combined image+video is enforced by\n"
-        "        // CacheBudgetEnforcer.sweep() — no artificial 30/70 split.\n"
-        "        val budgetMb = maxMb\n"
-        "        val budgetBytes = budgetMb * 1024L * 1024L\n"
-    )
-    if old_budget in t:
-        t = t.replace(old_budget, new_budget, 1)
-        changed = True
-        log("  ✓ video cache uses full limit (was 30%)")
-    elif "val budgetMb = maxMb\n" in t:
-        log("  ✓ already uses full limit")
-
-    # 2b. Add getSimpleCacheForEviction
-    if "fun getSimpleCacheForEviction(" not in t:
-        anchor = "    fun getCacheSizeBytes(context: Context): Long {\n"
-        add = (
-            "    /** Returns the existing SimpleCache without creating it, for external eviction. */\n"
-            "    fun getSimpleCacheForEviction(context: Context): SimpleCache? = simpleCache\n"
-            "\n"
-            "    fun getCacheSizeBytes(context: Context): Long {\n"
-        )
-        if anchor in t:
-            t = t.replace(anchor, add, 1)
-            changed = True
-            log("  ✓ getSimpleCacheForEviction added")
-        else:
-            log("  ⚠ getCacheSizeBytes anchor missing")
-
-    # 2c. Pause should trigger sweep (delayed)
-    old_pause = (
-        "    fun pause() {\n"
-        "        try { player?.pause() } catch (_: Throwable) {}\n"
-        "    }\n"
-    )
-    new_pause = (
-        "    fun pause() {\n"
-        "        try { player?.pause() } catch (_: Throwable) {}\n"
-        "        CacheBudgetEnforcer.sweepAsync()\n"
-        "    }\n"
-    )
-    if old_pause in t:
-        t = t.replace(old_pause, new_pause, 1)
-        changed = True
-        log("  ✓ pause → sweepAsync")
-    elif "CacheBudgetEnforcer.sweepAsync()" in t and "fun pause()" in t:
-        log("  ✓ pause already calls sweep")
-
-    # 2d. Release should trigger sweep
-    old_release = (
-        "        player = null\n"
-        "        currentPinId = null\n"
-        "    }\n"
-    )
-    new_release = (
-        "        player = null\n"
-        "        currentPinId = null\n"
-        "        CacheBudgetEnforcer.sweepAsync()\n"
-        "    }\n"
-    )
-    if old_release in t and "CacheBudgetEnforcer.sweepAsync()" not in t.split("fun release()")[1][:200] if "fun release()" in t else True:
-        t = t.replace(old_release, new_release, 1)
-        changed = True
-        log("  ✓ release → sweepAsync")
-
-    if changed:
-        f.write_text(t, encoding="utf-8")
-
-
-# ============================================================
-# NEW: CacheBudgetEnforcer.kt
-# ============================================================
-NEW_CACHE_BUDGET_ENFORCER = r'''package com.example.util
+NEW_VIDEO_PLAYER_MANAGER = r'''package com.example.util
 
 import android.content.Context
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import android.net.Uri
+import androidx.media3.common.MediaItem
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.dash.DashMediaSource
+import androidx.media3.exoplayer.hls.HlsMediaSource
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
+import com.example.model.PinItem
 import java.io.File
 
 /**
- * Enforces the user's total cache limit across IMAGE and VIDEO caches.
+ * In-app video player backed by Media3 ExoPlayer with SimpleCache.
  *
- * Rationale:
- *   - Coil (image) and Media3 (video) each have their own LRU evictors that
- *     only know about their own caches. If both use the full limit, combined
- *     size can reach 2x the user's intent.
- *   - This object periodically sweeps. If combined > limit, it evicts the
- *     oldest completed VIDEO spans first (video is easier to evict than
- *     Coil's disk cache). If video is exhausted and combined is still over,
- *     images are simply left alone — Coil's own LRU will evict them on its
- *     next write when it exceeds the limit by itself.
+ * Cache behaviour:
+ *   - Video cache has its OWN configurable limit (MIN 20 / MAX 4096 MB).
+ *   - Cache lives in cacheDir/media3_video_cache (cleared by Android when low on space).
+ *   - Downloads occur while player is playing; pause stops fetching; resume continues.
  *
- * Net effect: combined stays under the user's limit in steady state, with
- * both categories able to grow into whatever the other isn't using.
+ * Cache budgeting is SEPARATE from ImageCacheManager (image cache).
  */
-object CacheBudgetEnforcer {
+object VideoPlayerManager {
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private var appContext: Context? = null
-    private var monitorJob: Job? = null
+    private const val PREFS_NAME = "video_cache_prefs"
+    private const val KEY_MAX_VIDEO_CACHE_MB = "max_video_cache_mb"
+    const val DEFAULT_MAX_VIDEO_CACHE_MB = 512
+    const val MIN_VIDEO_CACHE_MB = 20
+    const val MAX_VIDEO_CACHE_MB = 4096
 
-    fun init(context: Context) {
-        if (appContext != null) return
-        appContext = context.applicationContext
-        monitorJob = scope.launch {
-            while (isActive) {
-                delay(60_000L)
-                try { sweep() } catch (_: Throwable) {}
-            }
-        }
+    private var player: ExoPlayer? = null
+    private var simpleCache: SimpleCache? = null
+    private var cacheBudgetMb: Int = -1
+    private var currentPinId: String? = null
+
+    fun getMaxVideoCacheMb(context: Context): Int {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getInt(KEY_MAX_VIDEO_CACHE_MB, DEFAULT_MAX_VIDEO_CACHE_MB)
     }
 
-    fun sweepAsync() {
-        scope.launch {
-            try {
-                delay(500L)  // let any in-flight write settle
-                sweep()
-            } catch (_: Throwable) {}
-        }
+    fun setMaxVideoCacheMb(context: Context, mb: Int) {
+        val clamped = mb.coerceIn(MIN_VIDEO_CACHE_MB, MAX_VIDEO_CACHE_MB)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putInt(KEY_MAX_VIDEO_CACHE_MB, clamped).apply()
+        // Release existing cache so next access rebuilds with new budget
+        try { simpleCache?.release() } catch (_: Throwable) {}
+        simpleCache = null
+        cacheBudgetMb = -1
     }
 
-    fun sweep() {
-        val ctx = appContext ?: return
-        val limit = ImageCacheManager.getMaxDiskCacheMb(ctx).toLong() * 1024L * 1024L
-        val imageSize = getImageCacheBytes(ctx)
-        val videoSize = VideoPlayerManager.getCacheSizeBytes(ctx)
-        val total = imageSize + videoSize
-        if (total <= limit) return
+    fun getOrCreatePlayer(context: Context): ExoPlayer {
+        player?.let { return it }
+        val ctx = context.applicationContext
+        val p = ExoPlayer.Builder(ctx).build()
+        p.repeatMode = ExoPlayer.REPEAT_MODE_OFF
+        player = p
+        return p
+    }
 
-        var toEvict = total - limit
-        val cache = VideoPlayerManager.getSimpleCacheForEviction(ctx) ?: return
+    private fun getSimpleCache(context: Context): SimpleCache {
+        val ctx = context.applicationContext
+        val maxMb = getMaxVideoCacheMb(ctx)
+        if (simpleCache != null && cacheBudgetMb == maxMb) {
+            return simpleCache!!
+        }
+        try { simpleCache?.release() } catch (_: Throwable) {}
+
+        val budgetBytes = maxMb.toLong() * 1024L * 1024L
+        val cacheDir = File(ctx.cacheDir, "media3_video_cache").apply { mkdirs() }
+        val evictor = LeastRecentlyUsedCacheEvictor(budgetBytes)
+        val cache = SimpleCache(cacheDir, evictor)
+        simpleCache = cache
+        cacheBudgetMb = maxMb
+        return cache
+    }
+
+    fun play(context: Context, pin: PinItem) {
+        val videoUrl = (pin.videoUrl ?: pin.imageUrl).ifBlank { return }
+        val p = getOrCreatePlayer(context)
+
+        if (currentPinId == pin.id && p.mediaItemCount > 0) {
+            p.play()
+            return
+        }
+
+        currentPinId = pin.id
+        val cache = getSimpleCache(context)
+        val upstream = DefaultHttpDataSource.Factory()
+            .setUserAgent("Mozilla/5.0 (Android; Mobile; rv:109.0)")
+            .setAllowCrossProtocolRedirects(true)
+            .setConnectTimeoutMs(15_000)
+            .setReadTimeoutMs(30_000)
+
+        val cacheFactory = CacheDataSource.Factory()
+            .setCache(cache)
+            .setUpstreamDataSourceFactory(upstream)
+            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
+
+        val mediaItem = MediaItem.fromUri(Uri.parse(videoUrl))
+        val mediaSource: MediaSource = when {
+            videoUrl.contains(".m3u8", ignoreCase = true) ->
+                HlsMediaSource.Factory(cacheFactory)
+                    .setAllowChunklessPreparation(true)
+                    .createMediaSource(mediaItem)
+            videoUrl.contains(".mpd", ignoreCase = true) ->
+                DashMediaSource.Factory(cacheFactory)
+                    .createMediaSource(mediaItem)
+            else ->
+                ProgressiveMediaSource.Factory(cacheFactory)
+                    .setLoadErrorHandlingPolicy(DefaultLoadErrorHandlingPolicy(5))
+                    .createMediaSource(mediaItem)
+        }
+
+        p.setMediaSource(mediaSource)
+        p.prepare()
+        p.playWhenReady = true
+    }
+
+    fun pause() {
+        try { player?.pause() } catch (_: Throwable) {}
+    }
+
+    fun release() {
         try {
-            val spans = cache.keys().asSequence()
-                .flatMap { key ->
-                    try { cache.getCachedSpans(key).asSequence() } catch (_: Throwable) { emptySequence() }
-                }
-                .filter { it.file != null }
-                .sortedBy { it.lastTouchTimestamp }
-                .toList()
-
-            for (span in spans) {
-                if (toEvict <= 0L) break
-                try {
-                    if (cache.removeSpan(span)) {
-                        toEvict -= span.length
-                    }
-                } catch (_: Throwable) {}
-            }
+            player?.stop()
+            player?.clearMediaItems()
+            player?.release()
         } catch (_: Throwable) {}
+        player = null
+        currentPinId = null
     }
 
-    private fun getImageCacheBytes(context: Context): Long {
-        val dir = File(context.cacheDir, "image_cache")
+    fun currentPlayingPinId(): String? = currentPinId
+
+    fun getCacheSizeBytes(context: Context): Long {
+        val dir = File(context.cacheDir, "media3_video_cache")
         if (!dir.exists()) return 0L
         return dirSize(dir)
+    }
+
+    fun clearCache(context: Context) {
+        release()
+        try { simpleCache?.release() } catch (_: Throwable) {}
+        simpleCache = null
+        cacheBudgetMb = -1
+        val dir = File(context.cacheDir, "media3_video_cache")
+        if (dir.exists()) {
+            try { dir.deleteRecursively() } catch (_: Throwable) {}
+        }
+    }
+
+    fun invalidateCache() {
+        try { simpleCache?.release() } catch (_: Throwable) {}
+        simpleCache = null
+        cacheBudgetMb = -1
     }
 
     private fun dirSize(dir: File): Long {
@@ -292,66 +270,563 @@ object CacheBudgetEnforcer {
 '''
 
 
-def write_cache_budget_enforcer():
-    log("\n=== PATCH: new CacheBudgetEnforcer.kt ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/util/CacheBudgetEnforcer.kt"
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(NEW_CACHE_BUDGET_ENFORCER, encoding="utf-8")
-    log("  ✓ created")
-
-
-# ============================================================
-# PATCH 3 — PinBoardApplication: init CacheBudgetEnforcer
-# ============================================================
-def patch_pinboard_application():
-    log("\n=== PATCH: PinBoardApplication (init enforcer) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/PinBoardApplication.kt"
+def rewrite_video_player_manager():
+    log("\n=== PATCH: rewrite VideoPlayerManager ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/util/VideoPlayerManager.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
-
-    if "CacheBudgetEnforcer.init(" in t:
-        log("  ✓ already patched"); return
-
-    anchor = '        com.example.util.CrashMonitor.init(this)\n'
-    if anchor in t:
-        t = t.replace(
-            anchor,
-            anchor + "        com.example.util.CacheBudgetEnforcer.init(this)\n",
-            1,
-        )
-        f.write_text(t, encoding="utf-8")
-        log("  ✓ CacheBudgetEnforcer.init called")
-    else:
-        log("  ⚠ CrashMonitor.init anchor missing")
+    if ("androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy" in t
+            and "getMaxVideoCacheMb" in t
+            and "CacheBudgetEnforcer" not in t):
+        log("  ✓ already correct"); return
+    f.write_text(NEW_VIDEO_PLAYER_MANAGER, encoding="utf-8")
+    log("  ✓ rewritten (correct import, separate budget, enforcer removed)")
 
 
 # ============================================================
-# PATCH 4 — ImageCacheManager: video cache is NOT separate anymore
-#           (but getDiskCacheUsageBytes and clearCache still combine them)
+# PATCH 3 — ImageCacheManager: image-only (no video coupling)
 # ============================================================
-def patch_image_cache_manager_comment():
-    log("\n=== PATCH: ImageCacheManager (comment update) ===")
+def patch_image_cache_manager():
+    log("\n=== PATCH: ImageCacheManager (image-only rollback) ===")
     f = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageCacheManager.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
+    changed = False
 
-    # Just ensure VideoPlayerManager calls still work — no code change needed.
-    # The comment update is cosmetic; skip if already there.
-    if "CacheBudgetEnforcer" in t:
-        log("  ✓ already referenced"); return
+    # 3a. getDiskCacheUsageBytes — image only
+    old_gd = (
+        '    /** Combined image + video cache size. Enforced as a single budget by CacheBudgetEnforcer. */\n'
+        '    fun getDiskCacheUsageBytes(context: Context): Long {\n'
+        '        val cacheDir = context.cacheDir.resolve("image_cache")\n'
+        '        val imageBytes = if (!cacheDir.exists()) 0L else getDirSize(cacheDir)\n'
+        '        val videoBytes = try { com.example.util.VideoPlayerManager.getCacheSizeBytes(context) } catch (_: Throwable) { 0L }\n'
+        '        return imageBytes + videoBytes\n'
+        '    }\n'
+    )
+    new_gd = (
+        '    fun getDiskCacheUsageBytes(context: Context): Long {\n'
+        '        val cacheDir = context.cacheDir.resolve("image_cache")\n'
+        '        if (!cacheDir.exists()) return 0L\n'
+        '        return getDirSize(cacheDir)\n'
+        '    }\n'
+    )
+    if old_gd in t:
+        t = t.replace(old_gd, new_gd, 1)
+        changed = True
+        log("  ✓ getDiskCacheUsageBytes → image only")
+    else:
+        # Try simpler replacement if comment was different
+        old_gd2 = (
+            '    fun getDiskCacheUsageBytes(context: Context): Long {\n'
+            '        val cacheDir = context.cacheDir.resolve("image_cache")\n'
+            '        val imageBytes = if (!cacheDir.exists()) 0L else getDirSize(cacheDir)\n'
+            '        val videoBytes = try { com.example.util.VideoPlayerManager.getCacheSizeBytes(context) } catch (_: Throwable) { 0L }\n'
+            '        return imageBytes + videoBytes\n'
+            '    }\n'
+        )
+        if old_gd2 in t:
+            t = t.replace(old_gd2, new_gd, 1)
+            changed = True
+            log("  ✓ getDiskCacheUsageBytes → image only (v2)")
 
-    # Add explanatory comment above getDiskCacheUsageBytes
-    old = (
-        "    fun getDiskCacheUsageBytes(context: Context): Long {\n"
+    # 3b. clearCache — remove video clear
+    old_cc = (
+        '            try { com.example.util.VideoPlayerManager.clearCache(context) } catch (_: Throwable) {}\n'
     )
-    new = (
-        "    /** Combined image + video cache size. Enforced as a single budget by CacheBudgetEnforcer. */\n"
-        "    fun getDiskCacheUsageBytes(context: Context): Long {\n"
+    if old_cc in t:
+        t = t.replace(old_cc, "", 1)
+        changed = True
+        log("  ✓ clearCache → image only")
+
+    # 3c. applyImageLoader — remove invalidateCache
+    old_ap = (
+        '        Coil.setImageLoader(imageLoader)\n'
+        '        try { com.example.util.VideoPlayerManager.invalidateCache() } catch (_: Throwable) {}\n'
+        '    }\n'
     )
-    if old in t:
-        t = t.replace(old, new, 1)
+    new_ap = (
+        '        Coil.setImageLoader(imageLoader)\n'
+        '    }\n'
+    )
+    if old_ap in t:
+        t = t.replace(old_ap, new_ap, 1)
+        changed = True
+        log("  ✓ applyImageLoader → no video invalidation")
+
+    if changed:
         f.write_text(t, encoding="utf-8")
-        log("  ✓ comment added")
+
+
+# ============================================================
+# PATCH 4 — FullscreenGalleryViewer: fix overlay scope
+# ============================================================
+def fix_fullscreen_video_overlay():
+    log("\n=== PATCH: FullscreenGalleryViewer (top-level overlay) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # 4a. Remove any existing broken overlay (inside pager — bad scope)
+    bad_if = "if (pin.isVideo && playingVideoPinId == pin.id) {"
+    bidx = t.find(bad_if)
+    if bidx >= 0:
+        prev_comment = t.rfind("// In-app video player overlay", 0, bidx)
+        if prev_comment < 0:
+            prev_comment = bidx
+        # Back up to start of comment line
+        line_start = t.rfind("\n", 0, prev_comment) + 1
+        # Trim leading blank line if present
+        while line_start >= 2 and t[line_start-1] == "\n" and t[line_start-2] == "\n":
+            line_start -= 1
+
+        # Brace balance the if block
+        ob = t.find("{", bidx)
+        depth = 0
+        i = ob
+        close_brace = -1
+        while i < len(t):
+            c = t[i]
+            if c == '"':
+                i += 1
+                while i < len(t):
+                    if t[i] == "\\": i += 2; continue
+                    if t[i] == '"': break
+                    i += 1
+            elif c == "{": depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    close_brace = i
+                    break
+            i += 1
+        if close_brace > 0:
+            end = close_brace + 1
+            while end < len(t) and t[end] == "\n":
+                end += 1
+            t = t[:line_start] + t[end:]
+            changed = True
+            log("  ✓ removed broken overlay (was inside pager)")
+
+    # 4b. Insert new top-level overlay before pinForImageHoldDialog
+    if "// In-app video player overlay (top-level)" not in t:
+        anchor = "\n        pinForImageHoldDialog?.let { pin ->\n"
+        if anchor not in t:
+            log("  ⚠ pinForImageHoldDialog anchor not found"); sys.exit(1)
+
+        overlay = (
+            "\n"
+            "        // In-app video player overlay (top-level) — plays the pin whose id matches\n"
+            "        val playingPin = playingVideoPinId?.let { id -> pins.firstOrNull { it.id == id } }\n"
+            "        if (playingPin != null) {\n"
+            "            androidx.compose.foundation.layout.Box(\n"
+            "                modifier = Modifier\n"
+            "                    .fillMaxSize()\n"
+            "                    .background(Color.Black)\n"
+            "                    .testTag(\"video_player_overlay\")\n"
+            "            ) {\n"
+            "                FullscreenVideoPlayer(modifier = Modifier.fillMaxSize())\n"
+            "\n"
+            "                IconButton(\n"
+            "                    onClick = {\n"
+            "                        com.example.util.VideoPlayerManager.release()\n"
+            "                        playingVideoPinId = null\n"
+            "                        onClose()\n"
+            "                    },\n"
+            "                    modifier = Modifier\n"
+            "                        .align(Alignment.TopStart)\n"
+            "                        .padding(16.dp)\n"
+            "                        .size(44.dp)\n"
+            "                        .background(Color.Black.copy(alpha = 0.55f), CircleShape)\n"
+            "                ) {\n"
+            "                    Icon(\n"
+            "                        imageVector = Icons.Default.Close,\n"
+            "                        contentDescription = \"Close video\",\n"
+            "                        tint = Color.White\n"
+            "                    )\n"
+            "                }\n"
+            "\n"
+            "                if (pins.size > 1 && !disableArrowNavigation) {\n"
+            "                    IconButton(\n"
+            "                        onClick = {\n"
+            "                            com.example.util.VideoPlayerManager.pause()\n"
+            "                            playingVideoPinId = null\n"
+            "                            coroutineScope.launch {\n"
+            "                                val target = (pagerState.currentPage - 1).coerceAtLeast(0)\n"
+            "                                pagerState.animateScrollToPage(target)\n"
+            "                            }\n"
+            "                        },\n"
+            "                        modifier = Modifier\n"
+            "                            .align(Alignment.CenterStart)\n"
+            "                            .padding(12.dp)\n"
+            "                            .size(44.dp)\n"
+            "                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)\n"
+            "                    ) {\n"
+            "                        Icon(\n"
+            "                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,\n"
+            "                            contentDescription = \"Previous\",\n"
+            "                            tint = Color.White\n"
+            "                        )\n"
+            "                    }\n"
+            "                    IconButton(\n"
+            "                        onClick = {\n"
+            "                            com.example.util.VideoPlayerManager.pause()\n"
+            "                            playingVideoPinId = null\n"
+            "                            coroutineScope.launch {\n"
+            "                                val target = (pagerState.currentPage + 1).coerceAtMost(virtualPageCount - 1)\n"
+            "                                pagerState.animateScrollToPage(target)\n"
+            "                            }\n"
+            "                        },\n"
+            "                        modifier = Modifier\n"
+            "                            .align(Alignment.CenterEnd)\n"
+            "                            .padding(12.dp)\n"
+            "                            .size(44.dp)\n"
+            "                            .background(Color.Black.copy(alpha = 0.5f), CircleShape)\n"
+            "                    ) {\n"
+            "                        Icon(\n"
+            "                            imageVector = Icons.AutoMirrored.Filled.ArrowForward,\n"
+            "                            contentDescription = \"Next\",\n"
+            "                            tint = Color.White\n"
+            "                        )\n"
+            "                    }\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "\n"
+            "        pinForImageHoldDialog?.let { pin ->\n"
+        )
+        t = t.replace(anchor, overlay, 1)
+        changed = True
+        log("  ✓ top-level overlay inserted")
+
+    # 4c. Ensure Close icon import
+    if "import androidx.compose.material.icons.filled.Close\n" not in t:
+        for anchor_imp in [
+            "import androidx.compose.material.icons.filled.ContentCopy\n",
+            "import androidx.compose.material.icons.filled.DeleteOutline\n",
+            "import androidx.compose.material.icons.filled.Download\n",
+        ]:
+            if anchor_imp in t:
+                t = t.replace(anchor_imp, "import androidx.compose.material.icons.filled.Close\n" + anchor_imp, 1)
+                changed = True
+                log("  ✓ Close icon import added")
+                break
+
+    # 4d. Ensure FullscreenVideoPlayer import (same package, no import needed — but verify)
+    # (it's com.example.ui.components.FullscreenVideoPlayer — same package as FullscreenGalleryViewer)
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# PATCH 5 — SettingsDialog: video cache section
+# ============================================================
+def patch_settings_dialog():
+    log("\n=== PATCH: SettingsDialog (video cache section) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/SettingsDialog.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+
+    if "video_cache_size_slider" in t:
+        log("  ✓ already patched"); return
+
+    changed = False
+
+    # 5a. Add PlayArrow import
+    if "import androidx.compose.material.icons.filled.PlayArrow" not in t:
+        for anchor in [
+            "import androidx.compose.material.icons.filled.DeleteSweep\n",
+            "import androidx.compose.material.icons.filled.Settings\n",
+            "import androidx.compose.material.icons.filled.BugReport\n",
+        ]:
+            if anchor in t:
+                t = t.replace(anchor, anchor + "import androidx.compose.material.icons.filled.PlayArrow\n", 1)
+                changed = True
+                break
+
+    # 5b. Add state declarations after image cache ones
+    old_state = (
+        "    var sliderValue by remember { mutableFloatStateOf(currentSavedMb.toFloat()) }\n"
+        "    var textValue by remember { mutableStateOf(currentSavedMb.toString()) }\n"
+        "    var isInputError by remember { mutableStateOf(false) }\n"
+    )
+    new_state = (
+        old_state +
+        "\n"
+        "    // Video cache state\n"
+        "    val currentVideoSavedMb = remember { com.example.util.VideoPlayerManager.getMaxVideoCacheMb(context) }\n"
+        "    var currentVideoCacheUsageBytes by remember { mutableLongStateOf(0L) }\n"
+        "    var videoSliderValue by remember { mutableFloatStateOf(currentVideoSavedMb.toFloat()) }\n"
+        "    var videoTextValue by remember { mutableStateOf(currentVideoSavedMb.toString()) }\n"
+        "    var videoInputError by remember { mutableStateOf(false) }\n"
+    )
+    if old_state in t:
+        t = t.replace(old_state, new_state, 1)
+        changed = True
+        log("  ✓ video cache state added")
+
+    # 5c. Extend LaunchedEffect(isOpen) to read video usage
+    old_lc = (
+        "    LaunchedEffect(isOpen) {\n"
+        "        currentCacheUsageBytes = ImageCacheManager.getDiskCacheUsageBytes(context)\n"
+        "    }\n"
+    )
+    new_lc = (
+        "    LaunchedEffect(isOpen) {\n"
+        "        currentCacheUsageBytes = ImageCacheManager.getDiskCacheUsageBytes(context)\n"
+        "        currentVideoCacheUsageBytes = try {\n"
+        "            com.example.util.VideoPlayerManager.getCacheSizeBytes(context)\n"
+        "        } catch (_: Throwable) { 0L }\n"
+        "    }\n"
+    )
+    if old_lc in t:
+        t = t.replace(old_lc, new_lc, 1)
+        changed = True
+        log("  ✓ LaunchedEffect reads video usage")
+
+    # 5d. Insert video section before Crash & Error Diagnostics card
+    anchor_diag = (
+        "                Spacer(modifier = Modifier.height(16.dp))\n"
+        "                HorizontalDivider(color = PinterestPillDarkGray.copy(alpha = 0.5f))\n"
+        "                Spacer(modifier = Modifier.height(12.dp))\n"
+        "\n"
+        "                // Crash & Error Diagnostics\n"
+    )
+    if anchor_diag not in t:
+        log("  ⚠ diagnostics anchor missing"); sys.exit(1)
+
+    video_section = (
+        "                Spacer(modifier = Modifier.height(16.dp))\n"
+        "                HorizontalDivider(color = PinterestPillDarkGray.copy(alpha = 0.5f))\n"
+        "                Spacer(modifier = Modifier.height(12.dp))\n"
+        "\n"
+        "                // Video cache usage card\n"
+        "                Card(\n"
+        "                    shape = RoundedCornerShape(12.dp),\n"
+        "                    colors = CardDefaults.cardColors(containerColor = PinterestPillGray),\n"
+        "                    modifier = Modifier.fillMaxWidth()\n"
+        "                ) {\n"
+        "                    Row(\n"
+        "                        modifier = Modifier\n"
+        "                            .fillMaxWidth()\n"
+        "                            .padding(horizontal = 12.dp, vertical = 10.dp),\n"
+        "                        verticalAlignment = Alignment.CenterVertically,\n"
+        "                        horizontalArrangement = Arrangement.SpaceBetween\n"
+        "                    ) {\n"
+        "                        Row(verticalAlignment = Alignment.CenterVertically) {\n"
+        "                            Icon(\n"
+        "                                imageVector = Icons.Default.PlayArrow,\n"
+        "                                contentDescription = null,\n"
+        "                                tint = PinterestRed,\n"
+        "                                modifier = Modifier.size(20.dp)\n"
+        "                            )\n"
+        "                            Spacer(modifier = Modifier.width(8.dp))\n"
+        "                            Column {\n"
+        "                                Text(\n"
+        "                                    text = \"Current Video Cache\",\n"
+        "                                    fontSize = 12.sp,\n"
+        "                                    color = PinterestTextSecondary,\n"
+        "                                    fontWeight = FontWeight.Medium\n"
+        "                                )\n"
+        "                                Text(\n"
+        "                                    text = ImageCacheManager.formatBytes(currentVideoCacheUsageBytes),\n"
+        "                                    fontSize = 14.sp,\n"
+        "                                    fontWeight = FontWeight.Bold,\n"
+        "                                    color = PinterestBlack\n"
+        "                                )\n"
+        "                            }\n"
+        "                        }\n"
+        "                        Button(\n"
+        "                            onClick = {\n"
+        "                                com.example.util.VideoPlayerManager.clearCache(context)\n"
+        "                                currentVideoCacheUsageBytes = 0L\n"
+        "                            },\n"
+        "                            colors = ButtonDefaults.buttonColors(\n"
+        "                                containerColor = MaterialTheme.colorScheme.surface,\n"
+        "                                contentColor = PinterestRed\n"
+        "                            ),\n"
+        "                            shape = RoundedCornerShape(16.dp),\n"
+        "                            elevation = ButtonDefaults.buttonElevation(defaultElevation = 1.dp),\n"
+        "                            modifier = Modifier.testTag(\"clear_video_cache_button\")\n"
+        "                        ) {\n"
+        "                            Icon(\n"
+        "                                imageVector = Icons.Default.DeleteSweep,\n"
+        "                                contentDescription = null,\n"
+        "                                modifier = Modifier.size(16.dp)\n"
+        "                            )\n"
+        "                            Spacer(modifier = Modifier.width(4.dp))\n"
+        "                            Text(\"Clear\", fontSize = 12.sp, fontWeight = FontWeight.Bold)\n"
+        "                        }\n"
+        "                    }\n"
+        "                }\n"
+        "\n"
+        "                Spacer(modifier = Modifier.height(16.dp))\n"
+        "                Text(\n"
+        "                    text = \"MAX VIDEO CACHE SIZE\",\n"
+        "                    style = MaterialTheme.typography.labelSmall.copy(\n"
+        "                        fontWeight = FontWeight.Bold,\n"
+        "                        fontSize = 11.sp,\n"
+        "                        letterSpacing = 0.5.sp,\n"
+        "                        color = PinterestTextSecondary\n"
+        "                    )\n"
+        "                )\n"
+        "                Spacer(modifier = Modifier.height(4.dp))\n"
+        "                Text(\n"
+        "                    text = \"Maximum disk space (MB) reserved for in-app video playback cache:\",\n"
+        "                    style = MaterialTheme.typography.bodySmall.copy(\n"
+        "                        fontSize = 12.sp,\n"
+        "                        color = PinterestTextSecondary\n"
+        "                    )\n"
+        "                )\n"
+        "                Spacer(modifier = Modifier.height(12.dp))\n"
+        "\n"
+        "                OutlinedTextField(\n"
+        "                    value = videoTextValue,\n"
+        "                    onValueChange = { input ->\n"
+        "                        val filtered = input.filter { it.isDigit() }\n"
+        "                        videoTextValue = filtered\n"
+        "                        val parsed = filtered.toIntOrNull()\n"
+        "                        if (parsed != null && parsed in com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB..com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB) {\n"
+        "                            videoInputError = false\n"
+        "                            videoSliderValue = parsed.toFloat()\n"
+        "                        } else {\n"
+        "                            videoInputError = filtered.isNotEmpty()\n"
+        "                        }\n"
+        "                    },\n"
+        "                    label = { Text(\"Video Cache Size (MB)\") },\n"
+        "                    suffix = { Text(\"MB\", fontWeight = FontWeight.Bold) },\n"
+        "                    singleLine = true,\n"
+        "                    isError = videoInputError,\n"
+        "                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),\n"
+        "                    colors = OutlinedTextFieldDefaults.colors(\n"
+        "                        focusedBorderColor = PinterestRed,\n"
+        "                        cursorColor = PinterestRed,\n"
+        "                        focusedLabelColor = PinterestRed\n"
+        "                    ),\n"
+        "                    shape = RoundedCornerShape(12.dp),\n"
+        "                    modifier = Modifier\n"
+        "                        .fillMaxWidth()\n"
+        "                        .testTag(\"video_cache_size_text_input\")\n"
+        "                )\n"
+        "\n"
+        "                if (videoInputError) {\n"
+        "                    Text(\n"
+        "                        text = \"Enter a value between ${com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB} and ${com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB} MB\",\n"
+        "                        color = MaterialTheme.colorScheme.error,\n"
+        "                        fontSize = 11.sp,\n"
+        "                        modifier = Modifier.padding(start = 4.dp, top = 2.dp)\n"
+        "                    )\n"
+        "                }\n"
+        "\n"
+        "                Spacer(modifier = Modifier.height(10.dp))\n"
+        "\n"
+        "                Row(\n"
+        "                    modifier = Modifier.fillMaxWidth(),\n"
+        "                    horizontalArrangement = Arrangement.SpaceBetween,\n"
+        "                    verticalAlignment = Alignment.CenterVertically\n"
+        "                ) {\n"
+        "                    Text(\"${com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB} MB\", fontSize = 11.sp, color = PinterestTextSecondary)\n"
+        "                    Text(\"${videoSliderValue.toInt()} MB\", fontSize = 13.sp, fontWeight = FontWeight.ExtraBold, color = PinterestRed)\n"
+        "                    Text(\"${com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB} MB\", fontSize = 11.sp, color = PinterestTextSecondary)\n"
+        "                }\n"
+        "\n"
+        "                Slider(\n"
+        "                    value = videoSliderValue,\n"
+        "                    onValueChange = { v ->\n"
+        "                        videoSliderValue = v\n"
+        "                        videoTextValue = v.toInt().toString()\n"
+        "                        videoInputError = false\n"
+        "                    },\n"
+        "                    valueRange = com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB.toFloat()..com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB.toFloat(),\n"
+        "                    colors = SliderDefaults.colors(\n"
+        "                        thumbColor = PinterestRed,\n"
+        "                        activeTrackColor = PinterestRed,\n"
+        "                        inactiveTrackColor = PinterestPillGray\n"
+        "                    ),\n"
+        "                    modifier = Modifier\n"
+        "                        .fillMaxWidth()\n"
+        "                        .testTag(\"video_cache_size_slider\")\n"
+        "                )\n"
+        "\n"
+        "                Spacer(modifier = Modifier.height(8.dp))\n"
+        "\n"
+        "                Row(\n"
+        "                    modifier = Modifier.fillMaxWidth(),\n"
+        "                    horizontalArrangement = Arrangement.spacedBy(6.dp)\n"
+        "                ) {\n"
+        "                    listOf(256, 512, 1024, 2048).forEach { presetMb ->\n"
+        "                        val isSelected = videoSliderValue.toInt() == presetMb\n"
+        "                        Surface(\n"
+        "                            shape = RoundedCornerShape(16.dp),\n"
+        "                            color = if (isSelected) PinterestBlack else PinterestPillGray,\n"
+        "                            modifier = Modifier\n"
+        "                                .weight(1f)\n"
+        "                                .clickable {\n"
+        "                                    videoSliderValue = presetMb.toFloat()\n"
+        "                                    videoTextValue = presetMb.toString()\n"
+        "                                    videoInputError = false\n"
+        "                                }\n"
+        "                        ) {\n"
+        "                            Box(\n"
+        "                                contentAlignment = Alignment.Center,\n"
+        "                                modifier = Modifier.padding(vertical = 6.dp)\n"
+        "                            ) {\n"
+        "                                Text(\n"
+        "                                    text = if (presetMb >= 1024) \"${presetMb / 1024} GB\" else \"${presetMb} M\",\n"
+        "                                    fontSize = 11.sp,\n"
+        "                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,\n"
+        "                                    color = if (isSelected) Color.White else PinterestBlack\n"
+        "                                )\n"
+        "                            }\n"
+        "                        }\n"
+        "                    }\n"
+        "                }\n"
+        "\n"
+        + anchor_diag
+    )
+    t = t.replace(anchor_diag, video_section, 1)
+    changed = True
+    log("  ✓ video cache section inserted")
+
+    # 5e. Extend confirmButton save to include video
+    old_save = (
+        "                onClick = {\n"
+        "                    focusManager.clearFocus()\n"
+        "                    val finalMb = textValue.toIntOrNull() ?: sliderValue.toInt()\n"
+        "                    val clamped = finalMb.coerceIn(ImageCacheManager.MIN_CACHE_MB, ImageCacheManager.MAX_CACHE_MB)\n"
+        "                    ImageCacheManager.setMaxDiskCacheMb(context, clamped)\n"
+        "                    onCacheSizeSaved(clamped)\n"
+        "\n"
+        "                    onDismiss()\n"
+        "                },\n"
+    )
+    new_save = (
+        "                onClick = {\n"
+        "                    focusManager.clearFocus()\n"
+        "                    val finalMb = textValue.toIntOrNull() ?: sliderValue.toInt()\n"
+        "                    val clamped = finalMb.coerceIn(ImageCacheManager.MIN_CACHE_MB, ImageCacheManager.MAX_CACHE_MB)\n"
+        "                    ImageCacheManager.setMaxDiskCacheMb(context, clamped)\n"
+        "                    val finalVideoMb = videoTextValue.toIntOrNull() ?: videoSliderValue.toInt()\n"
+        "                    val videoClamped = finalVideoMb.coerceIn(\n"
+        "                        com.example.util.VideoPlayerManager.MIN_VIDEO_CACHE_MB,\n"
+        "                        com.example.util.VideoPlayerManager.MAX_VIDEO_CACHE_MB\n"
+        "                    )\n"
+        "                    com.example.util.VideoPlayerManager.setMaxVideoCacheMb(context, videoClamped)\n"
+        "                    onCacheSizeSaved(clamped)\n"
+        "\n"
+        "                    onDismiss()\n"
+        "                },\n"
+    )
+    if old_save in t:
+        t = t.replace(old_save, new_save, 1)
+        changed = True
+        log("  ✓ confirmButton saves video limit")
+    else:
+        log("  ⚠ confirmButton anchor missing — saving video limit may not work")
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
 
 
 # ============================================================
@@ -359,46 +834,65 @@ def patch_image_cache_manager_comment():
 # ============================================================
 def verify_all():
     log("\n=== VERIFY ===")
-    checks = []
 
-    ps = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
     vpm = PROJECT_ROOT / "app/src/main/java/com/example/util/VideoPlayerManager.kt"
-    cbe = PROJECT_ROOT / "app/src/main/java/com/example/util/CacheBudgetEnforcer.kt"
-    pa = PROJECT_ROOT / "app/src/main/java/com/example/PinBoardApplication.kt"
     icm = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageCacheManager.kt"
+    fsv = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
+    sd = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/SettingsDialog.kt"
+    pa = PROJECT_ROOT / "app/src/main/java/com/example/PinBoardApplication.kt"
+    cbe = PROJECT_ROOT / "app/src/main/java/com/example/util/CacheBudgetEnforcer.kt"
 
-    for p in (ps, vpm, cbe, pa, icm):
+    for p in (vpm, icm, fsv, sd, pa):
         if not p.exists(): log(f"  ✗ missing: {p}"); sys.exit(1)
 
-    ps_t = ps.read_text(encoding="utf-8")
-    vpm_t = vpm.read_text(encoding="utf-8")
-    cbe_t = cbe.read_text(encoding="utf-8")
-    pa_t = pa.read_text(encoding="utf-8")
-    icm_t = icm.read_text(encoding="utf-8")
+    checks = []
 
-    checks.append(("Screen onClose releases player",
-                   "com.example.util.VideoPlayerManager.release()" in ps_t))
-    checks.append(("Screen onClose pattern correct",
-                   "onClose = {\n" in ps_t and "com.example.util.VideoPlayerManager.release()" in ps_t))
-    checks.append(("Screen no leftover one-line onClose",
-                   "onClose = { viewModel.closeFullscreen() }" not in ps_t or
-                   "onClose = {\n" in ps_t))
-    checks.append(("VideoPlayerManager full limit (no % split)",
-                   "val budgetMb = maxMb" in vpm_t))
-    checks.append(("VideoPlayerManager getSimpleCacheForEviction",
-                   "fun getSimpleCacheForEviction(" in vpm_t))
-    checks.append(("VideoPlayerManager pause → sweep",
-                   "fun pause()" in vpm_t and "CacheBudgetEnforcer.sweepAsync()" in vpm_t))
-    checks.append(("VideoPlayerManager release → sweep",
-                   "fun release()" in vpm_t and vpm_t.count("CacheBudgetEnforcer.sweepAsync()") >= 2))
-    checks.append(("CacheBudgetEnforcer exists",
-                   "object CacheBudgetEnforcer" in cbe_t))
-    checks.append(("CacheBudgetEnforcer sweep reads video size",
-                   "VideoPlayerManager.getCacheSizeBytes" in cbe_t))
-    checks.append(("CacheBudgetEnforcer evicts via removeSpan",
-                   "cache.removeSpan(span)" in cbe_t))
-    checks.append(("PinBoardApplication inits enforcer",
-                   "CacheBudgetEnforcer.init(" in pa_t))
+    checks.append(("CacheBudgetEnforcer.kt deleted", not cbe.exists()))
+
+    vpm_t = vpm.read_text(encoding="utf-8")
+    checks.append(("VideoPlayerManager correct import",
+                   "import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy" in vpm_t))
+    checks.append(("VideoPlayerManager getMaxVideoCacheMb",
+                   "fun getMaxVideoCacheMb(" in vpm_t))
+    checks.append(("VideoPlayerManager setMaxVideoCacheMb",
+                   "fun setMaxVideoCacheMb(" in vpm_t))
+    checks.append(("VideoPlayerManager no enforcer calls",
+                   "CacheBudgetEnforcer" not in vpm_t))
+    checks.append(("VideoPlayerManager no getSimpleCacheForEviction",
+                   "getSimpleCacheForEviction" not in vpm_t))
+
+    pa_t = pa.read_text(encoding="utf-8")
+    checks.append(("PinBoardApplication no enforcer init",
+                   "CacheBudgetEnforcer" not in pa_t))
+
+    icm_t = icm.read_text(encoding="utf-8")
+    checks.append(("ImageCacheManager no video coupling in usage",
+                   "VideoPlayerManager.getCacheSizeBytes" not in icm_t))
+    checks.append(("ImageCacheManager no video clear",
+                   "VideoPlayerManager.clearCache" not in icm_t))
+    checks.append(("ImageCacheManager no invalidateCache",
+                   "VideoPlayerManager.invalidateCache" not in icm_t))
+
+    fsv_t = fsv.read_text(encoding="utf-8")
+    checks.append(("Fullscreen has top-level overlay",
+                   "// In-app video player overlay (top-level)" in fsv_t))
+    checks.append(("Fullscreen overlay uses playingPin",
+                   "val playingPin = playingVideoPinId?.let { id -> pins.firstOrNull { it.id == id } }" in fsv_t))
+    checks.append(("Fullscreen no broken pin.isVideo&&playingVideoPinId",
+                   "if (pin.isVideo && playingVideoPinId == pin.id)" not in fsv_t))
+    checks.append(("Fullscreen Close import",
+                   "import androidx.compose.material.icons.filled.Close" in fsv_t))
+
+    sd_t = sd.read_text(encoding="utf-8")
+    checks.append(("Settings video slider", "video_cache_size_slider" in sd_t))
+    checks.append(("Settings video text input", "video_cache_size_text_input" in sd_t))
+    checks.append(("Settings video clear button", "clear_video_cache_button" in sd_t))
+    checks.append(("Settings video state",
+                   "videoSliderValue" in sd_t and "currentVideoCacheUsageBytes" in sd_t))
+    checks.append(("Settings saves video limit",
+                   "VideoPlayerManager.setMaxVideoCacheMb" in sd_t))
+    checks.append(("Settings PlayArrow import",
+                   "import androidx.compose.material.icons.filled.PlayArrow" in sd_t))
 
     def strip(text):
         out, i = [], 0
@@ -428,7 +922,7 @@ def verify_all():
                 out.append(c); i += 1
         return "".join(out)
 
-    for label, path in [("Screen", ps), ("Manager", vpm), ("Enforcer", cbe)]:
+    for label, path in [("Manager", vpm), ("Fullscreen", fsv), ("Settings", sd), ("ICM", icm)]:
         s = strip(path.read_text(encoding="utf-8"))
         po, pc = s.count("("), s.count(")")
         bo, bc = s.count("{"), s.count("}")
@@ -570,7 +1064,8 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Fix onClose anchor + unified cache budget (CacheBudgetEnforcer)"])
+        run(["git", "commit", "-m",
+             "Rollback unified cache; separate video limit + clear in settings; fix overlay scope"])
 
 
 def verify_keystore_tracked():
@@ -719,17 +1214,17 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — onClose anchor fix + unified cache budget")
+    log("PinBoard — separate video cache + clear in settings; fix overlay")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    patch_onclose_release()
-    patch_video_player_manager()
-    write_cache_budget_enforcer()
-    patch_pinboard_application()
-    patch_image_cache_manager_comment()
+    rollback_cache_budget_enforcer()
+    rewrite_video_player_manager()
+    patch_image_cache_manager()
+    fix_fullscreen_video_overlay()
+    patch_settings_dialog()
     verify_all()
 
     ensure_release_keystore()

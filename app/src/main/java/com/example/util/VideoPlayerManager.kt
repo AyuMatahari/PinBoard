@@ -7,38 +7,52 @@ import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
-import androidx.media3.exoplayer.DefaultLoadErrorHandlingPolicy
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy
 import com.example.model.PinItem
 import java.io.File
 
 /**
- * Singleton managing the ExoPlayer + Media3 disk cache.
+ * In-app video player backed by Media3 ExoPlayer with SimpleCache.
  *
- * Cache budgeting:
- *   - 30% of ImageCacheManager.getMaxDiskCacheMb() is reserved for the video cache.
- *   - This budget is enforced by LeastRecentlyUsedCacheEvictor.
- *   - Cache lives in cacheDir/media3_video_cache so it is auto-cleaned by Android.
+ * Cache behaviour:
+ *   - Video cache has its OWN configurable limit (MIN 20 / MAX 4096 MB).
+ *   - Cache lives in cacheDir/media3_video_cache (cleared by Android when low on space).
+ *   - Downloads occur while player is playing; pause stops fetching; resume continues.
  *
- * Download behavior (via CacheDataSource):
- *   - While player.play() is active → fetches chunks ahead of the playhead
- *   - When player.pause() is called → fetches stop
- *   - When player resumes → fetches resume from where they left off
- *   This exactly matches the requirement "pause download on nav/exit".
+ * Cache budgeting is SEPARATE from ImageCacheManager (image cache).
  */
 object VideoPlayerManager {
+
+    private const val PREFS_NAME = "video_cache_prefs"
+    private const val KEY_MAX_VIDEO_CACHE_MB = "max_video_cache_mb"
+    const val DEFAULT_MAX_VIDEO_CACHE_MB = 512
+    const val MIN_VIDEO_CACHE_MB = 20
+    const val MAX_VIDEO_CACHE_MB = 4096
 
     private var player: ExoPlayer? = null
     private var simpleCache: SimpleCache? = null
     private var cacheBudgetMb: Int = -1
     private var currentPinId: String? = null
 
-    private const val VIDEO_BUDGET_PERCENT = 30L
-    private const val MIN_VIDEO_CACHE_MB = 20L
+    fun getMaxVideoCacheMb(context: Context): Int {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return prefs.getInt(KEY_MAX_VIDEO_CACHE_MB, DEFAULT_MAX_VIDEO_CACHE_MB)
+    }
+
+    fun setMaxVideoCacheMb(context: Context, mb: Int) {
+        val clamped = mb.coerceIn(MIN_VIDEO_CACHE_MB, MAX_VIDEO_CACHE_MB)
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit().putInt(KEY_MAX_VIDEO_CACHE_MB, clamped).apply()
+        // Release existing cache so next access rebuilds with new budget
+        try { simpleCache?.release() } catch (_: Throwable) {}
+        simpleCache = null
+        cacheBudgetMb = -1
+    }
 
     fun getOrCreatePlayer(context: Context): ExoPlayer {
         player?.let { return it }
@@ -51,16 +65,13 @@ object VideoPlayerManager {
 
     private fun getSimpleCache(context: Context): SimpleCache {
         val ctx = context.applicationContext
-        val maxMb = ImageCacheManager.getMaxDiskCacheMb(ctx)
+        val maxMb = getMaxVideoCacheMb(ctx)
         if (simpleCache != null && cacheBudgetMb == maxMb) {
             return simpleCache!!
         }
         try { simpleCache?.release() } catch (_: Throwable) {}
 
-        // Use the FULL user limit. Combined image+video is enforced by
-        // CacheBudgetEnforcer.sweep() — no artificial 30/70 split.
-        val budgetMb = maxMb
-        val budgetBytes = budgetMb * 1024L * 1024L
+        val budgetBytes = maxMb.toLong() * 1024L * 1024L
         val cacheDir = File(ctx.cacheDir, "media3_video_cache").apply { mkdirs() }
         val evictor = LeastRecentlyUsedCacheEvictor(budgetBytes)
         val cache = SimpleCache(cacheDir, evictor)
@@ -113,7 +124,6 @@ object VideoPlayerManager {
 
     fun pause() {
         try { player?.pause() } catch (_: Throwable) {}
-        CacheBudgetEnforcer.sweepAsync()
     }
 
     fun release() {
@@ -124,13 +134,9 @@ object VideoPlayerManager {
         } catch (_: Throwable) {}
         player = null
         currentPinId = null
-        CacheBudgetEnforcer.sweepAsync()
     }
 
     fun currentPlayingPinId(): String? = currentPinId
-
-    /** Returns the existing SimpleCache without creating it, for external eviction. */
-    fun getSimpleCacheForEviction(context: Context): SimpleCache? = simpleCache
 
     fun getCacheSizeBytes(context: Context): Long {
         val dir = File(context.cacheDir, "media3_video_cache")
