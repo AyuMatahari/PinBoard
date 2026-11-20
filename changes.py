@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PinBoard Gallery — rebuild PinCard + FullscreenGalleryViewer signature/call
+PinBoard Gallery — fix onClose anchor + unified cache budget
 """
 import os, re, sys, json, time, shutil, datetime, subprocess, urllib.request
 from pathlib import Path
@@ -72,459 +72,333 @@ def tool_available(name):
 
 
 # ============================================================
-# Canonical PinCard.kt (rewrite)
+# PATCH 1 — fix onClose anchor (regex, handles comma variants)
 # ============================================================
-NEW_PIN_CARD = r'''package com.example.ui.components
+def patch_onclose_release():
+    log("\n=== PATCH: onClose release (regex, comma-tolerant) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
 
-// v2-video
-import androidx.compose.foundation.ExperimentalFoundationApi
-import androidx.compose.foundation.background
-import androidx.compose.foundation.border
-import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.BrokenImage
-import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.Favorite
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material3.Icon
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
-import coil.compose.AsyncImage
-import coil.request.ImageRequest
-import com.example.model.PinItem
-import com.example.ui.theme.PinterestBlack
-import com.example.ui.theme.PinterestPillGray
-import com.example.ui.theme.PinterestRed
-import com.example.ui.theme.PinterestTextSecondary
+    if "com.example.util.VideoPlayerManager.release()" in t:
+        log("  ✓ already patched"); return
+
+    pattern = re.compile(r'([ \t]*)onClose = \{ viewModel\.closeFullscreen\(\) \}(,?)')
+
+    def repl(m):
+        indent = m.group(1)
+        inner = indent + "    "
+        return (
+            f"{indent}onClose = {{\n"
+            f"{inner}com.example.util.VideoPlayerManager.release()\n"
+            f"{inner}viewModel.closeFullscreen()\n"
+            f"{indent}}},"
+        )
+
+    t_new, n = pattern.subn(repl, t, count=1)
+    if n == 0:
+        log("  ✗ onClose not matched even with regex"); sys.exit(1)
+
+    f.write_text(t_new, encoding="utf-8")
+    log("  ✓ onClose now releases player (comma handled)")
+
+
+# ============================================================
+# PATCH 2 — VideoPlayerManager: full limit + getSimpleCacheForEviction
+# ============================================================
+def patch_video_player_manager():
+    log("\n=== PATCH: VideoPlayerManager (full limit + evict hook) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/util/VideoPlayerManager.kt"
+    if not f.exists(): log("  ✗ not found"); sys.exit(1)
+    t = f.read_text(encoding="utf-8")
+    changed = False
+
+    # 2a. Switch from 30% budget to full limit
+    old_budget = (
+        "        val budgetMb = maxOf(MIN_VIDEO_CACHE_MB,\n"
+        "            (maxMb * VIDEO_BUDGET_PERCENT) / 100L)\n"
+        "        val budgetBytes = budgetMb * 1024L * 1024L\n"
+    )
+    new_budget = (
+        "        // Use the FULL user limit. Combined image+video is enforced by\n"
+        "        // CacheBudgetEnforcer.sweep() — no artificial 30/70 split.\n"
+        "        val budgetMb = maxMb\n"
+        "        val budgetBytes = budgetMb * 1024L * 1024L\n"
+    )
+    if old_budget in t:
+        t = t.replace(old_budget, new_budget, 1)
+        changed = True
+        log("  ✓ video cache uses full limit (was 30%)")
+    elif "val budgetMb = maxMb\n" in t:
+        log("  ✓ already uses full limit")
+
+    # 2b. Add getSimpleCacheForEviction
+    if "fun getSimpleCacheForEviction(" not in t:
+        anchor = "    fun getCacheSizeBytes(context: Context): Long {\n"
+        add = (
+            "    /** Returns the existing SimpleCache without creating it, for external eviction. */\n"
+            "    fun getSimpleCacheForEviction(context: Context): SimpleCache? = simpleCache\n"
+            "\n"
+            "    fun getCacheSizeBytes(context: Context): Long {\n"
+        )
+        if anchor in t:
+            t = t.replace(anchor, add, 1)
+            changed = True
+            log("  ✓ getSimpleCacheForEviction added")
+        else:
+            log("  ⚠ getCacheSizeBytes anchor missing")
+
+    # 2c. Pause should trigger sweep (delayed)
+    old_pause = (
+        "    fun pause() {\n"
+        "        try { player?.pause() } catch (_: Throwable) {}\n"
+        "    }\n"
+    )
+    new_pause = (
+        "    fun pause() {\n"
+        "        try { player?.pause() } catch (_: Throwable) {}\n"
+        "        CacheBudgetEnforcer.sweepAsync()\n"
+        "    }\n"
+    )
+    if old_pause in t:
+        t = t.replace(old_pause, new_pause, 1)
+        changed = True
+        log("  ✓ pause → sweepAsync")
+    elif "CacheBudgetEnforcer.sweepAsync()" in t and "fun pause()" in t:
+        log("  ✓ pause already calls sweep")
+
+    # 2d. Release should trigger sweep
+    old_release = (
+        "        player = null\n"
+        "        currentPinId = null\n"
+        "    }\n"
+    )
+    new_release = (
+        "        player = null\n"
+        "        currentPinId = null\n"
+        "        CacheBudgetEnforcer.sweepAsync()\n"
+        "    }\n"
+    )
+    if old_release in t and "CacheBudgetEnforcer.sweepAsync()" not in t.split("fun release()")[1][:200] if "fun release()" in t else True:
+        t = t.replace(old_release, new_release, 1)
+        changed = True
+        log("  ✓ release → sweepAsync")
+
+    if changed:
+        f.write_text(t, encoding="utf-8")
+
+
+# ============================================================
+# NEW: CacheBudgetEnforcer.kt
+# ============================================================
+NEW_CACHE_BUDGET_ENFORCER = r'''package com.example.util
+
+import android.content.Context
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.io.File
 
+/**
+ * Enforces the user's total cache limit across IMAGE and VIDEO caches.
+ *
+ * Rationale:
+ *   - Coil (image) and Media3 (video) each have their own LRU evictors that
+ *     only know about their own caches. If both use the full limit, combined
+ *     size can reach 2x the user's intent.
+ *   - This object periodically sweeps. If combined > limit, it evicts the
+ *     oldest completed VIDEO spans first (video is easier to evict than
+ *     Coil's disk cache). If video is exhausted and combined is still over,
+ *     images are simply left alone — Coil's own LRU will evict them on its
+ *     next write when it exceeds the limit by itself.
+ *
+ * Net effect: combined stays under the user's limit in steady state, with
+ * both categories able to grow into whatever the other isn't using.
+ */
+object CacheBudgetEnforcer {
 
-@OptIn(ExperimentalFoundationApi::class)
-@Composable
-fun PinCard(
-    pin: PinItem,
-    columnCount: Int,
-    isSelected: Boolean,
-    isSelectionMode: Boolean,
-    isFavorite: Boolean = false,
-    hideTitleAndAuthor: Boolean = false,
-    isNew: Boolean = false,
-    refreshCounter: Int = 0,
-    onClick: () -> Unit,
-    onLongClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val context = LocalContext.current
-    val cardShape = RoundedCornerShape(16.dp)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var appContext: Context? = null
+    private var monitorJob: Job? = null
 
-    // Video thumbnail extraction state
-    var extractedVideoThumb by remember(pin.id) { mutableStateOf<File?>(null) }
-    var videoThumbFailed by remember(pin.id) { mutableStateOf(false) }
-    LaunchedEffect(pin.id, pin.isVideo, pin.hasSeparateThumbnail) {
-        if (pin.isVideo && !pin.hasSeparateThumbnail && extractedVideoThumb == null && !videoThumbFailed) {
-            val f = com.example.util.VideoThumbnailCache.getOrExtract(context, pin)
-            if (f == null) videoThumbFailed = true else extractedVideoThumb = f
+    fun init(context: Context) {
+        if (appContext != null) return
+        appContext = context.applicationContext
+        monitorJob = scope.launch {
+            while (isActive) {
+                delay(60_000L)
+                try { sweep() } catch (_: Throwable) {}
+            }
         }
     }
 
-    val isAnimatedGif = !pin.isVideo && com.example.util.ImageMimeUtils.isAnimated(pin.mimeType, pin.imageUrl)
-    val effectiveImageModel: Any? = when {
-        pin.isVideo && pin.hasSeparateThumbnail -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
-        pin.isVideo -> extractedVideoThumb
-        isAnimatedGif -> pin.imageUrl.ifBlank { pin.thumbnailUrl }
-        else -> pin.thumbnailUrl.ifBlank { pin.imageUrl }
-    }
-
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .clip(cardShape)
-            .combinedClickable(
-                onClick = onClick,
-                onLongClick = onLongClick
-            )
-            .testTag("pin_card_${pin.id}")
-            .padding(bottom = if (hideTitleAndAuthor) 6.dp else 12.dp)
-    ) {
-        val safeRatio = remember(pin.aspectRatio) {
-            val r = pin.aspectRatio
-            if (r.isFinite() && r > 0.1f) r.coerceIn(0.45f, 2.0f) else 0.75f
-        }
-        val cardBg = remember(pin.dominantColor) {
+    fun sweepAsync() {
+        scope.launch {
             try {
-                if (pin.dominantColor != 0L) {
-                    val raw = (pin.dominantColor and 0xFFFFFFFFL).toInt()
-                    val argb = if ((raw and -0x1000000) == 0) (raw or -0x1000000) else raw
-                    Color(color = argb)
-                } else PinterestPillGray
-            } catch (_: Throwable) {
-                PinterestPillGray
-            }
+                delay(500L)  // let any in-flight write settle
+                sweep()
+            } catch (_: Throwable) {}
         }
+    }
 
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(cardShape)
-                .background(cardBg)
-                .aspectRatio(safeRatio)
-        ) {
-            if (effectiveImageModel != null) {
-                AsyncImage(
-                    model = ImageRequest.Builder(context)
-                        .data(effectiveImageModel)
-                        .apply {
-                            if (refreshCounter > 0) {
-                                memoryCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
-                                diskCacheKey("pin-thumb:${pin.id}:r$refreshCounter")
-                            }
-                        }
-                        .crossfade(true)
-                        .build(),
-                    contentDescription = pin.title,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .matchParentSize()
-                        .clip(cardShape)
-                )
-            } else {
-                // Video without extractable thumbnail — placeholder
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .background(PinterestPillGray),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Video",
-                        tint = PinterestTextSecondary,
-                        modifier = Modifier.size(36.dp)
-                    )
-                }
-            }
+    fun sweep() {
+        val ctx = appContext ?: return
+        val limit = ImageCacheManager.getMaxDiskCacheMb(ctx).toLong() * 1024L * 1024L
+        val imageSize = getImageCacheBytes(ctx)
+        val videoSize = VideoPlayerManager.getCacheSizeBytes(ctx)
+        val total = imageSize + videoSize
+        if (total <= limit) return
 
-            // Video play icon — top-left, masonry-only indicator
-            if (pin.isVideo && !isSelectionMode) {
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopStart)
-                        .padding(6.dp)
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.55f))
-                        .border(1.5.dp, Color.White, CircleShape)
-                        .testTag("pin_video_badge_${pin.id}"),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.PlayArrow,
-                        contentDescription = "Video",
-                        tint = Color.White,
-                        modifier = Modifier.size(15.dp)
-                    )
+        var toEvict = total - limit
+        val cache = VideoPlayerManager.getSimpleCacheForEviction(ctx) ?: return
+        try {
+            val spans = cache.keys().asSequence()
+                .flatMap { key ->
+                    try { cache.getCachedSpans(key).asSequence() } catch (_: Throwable) { emptySequence() }
                 }
-            }
+                .filter { it.file != null }
+                .sortedBy { it.lastTouchTimestamp }
+                .toList()
 
-            // Selection indicator
-            if (isSelectionMode) {
-                Box(
-                    modifier = Modifier
-                        .matchParentSize()
-                        .background(
-                            if (isSelected) PinterestRed.copy(alpha = 0.25f)
-                            else Color.Black.copy(alpha = 0.15f)
-                        )
-                )
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .padding(8.dp)
-                        .size(28.dp)
-                        .clip(CircleShape)
-                        .background(
-                            if (isSelected) PinterestRed else Color.Black.copy(alpha = 0.45f)
-                        )
-                        .border(width = 2.dp, color = Color.White, shape = CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    if (isSelected) {
-                        Icon(
-                            imageVector = Icons.Default.Check,
-                            contentDescription = "Selected",
-                            tint = Color.White,
-                            modifier = Modifier.size(18.dp)
-                        )
+            for (span in spans) {
+                if (toEvict <= 0L) break
+                try {
+                    if (cache.removeSpan(span)) {
+                        toEvict -= span.length
                     }
-                }
-            } else {
-                if (isFavorite) {
-                    Box(
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(6.dp)
-                            .size(28.dp)
-                            .clip(CircleShape)
-                            .background(PinterestRed)
-                            .border(width = 1.5.dp, color = Color.White, shape = CircleShape)
-                            .testTag("pin_favorite_badge_${pin.id}"),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Favorite,
-                            contentDescription = "Favorited",
-                            tint = Color.White,
-                            modifier = Modifier.size(15.dp)
-                        )
-                    }
-                }
-                if (isNew) {
-                    Surface(
-                        color = PinterestRed,
-                        shape = RoundedCornerShape(6.dp),
-                        shadowElevation = 3.dp,
-                        modifier = Modifier
-                            .padding(8.dp)
-                            .align(Alignment.TopStart)
-                            .testTag("pin_new_badge_${pin.id}")
-                    ) {
-                        Text(
-                            text = "NEW",
-                            color = Color.White,
-                            fontWeight = FontWeight.ExtraBold,
-                            fontSize = 9.sp,
-                            letterSpacing = 0.6.sp,
-                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-                        )
-                    }
-                }
+                } catch (_: Throwable) {}
             }
+        } catch (_: Throwable) {}
+    }
 
-            if (pin.isBrokenOrUnreachable) {
-                Surface(
-                    color = Color.Black.copy(alpha = 0.7f),
-                    shape = RoundedCornerShape(6.dp),
-                    modifier = Modifier
-                        .align(Alignment.BottomStart)
-                        .padding(6.dp)
-                ) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.BrokenImage,
-                            contentDescription = "Broken link",
-                            tint = Color(0xFFFFB4AB),
-                            modifier = Modifier.size(12.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Unavailable",
-                            color = Color(0xFFFFB4AB),
-                            fontSize = 9.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-                }
-            }
+    private fun getImageCacheBytes(context: Context): Long {
+        val dir = File(context.cacheDir, "image_cache")
+        if (!dir.exists()) return 0L
+        return dirSize(dir)
+    }
+
+    private fun dirSize(dir: File): Long {
+        var total = 0L
+        dir.listFiles()?.forEach { f ->
+            total += if (f.isDirectory) dirSize(f) else f.length()
         }
-
-        if (!hideTitleAndAuthor && columnCount <= 3 && pin.title.isNotBlank()) {
-            Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = pin.title,
-                style = MaterialTheme.typography.bodyMedium.copy(
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = if (columnCount == 2) 13.sp else 11.sp,
-                    lineHeight = if (columnCount == 2) 17.sp else 14.sp
-                ),
-                maxLines = if (columnCount == 2) 2 else 1,
-                overflow = TextOverflow.Ellipsis,
-                color = MaterialTheme.colorScheme.onSurface,
-                modifier = Modifier.padding(horizontal = 4.dp)
-            )
-
-            if (columnCount == 2) {
-                Spacer(modifier = Modifier.height(2.dp))
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 4.dp)
-                ) {
-                    Text(
-                        text = pin.author.ifBlank { pin.displayDomain },
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontSize = 11.sp,
-                            color = PinterestTextSecondary
-                        ),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
+        return total
     }
 }
 '''
 
 
-def rewrite_pin_card():
-    log("\n=== PATCH: rewrite PinCard.kt ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/PinCard.kt"
-    if not f.exists(): log("  ✗ not found"); sys.exit(1)
-    t = f.read_text(encoding="utf-8")
-    if "// v2-video" in t and "effectiveImageModel" in t and "pin_video_badge_" in t and "cardImageUrl" not in t:
-        log("  ✓ already v2"); return
-    f.write_text(NEW_PIN_CARD, encoding="utf-8")
-    log("  ✓ rewritten (canonical)")
+def write_cache_budget_enforcer():
+    log("\n=== PATCH: new CacheBudgetEnforcer.kt ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/util/CacheBudgetEnforcer.kt"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(NEW_CACHE_BUDGET_ENFORCER, encoding="utf-8")
+    log("  ✓ created")
 
 
-def find_balanced_parens(t, start_idx):
-    """Given index of '(', return index of matching ')'."""
-    depth = 0
-    i = start_idx
-    while i < len(t):
-        c = t[i]
-        if c == '"':
-            i += 1
-            while i < len(t):
-                if t[i] == "\\": i += 2; continue
-                if t[i] == '"': break
-                i += 1
-        elif c == "'":
-            i += 1
-            while i < len(t):
-                if t[i] == "\\": i += 2; continue
-                if t[i] == "'": break
-                i += 1
-        elif c == "(":
-            depth += 1
-        elif c == ")":
-            depth -= 1
-            if depth == 0:
-                return i
-        i += 1
-    return -1
-
-
-def rebuild_fullscreen_signature():
-    log("\n=== PATCH: FullscreenGalleryViewer signature (rebuild) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
+# ============================================================
+# PATCH 3 — PinBoardApplication: init CacheBudgetEnforcer
+# ============================================================
+def patch_pinboard_application():
+    log("\n=== PATCH: PinBoardApplication (init enforcer) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/PinBoardApplication.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    marker = "fun FullscreenGalleryViewer("
-    idx = t.find(marker)
-    if idx < 0: log("  ✗ marker not found"); sys.exit(1)
+    if "CacheBudgetEnforcer.init(" in t:
+        log("  ✓ already patched"); return
 
-    open_paren = t.find("(", idx)
-    close_paren = find_balanced_parens(t, open_paren)
-    if close_paren < 0: log("  ✗ unbalanced"); sys.exit(1)
-
-    current_params = t[open_paren:close_paren + 1]
-    if "onPlayVideo:" in current_params and "refreshCounters:" in current_params:
-        log("  ✓ signature already complete"); return
-
-    new_params = """(
-    pins: List<PinItem>,
-    initialIndex: Int,
-    isFavorite: (PinItem) -> Boolean = { false },
-    onToggleFavorite: (PinItem) -> Unit = {},
-    onMoveToTop: (PinItem) -> Unit = {},
-    onDeleteSingle: (PinItem) -> Unit = {},
-    onClose: () -> Unit,
-    onDownloadSingle: (PinItem) -> Unit,
-    onPlayVideo: (PinItem) -> Unit = {},
-    disableArrowNavigation: Boolean = false,
-    refreshCounters: Map<String, Int> = emptyMap(),
-    onRefreshImage: (PinItem) -> Unit = {},
-    modifier: Modifier = Modifier
-)"""
-
-    t = t[:open_paren] + new_params + t[close_paren + 1:]
-    f.write_text(t, encoding="utf-8")
-    log("  ✓ signature rebuilt with onPlayVideo")
+    anchor = '        com.example.util.CrashMonitor.init(this)\n'
+    if anchor in t:
+        t = t.replace(
+            anchor,
+            anchor + "        com.example.util.CacheBudgetEnforcer.init(this)\n",
+            1,
+        )
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ CacheBudgetEnforcer.init called")
+    else:
+        log("  ⚠ CrashMonitor.init anchor missing")
 
 
-def rebuild_screen_call_site():
-    log("\n=== PATCH: PinBoardGalleryScreen FullscreenGalleryViewer call (rebuild) ===")
-    f = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+# ============================================================
+# PATCH 4 — ImageCacheManager: video cache is NOT separate anymore
+#           (but getDiskCacheUsageBytes and clearCache still combine them)
+# ============================================================
+def patch_image_cache_manager_comment():
+    log("\n=== PATCH: ImageCacheManager (comment update) ===")
+    f = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageCacheManager.kt"
     if not f.exists(): log("  ✗ not found"); sys.exit(1)
     t = f.read_text(encoding="utf-8")
 
-    marker = "FullscreenGalleryViewer("
-    idx = t.find(marker)
-    if idx < 0: log("  ✗ call not found"); sys.exit(1)
+    # Just ensure VideoPlayerManager calls still work — no code change needed.
+    # The comment update is cosmetic; skip if already there.
+    if "CacheBudgetEnforcer" in t:
+        log("  ✓ already referenced"); return
 
-    open_paren = t.find("(", idx)
-    close_paren = find_balanced_parens(t, open_paren)
-    if close_paren < 0: log("  ✗ unbalanced"); sys.exit(1)
-
-    # Get indentation of the call line
-    line_start = t.rfind("\n", 0, idx) + 1
-    base_indent = t[line_start:idx]
-    arg_indent = base_indent + "    "
-
-    new_call = (
-        base_indent + "FullscreenGalleryViewer(\n" +
-        arg_indent + "refreshCounters = imageRefreshCounters,\n" +
-        arg_indent + "onRefreshImage = { p -> viewModel.refreshImage(p.id) },\n" +
-        arg_indent + "onPlayVideo = { p -> viewModel.playVideo(context, p) },\n" +
-        arg_indent + "pins = fullScreenPins,\n" +
-        arg_indent + "initialIndex = initialIndex,\n" +
-        arg_indent + "disableArrowNavigation = disableArrowNavigation,\n" +
-        arg_indent + "isFavorite = { pin -> favoritePinKeys.contains(pin.id) || favoritePinKeys.contains(pin.imageUrl) },\n" +
-        arg_indent + "onToggleFavorite = { pin -> viewModel.toggleFavorite(pin) },\n" +
-        arg_indent + "onMoveToTop = { pin -> viewModel.movePinToTop(pin) },\n" +
-        arg_indent + "onDeleteSingle = { pin -> viewModel.deleteSinglePin(pin) },\n" +
-        arg_indent + "onClose = { viewModel.closeFullscreen() },\n" +
-        arg_indent + "onDownloadSingle = { pin -> viewModel.downloadSingle(context, pin) }\n" +
-        base_indent + ")"
+    # Add explanatory comment above getDiskCacheUsageBytes
+    old = (
+        "    fun getDiskCacheUsageBytes(context: Context): Long {\n"
     )
+    new = (
+        "    /** Combined image + video cache size. Enforced as a single budget by CacheBudgetEnforcer. */\n"
+        "    fun getDiskCacheUsageBytes(context: Context): Long {\n"
+    )
+    if old in t:
+        t = t.replace(old, new, 1)
+        f.write_text(t, encoding="utf-8")
+        log("  ✓ comment added")
 
-    t = t[:idx] + new_call + t[close_paren + 1:]
-    f.write_text(t, encoding="utf-8")
-    log("  ✓ call site rebuilt")
 
-
+# ============================================================
+# Verify
+# ============================================================
 def verify_all():
     log("\n=== VERIFY ===")
-    ps = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
-    fs = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/FullscreenGalleryViewer.kt"
-    pc = PROJECT_ROOT / "app/src/main/java/com/example/ui/components/PinCard.kt"
+    checks = []
 
-    for p in (ps, fs, pc):
-        if not p.exists(): log(f"  ✗ missing {p}"); sys.exit(1)
+    ps = PROJECT_ROOT / "app/src/main/java/com/example/ui/PinBoardGalleryScreen.kt"
+    vpm = PROJECT_ROOT / "app/src/main/java/com/example/util/VideoPlayerManager.kt"
+    cbe = PROJECT_ROOT / "app/src/main/java/com/example/util/CacheBudgetEnforcer.kt"
+    pa = PROJECT_ROOT / "app/src/main/java/com/example/PinBoardApplication.kt"
+    icm = PROJECT_ROOT / "app/src/main/java/com/example/util/ImageCacheManager.kt"
+
+    for p in (ps, vpm, cbe, pa, icm):
+        if not p.exists(): log(f"  ✗ missing: {p}"); sys.exit(1)
+
+    ps_t = ps.read_text(encoding="utf-8")
+    vpm_t = vpm.read_text(encoding="utf-8")
+    cbe_t = cbe.read_text(encoding="utf-8")
+    pa_t = pa.read_text(encoding="utf-8")
+    icm_t = icm.read_text(encoding="utf-8")
+
+    checks.append(("Screen onClose releases player",
+                   "com.example.util.VideoPlayerManager.release()" in ps_t))
+    checks.append(("Screen onClose pattern correct",
+                   "onClose = {\n" in ps_t and "com.example.util.VideoPlayerManager.release()" in ps_t))
+    checks.append(("Screen no leftover one-line onClose",
+                   "onClose = { viewModel.closeFullscreen() }" not in ps_t or
+                   "onClose = {\n" in ps_t))
+    checks.append(("VideoPlayerManager full limit (no % split)",
+                   "val budgetMb = maxMb" in vpm_t))
+    checks.append(("VideoPlayerManager getSimpleCacheForEviction",
+                   "fun getSimpleCacheForEviction(" in vpm_t))
+    checks.append(("VideoPlayerManager pause → sweep",
+                   "fun pause()" in vpm_t and "CacheBudgetEnforcer.sweepAsync()" in vpm_t))
+    checks.append(("VideoPlayerManager release → sweep",
+                   "fun release()" in vpm_t and vpm_t.count("CacheBudgetEnforcer.sweepAsync()") >= 2))
+    checks.append(("CacheBudgetEnforcer exists",
+                   "object CacheBudgetEnforcer" in cbe_t))
+    checks.append(("CacheBudgetEnforcer sweep reads video size",
+                   "VideoPlayerManager.getCacheSizeBytes" in cbe_t))
+    checks.append(("CacheBudgetEnforcer evicts via removeSpan",
+                   "cache.removeSpan(span)" in cbe_t))
+    checks.append(("PinBoardApplication inits enforcer",
+                   "CacheBudgetEnforcer.init(" in pa_t))
 
     def strip(text):
         out, i = [], 0
@@ -554,42 +428,11 @@ def verify_all():
                 out.append(c); i += 1
         return "".join(out)
 
-    checks = []
-
-    pst = ps.read_text(encoding="utf-8")
-    fst = fs.read_text(encoding="utf-8")
-    pct = pc.read_text(encoding="utf-8")
-
-    checks.append(("FullscreenGalleryViewer has onPlayVideo param",
-                   "onPlayVideo: (PinItem) -> Unit = {}," in fst))
-    checks.append(("FullscreenGalleryViewer has refreshCounters param",
-                   "refreshCounters: Map<String, Int> = emptyMap()," in fst))
-    checks.append(("FullscreenGalleryViewer has onRefreshImage param",
-                   "onRefreshImage: (PinItem) -> Unit = {}," in fst))
-    checks.append(("Screen call site has onPlayVideo",
-                   "onPlayVideo = { p -> viewModel.playVideo(context, p) }," in pst))
-    checks.append(("Screen call site has onRefreshImage",
-                   "onRefreshImage = { p -> viewModel.refreshImage(p.id) }," in pst))
-    checks.append(("Screen call site has refreshCounters",
-                   "refreshCounters = imageRefreshCounters," in pst))
-
-    checks.append(("PinCard v2-video marker", "// v2-video" in pct))
-    checks.append(("PinCard has effectiveImageModel", "effectiveImageModel" in pct))
-    checks.append(("PinCard has video badge", "pin_video_badge_" in pct))
-    checks.append(("PinCard has PlayArrow import",
-                   "import androidx.compose.material.icons.filled.PlayArrow" in pct))
-    checks.append(("PinCard no orphan cardImageUrl", "cardImageUrl" not in pct))
-
-    # Bracket balance on all three files
-    for label, path, content in [
-        ("Screen", ps, pst),
-        ("Fullscreen", fs, fst),
-        ("PinCard", pc, pct),
-    ]:
-        s = strip(content)
-        po, pcnt = s.count("("), s.count(")")
+    for label, path in [("Screen", ps), ("Manager", vpm), ("Enforcer", cbe)]:
+        s = strip(path.read_text(encoding="utf-8"))
+        po, pc = s.count("("), s.count(")")
         bo, bc = s.count("{"), s.count("}")
-        checks.append((f"{label} paren balance ({po}/{pcnt})", po == pcnt))
+        checks.append((f"{label} paren balance ({po}/{pc})", po == pc))
         checks.append((f"{label} brace balance ({bo}/{bc})", bo == bc))
 
     all_ok = True
@@ -727,7 +570,7 @@ def setup_git():
     for n in (KEYSTORE_FILE, "debug.keystore"):
         if (PROJECT_ROOT / n).exists(): run(["git", "add", "-f", n], check=False)
     if subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True).stdout.strip():
-        run(["git", "commit", "-m", "Fix PinCard + FullscreenGalleryViewer signature/call (canonical rebuild)"])
+        run(["git", "commit", "-m", "Fix onClose anchor + unified cache budget (CacheBudgetEnforcer)"])
 
 
 def verify_keystore_tracked():
@@ -876,15 +719,17 @@ def device_install(apk):
 
 def main():
     log("=" * 70)
-    log("PinBoard — fix PinCard + FullscreenGalleryViewer signature")
+    log("PinBoard — onClose anchor fix + unified cache budget")
     log("=" * 70)
     if not (PROJECT_ROOT / "app/build.gradle.kts").exists(): sys.exit(1)
     for t in ("git", "gh", "keytool"):
         if not tool_available(t): sys.exit(1)
 
-    rewrite_pin_card()
-    rebuild_fullscreen_signature()
-    rebuild_screen_call_site()
+    patch_onclose_release()
+    patch_video_player_manager()
+    write_cache_budget_enforcer()
+    patch_pinboard_application()
+    patch_image_cache_manager_comment()
     verify_all()
 
     ensure_release_keystore()

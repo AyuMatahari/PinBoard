@@ -1365,7 +1365,10 @@ fun PinBoardGalleryScreen(
                     onToggleFavorite = { pin -> viewModel.toggleFavorite(pin) },
                     onMoveToTop = { pin -> viewModel.movePinToTop(pin) },
                     onDeleteSingle = { pin -> viewModel.deleteSinglePin(pin) },
-                    onClose = { viewModel.closeFullscreen() },
+                    onClose = {
+                        com.example.util.VideoPlayerManager.release()
+                        viewModel.closeFullscreen()
+                    },
                     onDownloadSingle = { pin -> viewModel.downloadSingle(context, pin) }
                 )
             }

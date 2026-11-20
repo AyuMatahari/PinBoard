@@ -47,6 +47,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
@@ -143,10 +144,12 @@ fun FullscreenGalleryViewer(
     )
 
     var showControls by remember { mutableStateOf(false) }
+    var playingVideoPinId by remember { mutableStateOf<String?>(null) }
     var isCurrentPageZoomed by remember { mutableStateOf(false) }
     var pinForImageHoldDialog by remember { mutableStateOf<PinItem?>(null) }
 
     BackHandler {
+        com.example.util.VideoPlayerManager.release()
         onClose()
     }
 
@@ -159,6 +162,89 @@ fun FullscreenGalleryViewer(
     // Always ensure scrolling is unlocked on page transitions
     LaunchedEffect(pagerState.currentPage) {
         isCurrentPageZoomed = false
+    }
+
+    // Pause video download when navigating away from the playing pin
+    LaunchedEffect(currentActualIndex) {
+        val currentPlaying = playingVideoPinId
+        if (currentPlaying != null) {
+            val currentPin = pins.getOrNull(currentActualIndex)
+            if (currentPin == null || currentPin.id != currentPlaying) {
+                com.example.util.VideoPlayerManager.pause()
+            }
+
+            // In-app video player overlay — plays inline, pauses download on nav/exit
+            if (pin.isVideo && playingVideoPinId == pin.id) {
+                androidx.compose.foundation.layout.Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black)
+                        .testTag("video_player_overlay")
+                ) {
+                    FullscreenVideoPlayer(modifier = Modifier.fillMaxSize())
+
+                    IconButton(
+                        onClick = { onClose() },
+                        modifier = Modifier
+                            .align(Alignment.TopStart)
+                            .padding(16.dp)
+                            .size(44.dp)
+                            .background(Color.Black.copy(alpha = 0.55f), CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Close,
+                            contentDescription = "Close video",
+                            tint = Color.White
+                        )
+                    }
+
+                    if (pins.size > 1 && !disableArrowNavigation) {
+                        IconButton(
+                            onClick = {
+                                com.example.util.VideoPlayerManager.pause()
+                                playingVideoPinId = null
+                                coroutineScope.launch {
+                                    val target = (pagerState.currentPage - 1).coerceAtLeast(0)
+                                    pagerState.animateScrollToPage(target)
+                                }
+                            },
+                            modifier = Modifier
+                                .align(Alignment.CenterStart)
+                                .padding(12.dp)
+                                .size(44.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Previous",
+                                tint = Color.White
+                            )
+                        }
+                        IconButton(
+                            onClick = {
+                                com.example.util.VideoPlayerManager.pause()
+                                playingVideoPinId = null
+                                coroutineScope.launch {
+                                    val target = (pagerState.currentPage + 1).coerceAtMost(virtualPageCount - 1)
+                                    pagerState.animateScrollToPage(target)
+                                }
+                            },
+                            modifier = Modifier
+                                .align(Alignment.CenterEnd)
+                                .padding(12.dp)
+                                .size(44.dp)
+                                .background(Color.Black.copy(alpha = 0.5f), CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
+                                contentDescription = "Next",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Box(
@@ -331,7 +417,10 @@ fun FullscreenGalleryViewer(
                             color = Color.Black.copy(alpha = 0.6f),
                             modifier = Modifier
                                 .fillMaxSize()
-                                .clickable { onPlayVideo(pin) }
+                                .clickable {
+                                    playingVideoPinId = pin.id
+                                    com.example.util.VideoPlayerManager.play(context, pin)
+                                }
                                 .testTag("fullscreen_play_video_${pin.id}")
                         ) {
                             androidx.compose.foundation.layout.Box(contentAlignment = Alignment.Center) {

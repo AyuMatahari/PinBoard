@@ -12,6 +12,7 @@ class PinBoardApplication : Application() {
     override fun onCreate() {
         super.onCreate()
         com.example.util.CrashMonitor.init(this)
+        com.example.util.CacheBudgetEnforcer.init(this)
         com.example.util.CrashMonitor.addBreadcrumb("Application initialized: ${if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) getProcessName() else "default"}")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
